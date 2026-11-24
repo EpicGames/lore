@@ -14,6 +14,7 @@ use lore_revision::util::path::RelativePath;
 mod content_tests;
 mod deletion_tests;
 mod directory_children_tests;
+mod link_tests;
 mod move_tests;
 mod parent_restore_tests;
 mod resolution_tests;
@@ -51,4 +52,31 @@ pub(super) async fn stage_root_child(
     .await
     .expect("the stage");
     operation.finalize().await.expect("the operation finishes");
+}
+
+/// Stages each of `paths` below the working tree without `--scan`, as `lore stage <path>...` does;
+/// the empty path stages the whole working tree.
+async fn staged_as_marked(instance: &crate::helper::TestRepository, paths: &[&str]) {
+    staged_with(instance, paths, StageOptions::default()).await;
+}
+
+/// Stages `paths` by name with `options`.
+async fn staged_with(
+    instance: &crate::helper::TestRepository,
+    paths: &[&str],
+    options: StageOptions,
+) {
+    lore_revision::file::stage::stage(
+        instance.repository.clone(),
+        &instance.write_token,
+        lore_revision::interface::LoreArray::from_vec(
+            paths
+                .iter()
+                .map(|path| lore_revision::interface::LoreString::from(&instance.path.join(path)))
+                .collect(),
+        ),
+        options,
+    )
+    .await
+    .expect("the stage");
 }

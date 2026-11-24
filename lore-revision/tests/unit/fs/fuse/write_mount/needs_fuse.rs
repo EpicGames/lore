@@ -1662,3 +1662,39 @@ async fn a_merge_across_a_move_below_a_case_only_rename_serves_only_the_merged_s
         m.unmount().await;
     }
 }
+
+/// A directory renamed in case through a mount commits at its new spelling under the case handling
+/// that renames, and the mount keeps serving it so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_directory_renamed_in_case_through_the_mount_commits_at_its_new_spelling() {
+    skip_without_fuse!();
+    let instance = Instance::new(&[
+        ("Dir/a.txt", b"Dir/a.txt"),
+        ("Dir/Sub/c.txt", b"Dir/Sub/c.txt"),
+        ("Top.txt", b"Top.txt"),
+    ])
+    .await;
+    let m = instance.mount().await;
+    let root = m.root.clone();
+    blocking(move || std::fs::rename(root.join("Dir"), root.join("dir")).expect("rename")).await;
+
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            stage_case_through(
+                &instance,
+                &m.fs,
+                lore_revision::stage::StageCaseChange::Rename,
+            )
+            .await
+            .expect("stage");
+            let committed = commit_staged(&instance, &m.fs).await.expect("commit");
+            assert_eq!(
+                revision_paths(&instance, committed).await,
+                ["Top.txt", "dir", "dir/Sub", "dir/Sub/c.txt", "dir/a.txt"]
+            );
+        })
+        .await;
+    let root = m.root.clone();
+    assert_eq!(blocking(move || names(&root)).await, ["Top.txt", "dir"]);
+    m.unmount().await;
+}

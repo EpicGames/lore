@@ -959,6 +959,17 @@ impl RelativePath {
         covers_impl(self.as_str(), child.as_ref())
     }
 
+    /// Whether an entry of `antichain`, ordered as [`Self::dedup_to_supersets`] leaves it, covers
+    /// `self` ([`Self::covers_ignore_case`]); one search, as only the entry ordered last at or
+    /// before `self` can cover it.
+    pub fn covered_in(&self, antichain: &[RelativePath]) -> bool {
+        let at = antichain.partition_point(|entry| {
+            compare_subtree_order(entry.as_lowercase_str(), self.as_lowercase_str())
+                != std::cmp::Ordering::Greater
+        });
+        at > 0 && antichain[at - 1].covers_ignore_case(self)
+    }
+
     /// [`covers`](Self::covers) on the lowercased form. Node lookup hashes
     /// names case-insensitively, so a path the caller resolved a node from can
     /// differ in case from the stored paths it has to be compared against.

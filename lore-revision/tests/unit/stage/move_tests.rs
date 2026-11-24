@@ -15,6 +15,7 @@ use lore_revision::stage::StageOptions;
 use lore_revision::state::Clear;
 use lore_revision::state::State;
 
+use super::staged_as_marked;
 use crate::dirty_move_fixture::assert_no_change_marked;
 use crate::dirty_move_fixture::chained;
 use crate::dirty_move_fixture::children_named;
@@ -27,6 +28,7 @@ use crate::dirty_move_fixture::made_directory;
 use crate::dirty_move_fixture::node_at;
 use crate::dirty_move_fixture::node_id_at;
 use crate::dirty_move_fixture::node_of;
+use crate::dirty_move_fixture::removed;
 use crate::dirty_move_fixture::removed_directory;
 use crate::dirty_move_fixture::rename;
 use crate::dirty_move_fixture::restaged;
@@ -42,12 +44,6 @@ use crate::helper::TestRepository;
 use crate::helper::mount_intermediate;
 use crate::helper::test_commit;
 use crate::helper::test_file_write;
-
-/// Removes the file `path` below `instance`'s working tree.
-#[allow(clippy::disallowed_methods)] // A test fixture in its own temporary directory.
-fn removed(instance: &TestRepository, path: &str) {
-    std::fs::remove_file(instance.path.join(path)).expect("the delete on disk");
-}
 
 /// Moves `dir/sub` over `dir` in `instance`'s working tree, which then holds `sub`'s files in
 /// `dir` and nothing else of the old `dir`.
@@ -1743,6 +1739,78 @@ async fn a_staged_move_onto_the_root_is_invalid() {
         assert!(
             matches!(refused, Err(StageError::InvalidArguments(_))),
             "the move onto the root was not refused as invalid: {refused:?}"
+        );
+    })
+    .await;
+}
+
+/// A new directory marked dirty while empty is staged as itself: a file created in it afterwards,
+/// which nothing marked, stays out of the stage.
+#[tokio::test]
+async fn a_stage_of_a_new_directory_marked_empty_leaves_out_a_file_created_in_it() {
+    use crate::dirty_move_fixture::Held;
+    use crate::dirty_move_fixture::held_at;
+
+    with_instance(|instance| async move {
+        committed(&instance, &["other.txt"]).await;
+        made_directory(&instance, "n");
+        dirtied(&instance, "n").await;
+        written(&instance, &["n/new.txt"]);
+
+        staged_as_marked(&instance, &[""]).await;
+
+        assert_eq!(
+            held_at(&instance.repository, &["n", "n/new.txt"]).await,
+            [Held::StagedAdd, Held::Nothing]
+        );
+    })
+    .await;
+}
+
+/// A new directory holding a file marked dirty and one not is staged with the marked file alone.
+#[tokio::test]
+async fn a_stage_of_a_new_directory_takes_its_marked_file_alone() {
+    use crate::dirty_move_fixture::Held;
+    use crate::dirty_move_fixture::held_at;
+
+    with_instance(|instance| async move {
+        committed(&instance, &["other.txt"]).await;
+        written(&instance, &["n/marked.txt", "n/unmarked.txt"]);
+        dirtied(&instance, "n/marked.txt").await;
+
+        staged_as_marked(&instance, &[""]).await;
+
+        assert_eq!(
+            held_at(
+                &instance.repository,
+                &["n", "n/marked.txt", "n/unmarked.txt"]
+            )
+            .await,
+            [Held::StagedAdd, Held::StagedAdd, Held::Nothing]
+        );
+    })
+    .await;
+}
+
+/// A stage without `--scan` stages nothing of a directory moved and marked with `lore file dirty
+/// move` whose file no change of content carries: the directory and the file keep their marks as
+/// dirty moves, and a file created in the directory afterwards, which nothing marked, stays out of
+/// the stage.
+#[tokio::test]
+async fn a_stage_of_a_dirty_moved_directory_leaves_out_a_file_created_in_it() {
+    use crate::dirty_move_fixture::Held;
+    use crate::dirty_move_fixture::held_at;
+
+    with_instance(|instance| async move {
+        committed(&instance, &["d/k.txt", "other.txt"]).await;
+        dirty_moved(&instance, "d", "e").await;
+        written(&instance, &["e/new.txt"]);
+
+        staged_as_marked(&instance, &[""]).await;
+
+        assert_eq!(
+            held_at(&instance.repository, &["e", "e/k.txt", "e/new.txt"]).await,
+            [Held::DirtyMove, Held::DirtyMove, Held::Nothing]
         );
     })
     .await;

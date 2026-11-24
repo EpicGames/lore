@@ -465,7 +465,7 @@ fn collect_root() -> OpFn {
 }
 
 /// The paths a collection below `d/` reports through `d/l` pinning the revision holding markers.
-const THROUGH: [&str; 3] = ["l/a", "l/n/m", "l/o"];
+const THROUGH: [&str; 4] = ["l/a", "l/n", "l/n/m", "l/o"];
 
 /// A collection through the dirty link `d/l` reports the paths its pinned revision holds below the
 /// node the pin exposes: beside a whole repin to the first revision, which holds no marker, those

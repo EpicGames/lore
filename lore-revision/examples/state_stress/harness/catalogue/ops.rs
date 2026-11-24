@@ -1265,9 +1265,10 @@ pub async fn node_path(
 }
 
 /// The paths of the dirty nodes at or below directory `root`, at `base` in the tree, as the stage
-/// collects them to stage a directory (`State::collect_dirty_paths`), in one State: `None` where it
-/// failed. Each path's spelling relative to `root` noted on the call, sorted. `base` is empty for
-/// the State's root alone, as the product takes an empty path for its root's.
+/// collects them to stage a directory (`State::collect_dirty_paths`), the directories it stages as
+/// themselves among them, in one State: `None` where it failed. Each path's spelling relative to
+/// `root` noted on the call, sorted. `base` is empty for the State's root alone, as the product
+/// takes an empty path for its root's.
 pub async fn dirty_paths(tree: &Tree, root: NodeID, base: &str) -> Option<Vec<RelativePath>> {
     assert_eq!(
         base.is_empty(),
@@ -1280,7 +1281,9 @@ pub async fn dirty_paths(tree: &Tree, root: NodeID, base: &str) -> Option<Vec<Re
             .collect_dirty_paths(tree.repository.clone(), root, base_path)
             .await;
         match paths {
-            Ok(paths) => {
+            Ok(found) => {
+                let mut paths = found.paths;
+                paths.extend(found.directories);
                 let mut spelled: Vec<u64> = (paths.iter())
                     .map(|path| below_root(path.as_str(), base))
                     .collect();

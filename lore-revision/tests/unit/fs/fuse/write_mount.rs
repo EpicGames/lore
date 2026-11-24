@@ -3329,13 +3329,19 @@ async fn a_create_racing_an_attach_of_the_same_name_answers_eexist() {
         .await;
 }
 
-/// The provider over a fresh rebuild of `instance` under a view excluding `globs`.
-async fn viewed_provider(instance: &Instance, globs: &[&str]) -> Arc<FuseFilesystem> {
-    use fuse_fixture::RepositoryContextCreationArgsExt as _;
+/// A filter whose view leaves out `globs`.
+fn view_excluding(globs: &[&str]) -> lore_revision::filter::Filter {
     let mut filter = lore_revision::filter::Filter::default();
     for glob in globs {
         filter.view.add_exclusion(glob).expect("filter exclusion");
     }
+    filter
+}
+
+/// The provider over a fresh rebuild of `instance` under a view excluding `globs`.
+async fn viewed_provider(instance: &Instance, globs: &[&str]) -> Arc<FuseFilesystem> {
+    use fuse_fixture::RepositoryContextCreationArgsExt as _;
+    let filter = view_excluding(globs);
     let viewed = Arc::new(lore_revision::repository::RepositoryContext::new(
         fuse_fixture::default_repository_creation_args(
             instance.fixture.immutable.clone(),
@@ -11417,6 +11423,751 @@ async fn a_status_leaves_an_identical_file_respelled_local() {
             drop(fs);
             let remounted = provider(&instance).await;
             assert_eq!(listed(&remounted, ROOT_INO).await, vec!["A.txt"]);
+        })
+        .await;
+}
+
+/// An instance over `Dir/a.txt`, `Dir/b.txt`, `Dir/Sub/c.txt` and `Top.txt`, and a provider
+/// over it in which `Dir` was renamed to `dir`.
+async fn directory_renamed_in_case() -> (Instance, Arc<FuseFilesystem>) {
+    let instance = Instance::new(&[
+        ("Dir/a.txt", b"Dir/a.txt"),
+        ("Dir/b.txt", b"Dir/b.txt"),
+        ("Dir/Sub/c.txt", b"Dir/Sub/c.txt"),
+        ("Top.txt", b"Top.txt"),
+    ])
+    .await;
+    let fs = provider(&instance).await;
+    lookup(&fs, ROOT_INO, "Dir").await.expect("Dir");
+    fs.rename(&request(), ROOT_INO, b"Dir", ROOT_INO, b"dir", 0)
+        .await
+        .expect("rename Dir to dir");
+    (instance, fs)
+}
+
+/// Stages the whole tree through `fs` with `case_change`, as `lore stage --case` does.
+async fn stage_case_through(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+    case_change: lore_revision::stage::StageCaseChange,
+) -> Result<Hash, String> {
+    stage_hosts_through(
+        instance,
+        fs,
+        vec![instance.fixture.path.clone()],
+        Default::default(),
+        lore_revision::stage::StageOptions {
+            case_change,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// The paths `revision` holds.
+async fn revision_paths(instance: &Instance, revision: Hash) -> Vec<String> {
+    revision_tree(instance, revision)
+        .await
+        .into_keys()
+        .collect()
+}
+
+/// A directory renamed in case through the mount is staged as a move under the case handling
+/// that renames, and the commit's revision spells it as the mount does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_renaming_in_case_records_a_directory_renamed_in_case() {
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let (instance, fs) = directory_renamed_in_case().await;
+            assert_eq!(
+                status_of(&instance, &fs).await,
+                [(
+                    "dir".to_string(),
+                    (lore_revision::interface::LoreFileAction::Move, true)
+                )]
+                .into()
+            );
+            let renamed = [
+                "Top.txt",
+                "dir",
+                "dir/Sub",
+                "dir/Sub/c.txt",
+                "dir/a.txt",
+                "dir/b.txt",
+            ];
+
+            let staged = stage_case_through(
+                &instance,
+                &fs,
+                lore_revision::stage::StageCaseChange::Rename,
+            )
+            .await
+            .expect("stage");
+            assert_eq!(revision_paths(&instance, staged).await, renamed);
+            let committed = commit_staged(&instance, &fs).await.expect("commit");
+            assert_eq!(revision_paths(&instance, committed).await, renamed);
+            assert_eq!(listed(&fs, ROOT_INO).await, ["Top.txt", "dir"]);
+        })
+        .await;
+}
+
+/// A directory renamed in case through the mount is staged as a move after a status marked it:
+/// the stage's diff keeps the marks below it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_renaming_in_case_after_a_status_records_a_directory_renamed_in_case() {
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let (instance, fs) = directory_renamed_in_case().await;
+            changed_paths_holding_token(&instance, &fs).await;
+
+            let staged = stage_case_through(
+                &instance,
+                &fs,
+                lore_revision::stage::StageCaseChange::Rename,
+            )
+            .await
+            .expect("stage");
+            assert_eq!(
+                revision_paths(&instance, staged).await,
+                [
+                    "Top.txt",
+                    "dir",
+                    "dir/Sub",
+                    "dir/Sub/c.txt",
+                    "dir/a.txt",
+                    "dir/b.txt"
+                ]
+            );
+        })
+        .await;
+}
+
+/// A file moved and a file edited below a directory renamed in case through the mount commit at
+/// the directory's new spelling under the case handling that renames.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_renaming_in_case_records_a_move_below_a_directory_renamed_in_case() {
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let (instance, fs) = directory_renamed_in_case().await;
+            let sub = lookup_path(&fs, "dir/Sub").await.expect("dir/Sub");
+            lookup(&fs, sub, "c.txt").await.expect("c.txt");
+            fs.rename(&request(), sub, b"c.txt", sub, b"d.txt", 0)
+                .await
+                .expect("rename c.txt to d.txt");
+            let a = lookup_path(&fs, "dir/a.txt").await.expect("dir/a.txt");
+            fs.write(&request(), a, 0, 0, b"edited!!!", 0)
+                .await
+                .expect("write");
+
+            stage_case_through(
+                &instance,
+                &fs,
+                lore_revision::stage::StageCaseChange::Rename,
+            )
+            .await
+            .expect("stage");
+            let committed = commit_staged(&instance, &fs).await.expect("commit");
+            let tree = revision_tree(&instance, committed).await;
+            assert_eq!(
+                tree.keys().collect::<Vec<_>>(),
+                [
+                    "Top.txt",
+                    "dir",
+                    "dir/Sub",
+                    "dir/Sub/d.txt",
+                    "dir/a.txt",
+                    "dir/b.txt"
+                ]
+            );
+            assert_eq!(tree["dir/a.txt"].as_deref(), Some(&b"edited!!!"[..]));
+            assert_eq!(listed(&fs, ROOT_INO).await, ["Top.txt", "dir"]);
+        })
+        .await;
+}
+
+/// A stage under the default case handling refuses a directory renamed in case through the
+/// mount, as it refuses one renamed on an ordinary instance, and stages nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_refuses_a_directory_renamed_in_case_by_default() {
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let (instance, fs) = directory_renamed_in_case().await;
+
+            assert!(stage_through(&instance, &fs).await.is_err());
+            assert_eq!(
+                status_of(&instance, &fs).await,
+                [(
+                    "dir".to_string(),
+                    (lore_revision::interface::LoreFileAction::Move, true)
+                )]
+                .into()
+            );
+            assert_eq!(listed(&fs, ROOT_INO).await, ["Top.txt", "dir"]);
+        })
+        .await;
+}
+
+/// A file removed, a file created and a file edited in a directory, a status, then the directory
+/// renamed in case through the mount: the commit under the case handling that renames holds the
+/// new spelling, the created and the edited file, and not the removed one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_renaming_in_case_keeps_the_changes_a_status_marked_below_the_directory() {
+    let instance = Instance::new(&[
+        ("Dir/a.txt", b"Dir/a.txt"),
+        ("Dir/b.txt", b"Dir/b.txt"),
+        ("Top.txt", b"Top.txt"),
+    ])
+    .await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let dir = lookup(&fs, ROOT_INO, "Dir").await.expect("Dir");
+            removed_through(&fs, "Dir/b.txt", false).await;
+            create_with(&fs, dir, "new.txt", b"new").await;
+            let a = lookup(&fs, dir, "a.txt").await.expect("a.txt");
+            fs.write(&request(), a, 0, 0, b"edited!!!", 0)
+                .await
+                .expect("write");
+            changed_paths_holding_token(&instance, &fs).await;
+            fs.rename(&request(), ROOT_INO, b"Dir", ROOT_INO, b"dir", 0)
+                .await
+                .expect("rename Dir to dir");
+
+            stage_case_through(
+                &instance,
+                &fs,
+                lore_revision::stage::StageCaseChange::Rename,
+            )
+            .await
+            .expect("stage");
+            let committed = commit_staged(&instance, &fs).await.expect("commit");
+            let tree = revision_tree(&instance, committed).await;
+            assert_eq!(
+                tree.keys().collect::<Vec<_>>(),
+                ["Top.txt", "dir", "dir/a.txt", "dir/new.txt"]
+            );
+            assert_eq!(tree["dir/a.txt"].as_deref(), Some(&b"edited!!!"[..]));
+        })
+        .await;
+}
+
+/// A reset of a path named in another case than the mount spells it resets the file the mount
+/// holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_of_a_path_named_in_another_case_resets_the_file_the_mount_holds() {
+    let instance = Instance::new(&[("dir/a.txt", b"a"), ("Top.txt", b"t")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let a = lookup_path(&fs, "dir/a.txt").await.expect("dir/a.txt");
+            fs.write(&request(), a, 0, 0, b"edited", 0)
+                .await
+                .expect("write");
+
+            reset_through(&instance, &fs, &["Dir/A.txt"], None, false)
+                .await
+                .expect("reset");
+            assert_eq!(served_at(&fs, "dir/a.txt").await, b"a");
+            assert_eq!(status_of(&instance, &fs).await, Default::default());
+        })
+        .await;
+}
+
+/// An unstage of a path named in another case than the mount spells it unstages the file the
+/// mount holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unstage_of_a_path_named_in_another_case_unstages_the_file_the_mount_holds() {
+    use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreString;
+    use lore_revision::repository::RepositoryWriteToken;
+
+    let instance = Instance::new(&[("dir/a.txt", b"a"), ("Top.txt", b"t")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let a = lookup_path(&fs, "dir/a.txt").await.expect("dir/a.txt");
+            fs.write(&request(), a, 0, 0, b"edited", 0)
+                .await
+                .expect("write");
+            stage_paths_through(&instance, &fs, &["dir/a.txt"])
+                .await
+                .expect("stage");
+
+            let token = RepositoryWriteToken::acquire(&instance.fixture.path).await;
+            lore_revision::file::unstage::unstage(
+                instance.command_context(&fs, Some(token.share())),
+                &token,
+                LoreArray::from_vec(vec![LoreString::from(
+                    &instance.fixture.path.join("Dir/A.txt"),
+                )]),
+                Default::default(),
+            )
+            .await
+            .expect("unstage");
+            drop(token);
+            assert_eq!(
+                status_of(&instance, &fs).await,
+                [(
+                    "dir/a.txt".to_string(),
+                    (lore_revision::interface::LoreFileAction::Keep, true)
+                )]
+                .into()
+            );
+        })
+        .await;
+}
+
+/// A stage of a path named in another case than the mount spells it stages the file the mount
+/// holds, as on an ordinary instance, and the commit records it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_of_a_path_named_in_another_case_stages_the_file_the_mount_holds() {
+    let instance = Instance::new(&[("dir/a.txt", b"a"), ("Top.txt", b"t")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let a = lookup_path(&fs, "dir/a.txt").await.expect("dir/a.txt");
+            fs.write(&request(), a, 0, 0, b"edited", 0)
+                .await
+                .expect("write");
+
+            stage_paths_through(&instance, &fs, &["Dir/A.txt"])
+                .await
+                .expect("stage");
+            let committed = commit_staged(&instance, &fs).await.expect("commit");
+            let tree = revision_tree(&instance, committed).await;
+            assert_eq!(
+                tree.keys().collect::<Vec<_>>(),
+                ["Top.txt", "dir", "dir/a.txt"]
+            );
+            assert_eq!(tree["dir/a.txt"].as_deref(), Some(&b"edited"[..]));
+        })
+        .await;
+}
+
+/// A directory renamed in case through the mount and back after a status marked it moved stages
+/// it at the revision's spelling.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_directory_renamed_in_case_and_back_after_a_status_stages_it_as_the_revision_spells_it() {
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let (instance, fs) = directory_renamed_in_case().await;
+            changed_paths_holding_token(&instance, &fs).await;
+            fs.rename(&request(), ROOT_INO, b"dir", ROOT_INO, b"Dir", 0)
+                .await
+                .expect("rename dir to Dir");
+
+            assert_eq!(status_of(&instance, &fs).await, Default::default());
+            let staged = stage_through(&instance, &fs).await.expect("stage");
+            assert_eq!(
+                revision_paths(&instance, staged).await,
+                [
+                    "Dir",
+                    "Dir/Sub",
+                    "Dir/Sub/c.txt",
+                    "Dir/a.txt",
+                    "Dir/b.txt",
+                    "Top.txt"
+                ]
+            );
+        })
+        .await;
+}
+
+/// A stage that keeps the revision's case gives a directory renamed in case through the mount the
+/// revision's spelling again, and leaves nothing to commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_keeping_case_serves_a_directory_renamed_in_case_as_the_revision_spells_it() {
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let (instance, fs) = directory_renamed_in_case().await;
+
+            stage_case_through(&instance, &fs, lore_revision::stage::StageCaseChange::Keep)
+                .await
+                .expect("stage");
+            assert_eq!(listed(&fs, ROOT_INO).await, ["Dir", "Top.txt"]);
+            assert_eq!(lookup(&fs, ROOT_INO, "dir").await, Err(Errno::ENOENT));
+            assert_eq!(status_of(&instance, &fs).await, Default::default());
+        })
+        .await;
+}
+
+/// An instance at a revision holding `files` and the empty directories `Dir/Sub/Deep` and
+/// `Dir/Other`, and a provider over it in which `Dir` was renamed to `dir`.
+async fn empty_directories_renamed_in_case(
+    files: &[(&str, &[u8])],
+) -> (Instance, Arc<FuseFilesystem>) {
+    let instance = Instance::new(files).await;
+    let fs = provider(&instance).await;
+    let mkdir = async |parent: u64, name: &[u8]| {
+        fs.mkdir(&request(), parent, name, libc::S_IFDIR | 0o755, 0o022)
+            .await
+            .expect("mkdir")
+            .ino
+    };
+    let dir = match lookup(&fs, ROOT_INO, "Dir").await {
+        Ok(dir) => dir,
+        Err(_) => mkdir(ROOT_INO, b"Dir").await,
+    };
+    let sub = mkdir(dir, b"Sub").await;
+    mkdir(sub, b"Deep").await;
+    mkdir(dir, b"Other").await;
+    let revision = commit_through(&instance, &fs, false).await.expect("commit");
+    let fs = provider_at(&instance, revision).await;
+    lookup(&fs, ROOT_INO, "Dir").await.expect("Dir");
+    fs.rename(&request(), ROOT_INO, b"Dir", ROOT_INO, b"dir", 0)
+        .await
+        .expect("rename Dir to dir");
+    (instance, fs)
+}
+
+/// A directory holding only empty directories, renamed in case through the mount, is staged as a
+/// move under the case handling that renames, and the commit's revision spells it as the mount
+/// does, with every empty directory below it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_renaming_in_case_records_a_directory_holding_only_empty_directories() {
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let (instance, fs) =
+                empty_directories_renamed_in_case(&[("Top.txt", b"Top.txt")]).await;
+            let renamed = ["Top.txt", "dir", "dir/Other", "dir/Sub", "dir/Sub/Deep"];
+
+            let staged = stage_case_through(
+                &instance,
+                &fs,
+                lore_revision::stage::StageCaseChange::Rename,
+            )
+            .await
+            .expect("stage");
+            assert_eq!(revision_paths(&instance, staged).await, renamed);
+            let committed = commit_staged(&instance, &fs).await.expect("commit");
+            assert_eq!(revision_paths(&instance, committed).await, renamed);
+            assert_eq!(listed(&fs, ROOT_INO).await, ["Top.txt", "dir"]);
+            assert_eq!(status_of(&instance, &fs).await, Default::default());
+        })
+        .await;
+}
+
+/// The empty directories beside a file below a directory renamed in case through the mount commit
+/// at the directory's new spelling under the case handling that renames.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_renaming_in_case_records_empty_directories_beside_a_file_below_the_directory() {
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let (instance, fs) = empty_directories_renamed_in_case(&[
+                ("Dir/a.txt", b"Dir/a.txt"),
+                ("Top.txt", b"Top.txt"),
+            ])
+            .await;
+            let renamed = [
+                "Top.txt",
+                "dir",
+                "dir/Other",
+                "dir/Sub",
+                "dir/Sub/Deep",
+                "dir/a.txt",
+            ];
+
+            let staged = stage_case_through(
+                &instance,
+                &fs,
+                lore_revision::stage::StageCaseChange::Rename,
+            )
+            .await
+            .expect("stage");
+            assert_eq!(revision_paths(&instance, staged).await, renamed);
+            let committed = commit_staged(&instance, &fs).await.expect("commit");
+            assert_eq!(revision_paths(&instance, committed).await, renamed);
+            assert_eq!(status_of(&instance, &fs).await, Default::default());
+        })
+        .await;
+}
+
+/// An instance over `Dir/a.txt` and `Top.txt`, and a provider over it in which `Dir/a.txt` was
+/// removed and `Dir` then renamed to `dir`.
+async fn emptied_directory_renamed_in_case() -> (Instance, Arc<FuseFilesystem>) {
+    let instance = Instance::new(&[("Dir/a.txt", b"Dir/a.txt"), ("Top.txt", b"Top.txt")]).await;
+    let fs = provider(&instance).await;
+    removed_through(&fs, "Dir/a.txt", false).await;
+    lookup(&fs, ROOT_INO, "Dir").await.expect("Dir");
+    fs.rename(&request(), ROOT_INO, b"Dir", ROOT_INO, b"dir", 0)
+        .await
+        .expect("rename Dir to dir");
+    (instance, fs)
+}
+
+/// A directory renamed in case through the mount, and a directory below it renamed in case too,
+/// commit at their new spellings under the case handling that renames, with the file below both.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_renaming_in_case_records_directories_renamed_in_case_one_below_the_other() {
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let (instance, fs) = directory_renamed_in_case().await;
+            let dir = lookup_path(&fs, "dir").await.expect("dir");
+            lookup(&fs, dir, "Sub").await.expect("Sub");
+            fs.rename(&request(), dir, b"Sub", dir, b"sub", 0)
+                .await
+                .expect("rename Sub to sub");
+            let renamed = [
+                "Top.txt",
+                "dir",
+                "dir/a.txt",
+                "dir/b.txt",
+                "dir/sub",
+                "dir/sub/c.txt",
+            ];
+
+            let staged = stage_case_through(
+                &instance,
+                &fs,
+                lore_revision::stage::StageCaseChange::Rename,
+            )
+            .await
+            .expect("stage");
+            assert_eq!(revision_paths(&instance, staged).await, renamed);
+            let committed = commit_staged(&instance, &fs).await.expect("commit");
+            assert_eq!(revision_paths(&instance, committed).await, renamed);
+        })
+        .await;
+}
+
+/// A status reports the file removed below a directory renamed in case through the mount as a
+/// deletion still to stage, beside the directory's move, however the two settle in the diff: over
+/// ten instances, as the diff settles them in either order.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_reports_a_removal_below_a_directory_renamed_in_case_as_marked() {
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let marked: std::collections::BTreeMap<_, _> = [
+                (
+                    "Dir/a.txt".to_string(),
+                    (lore_revision::interface::LoreFileAction::Delete, true),
+                ),
+                (
+                    "dir".to_string(),
+                    (lore_revision::interface::LoreFileAction::Move, true),
+                ),
+            ]
+            .into();
+            for _ in 0..10 {
+                let (instance, fs) = emptied_directory_renamed_in_case().await;
+
+                assert_eq!(status_of(&instance, &fs).await, marked);
+                assert_eq!(status_of(&instance, &fs).await, marked);
+            }
+        })
+        .await;
+}
+
+/// A directory whose only file was removed, then renamed in case through the mount, commits at its
+/// new spelling under the case handling that renames, without the removed file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_renaming_in_case_records_a_directory_emptied_before_its_rename() {
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let (instance, fs) = emptied_directory_renamed_in_case().await;
+
+            let staged = stage_case_through(
+                &instance,
+                &fs,
+                lore_revision::stage::StageCaseChange::Rename,
+            )
+            .await
+            .expect("stage");
+            assert_eq!(revision_paths(&instance, staged).await, ["Top.txt", "dir"]);
+            let committed = commit_staged(&instance, &fs).await.expect("commit");
+            assert_eq!(
+                revision_paths(&instance, committed).await,
+                ["Top.txt", "dir"]
+            );
+            assert_eq!(status_of(&instance, &fs).await, Default::default());
+        })
+        .await;
+}
+
+/// Stages the whole tree through `fs` with `case_change`, as `lore stage --case` does, in a context
+/// whose view leaves out `globs`.
+async fn stage_case_viewed_through(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+    globs: &[&str],
+    case_change: lore_revision::stage::StageCaseChange,
+) -> Result<Hash, String> {
+    use fuse_fixture::RepositoryContextCreationArgsExt as _;
+    use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreString;
+    use lore_revision::repository::RepositoryWriteToken;
+
+    let filter = view_excluding(globs);
+    let token = RepositoryWriteToken::acquire(&instance.fixture.path).await;
+    let context = lore_revision::repository::RepositoryContext::new(
+        instance
+            .args_over(instance.fixture.immutable.clone())
+            .with_filesystem_provider(Arc::new(FuseProvider(fs.clone())))
+            .with_filter(Arc::new(filter)),
+    )
+    .with_write_token(token.share());
+    lore_revision::file::stage::stage(
+        Arc::new(context),
+        &token,
+        LoreArray::from_vec(vec![LoreString::from(&instance.fixture.path)]),
+        lore_revision::stage::StageOptions {
+            case_change,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|error| format!("stage: {error}"))
+}
+
+/// A directory renamed in case through the mount whose only file the view leaves out is staged at
+/// its new spelling under the case handling that renames, with the file below it, and refused
+/// under the default case handling.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_renaming_in_case_records_a_directory_whose_file_the_view_leaves_out() {
+    let instance = Instance::new(&[
+        ("Dir/secret.bin", b"Dir/secret.bin"),
+        ("Top.txt", b"Top.txt"),
+    ])
+    .await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = viewed_provider(&instance, &["secret.bin"]).await;
+            lookup(&fs, ROOT_INO, "Dir").await.expect("Dir");
+            fs.rename(&request(), ROOT_INO, b"Dir", ROOT_INO, b"dir", 0)
+                .await
+                .expect("rename Dir to dir");
+
+            assert!(
+                stage_case_viewed_through(&instance, &fs, &["secret.bin"], Default::default())
+                    .await
+                    .is_err()
+            );
+            let staged = stage_case_viewed_through(
+                &instance,
+                &fs,
+                &["secret.bin"],
+                lore_revision::stage::StageCaseChange::Rename,
+            )
+            .await
+            .expect("stage");
+            assert_eq!(
+                revision_paths(&instance, staged).await,
+                ["Top.txt", "dir", "dir/secret.bin"]
+            );
+        })
+        .await;
+}
+
+/// A directory whose files were all removed, one below a directory of its own, then renamed in case
+/// through the mount, commits at its new spelling under the case handling that renames, without the
+/// removed files and with the directory they left.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_renaming_in_case_records_the_removals_below_a_directory_holding_only_removals() {
+    let instance = Instance::new(&[
+        ("Dir/a.txt", b"Dir/a.txt"),
+        ("Dir/Sub/c.txt", b"Dir/Sub/c.txt"),
+        ("Top.txt", b"Top.txt"),
+    ])
+    .await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            removed_through(&fs, "Dir/a.txt", false).await;
+            removed_through(&fs, "Dir/Sub/c.txt", false).await;
+            lookup(&fs, ROOT_INO, "Dir").await.expect("Dir");
+            fs.rename(&request(), ROOT_INO, b"Dir", ROOT_INO, b"dir", 0)
+                .await
+                .expect("rename Dir to dir");
+            let renamed = ["Top.txt", "dir", "dir/Sub"];
+
+            let staged = stage_case_through(
+                &instance,
+                &fs,
+                lore_revision::stage::StageCaseChange::Rename,
+            )
+            .await
+            .expect("stage");
+            assert_eq!(revision_paths(&instance, staged).await, renamed);
+            let committed = commit_staged(&instance, &fs).await.expect("commit");
+            assert_eq!(revision_paths(&instance, committed).await, renamed);
+            assert_eq!(status_of(&instance, &fs).await, Default::default());
+        })
+        .await;
+}
+
+/// A stage under the default case handling refuses a directory whose only file was removed, then
+/// renamed in case through the mount.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_refuses_a_directory_emptied_before_its_rename_in_case_by_default() {
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let (instance, fs) = emptied_directory_renamed_in_case().await;
+            let reported = status_of(&instance, &fs).await;
+
+            assert!(stage_through(&instance, &fs).await.is_err());
+            assert_eq!(status_of(&instance, &fs).await, reported);
+            assert_eq!(listed(&fs, ROOT_INO).await, ["Top.txt", "dir"]);
+        })
+        .await;
+}
+
+/// A stage that keeps the revision's case gives a directory whose only file was removed, then
+/// renamed in case through the mount, the revision's spelling again, and stages the removal.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_keeping_case_respells_a_directory_emptied_before_its_rename() {
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let (instance, fs) = emptied_directory_renamed_in_case().await;
+
+            let staged =
+                stage_case_through(&instance, &fs, lore_revision::stage::StageCaseChange::Keep)
+                    .await
+                    .expect("stage");
+            assert_eq!(listed(&fs, ROOT_INO).await, ["Dir", "Top.txt"]);
+            assert_eq!(lookup(&fs, ROOT_INO, "dir").await, Err(Errno::ENOENT));
+            assert_eq!(revision_paths(&instance, staged).await, ["Dir", "Top.txt"]);
+        })
+        .await;
+}
+
+/// A stage under the default case handling refuses a directory holding only empty directories
+/// renamed in case through the mount, as it refuses one with a file below it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_refuses_a_directory_holding_only_empty_directories_renamed_in_case_by_default() {
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let (instance, fs) =
+                empty_directories_renamed_in_case(&[("Top.txt", b"Top.txt")]).await;
+
+            assert!(stage_through(&instance, &fs).await.is_err());
+            assert_eq!(
+                status_of(&instance, &fs).await,
+                [(
+                    "dir".to_string(),
+                    (lore_revision::interface::LoreFileAction::Move, true)
+                )]
+                .into()
+            );
+            assert_eq!(listed(&fs, ROOT_INO).await, ["Top.txt", "dir"]);
+        })
+        .await;
+}
+
+/// A stage that keeps the revision's case gives a directory holding only empty directories,
+/// renamed in case through the mount, the revision's spelling again, and leaves nothing to report.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_keeping_case_respells_a_directory_holding_only_empty_directories() {
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let (instance, fs) =
+                empty_directories_renamed_in_case(&[("Top.txt", b"Top.txt")]).await;
+
+            stage_case_through(&instance, &fs, lore_revision::stage::StageCaseChange::Keep)
+                .await
+                .expect("stage");
+            assert_eq!(listed(&fs, ROOT_INO).await, ["Dir", "Top.txt"]);
+            assert_eq!(lookup(&fs, ROOT_INO, "dir").await, Err(Errno::ENOENT));
+            assert_eq!(status_of(&instance, &fs).await, Default::default());
         })
         .await;
 }

@@ -836,7 +836,7 @@ fn dirtied() -> Snapshot {
 }
 
 /// The paths a collection from the root reports through `l` pinning [`PINNED`] in [`dirtied`].
-const THROUGH: [&str; 3] = ["l/a", "l/n/m", "l/o"];
+const THROUGH: [&str; 4] = ["l/a", "l/n", "l/n/m", "l/o"];
 
 /// The violation the model reports of a collection leaving out a path below a dirty link it named.
 const BELOW: &str = "leaving out a path its pinned revision holds below it";
@@ -905,11 +905,10 @@ fn collected_through(
 }
 
 /// A collection naming a dirty link reports the paths a collection of its pinned revision makes
-/// from the node the pin exposes, spelled below the link's path: dirty files, dirty deletes and
-/// dirty adds staged or heading no chain, nothing below a dirty delete; the link's own path where
-/// the node is a dirty add with no child but a `Discarded` one, none where it is a file. One left
-/// out, one more, one twice, a clean file's, one below a dirty delete, a dirty add its children
-/// carry or the link's own is caught.
+/// from the node the pin exposes, spelled below the link's path: dirty files, dirty deletes, and
+/// dirty adds and dirty moves not staged, whatever they hold, nothing below a dirty delete; the
+/// link's own path where the node stands for itself, none where it is a file. One left out, one
+/// more, one twice, a clean file's, one below a dirty delete or the link's own is caught.
 #[test]
 fn a_collection_through_a_dirty_link_reports_what_its_pinned_revision_holds() {
     let made = made();
@@ -920,7 +919,7 @@ fn a_collection_through_a_dirty_link_reports_what_its_pinned_revision_holds() {
             |paths: &[&str]| collected_through((&made, dirtied()), &named, (span, paths), gate);
         clean(&collecting(&THROUGH));
         caught(&collecting(&["l/a", "l/o"]), 5, BELOW);
-        for more in ["l/b", "l/o/p", "l/n", "l"] {
+        for more in ["l/b", "l/o/p", "l"] {
             let paths = [&THROUGH[..], &[more]].concat();
             caught(&collecting(&paths), 5, UNNAMED);
         }

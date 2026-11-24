@@ -6,7 +6,7 @@ import pytest
 from error_types import LOCAL_MODIFICATIONS, LocalChanges
 from link_helpers import build_nested_link_repos_at, fail_unless_holds, link_pin
 from lore_parsers import parse_status_json
-from test_utils import to_posix, unstaged_entries, working_tree_files
+from test_utils import status_by_path, to_posix, unstaged_entries, working_tree_files
 
 pytestmark = pytest.mark.own_vfs(
     "links a repository, which a virtual clone does not hold"
@@ -732,3 +732,23 @@ def test_unstage_below_a_nested_link_leaves_what_a_forced_stage_staged_past_the_
     repo_c.sync()
     with repo_c.open_file("Hidden/new.txt") as committed:
         assert committed.read() == content
+
+
+@pytest.mark.smoke
+def test_nested_link_commit_of_two_files_named_in_a_new_directory(new_lore_repo):
+    """Two files named in a new directory of a link inside a link (A -> B -> C), staged by name,
+    commit into C, after which a scan finds nothing changed."""
+    repo_a, _repo_b, repo_c, _b_mount, nested_mount = build_nested_link_repos_at(
+        new_lore_repo, "vendor/b", "inner/c"
+    )
+    files = [f"{nested_mount}/new/a.txt", f"{nested_mount}/new/b.txt"]
+    repo_a.write_files(dict.fromkeys(files, "new\n"))
+
+    repo_a.stage(files)
+    repo_a.commit("Two files in C", non_interactive=True)
+    repo_a.push()
+
+    assert status_by_path(repo_a, scan=True) == {}
+    repo_c.sync()
+    for name in ("a.txt", "b.txt"):
+        assert os.path.isfile(os.path.join(repo_c.path, "new", name)), name

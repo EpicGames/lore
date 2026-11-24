@@ -135,10 +135,9 @@ pub(super) struct Answered {
     hopped: usize,
     crossed_at: Option<u64>,
     /// Each child a dirty-paths collection named, in order, and whether its root, as the model held
-    /// it at its head read, was a dirty add with no child but `Discarded` ones, which its walk
-    /// passes.
+    /// it at its head read, stood for itself ([`stands_alone`]).
     namings: Vec<Naming>,
-    root_empty_add: bool,
+    root_stands: bool,
     /// Whether the listing it names, for a read by a listing's mark, was a marked listing of its
     /// directory on its State whose head read the replay had met as it began, its mark judging
     /// its claims ([`ByMark`]).
@@ -1309,9 +1308,8 @@ impl Replay<'_> {
                     || (call.target == Some(*node) && Flagged::of(call.kind).is_some())
                     || collects(call) =>
             {
-                // Whether a collection's root is a dirty add its walk finds empty, at its head read.
                 if collects(call) && answered.heads.is_empty() {
-                    answered.root_empty_add = empty_add(self.state, *node);
+                    answered.root_stands = stands_alone(self.state, *node);
                 }
                 // The chain's head only a marked listing's mark keeps.
                 let head = lists_marked(call)
@@ -1920,21 +1918,19 @@ fn live_in(slot: &Slot, dir: NodeID) -> bool {
     slot.status == Status::Chained && !slot.is_discarded() && slot.record.parent == dir
 }
 
-/// Whether a collection reports `record`: a dirty file, a dirty delete, or a dirty add
-/// [`reported_add`] keeps.
+/// Whether a collection reports `record`: a dirty file, a dirty delete, or a directory
+/// [`reported_marked`] keeps.
 fn reportable(record: &Node) -> bool {
     (record.is_file() && record.is_dirty())
-        || reported_add(record)
+        || reported_marked(record)
         || (record.is_directory() && record.is_dirty_delete())
 }
 
-/// Whether a collection reports `record`, a directory, as a dirty add: one staged, or heading no
-/// chain, as `marked_directory_carried_by_children` (state.rs) leaves the children of one only
-/// marked to carry it.
-fn reported_add(record: &Node) -> bool {
+/// Whether a collection reports `record`, a directory, at its own path, whatever it holds: a dirty
+/// add, and a dirty move not staged, as `stages_as_itself` (state.rs) takes one.
+fn reported_marked(record: &Node) -> bool {
     record.is_directory()
-        && record.is_dirty_add()
-        && (record.is_staged() || record.child().is_none())
+        && (record.is_dirty_add() || record.is_dirty_move() && !record.is_staged())
 }
 
 /// Whether a collection descends into `record`: a directory, dirty and no dirty delete.
@@ -1971,9 +1967,9 @@ fn collected_path(state: &StateModel, (root, listed): (NodeID, u64), node: NodeI
 
 /// Whether `node` stands for `call`, a collection, from `scope`, its root and its root's head read,
 /// at a path it did not report: a node it reports ([`reportable`]) at its [`collected_path`], or its
-/// root, but the State's, an [`empty_add`], at the empty path; or a dirty link there, which it
-/// follows, with a path the revision its pin names holds below it ([`linked_paths`]) unreported,
-/// or a pin the model does not follow.
+/// root, but the State's, where it [`stands_alone`], at the empty path; or a dirty link there,
+/// which it follows, with a path the revision its pin names holds below it ([`linked_paths`])
+/// unreported, or a pin the model does not follow.
 fn left_out(
     (state, revisions): (&StateModel, &BTreeMap<Hash, Snapshot>),
     call: &Call,
@@ -1983,7 +1979,7 @@ fn left_out(
     let unreported = |path: u64| call.paths.binary_search(&path).is_err();
     let (root, _) = scope;
     if node == root {
-        return root != ROOT_NODE && empty_add(state, root) && unreported(spelling(b""));
+        return root != ROOT_NODE && stands_alone(state, root) && unreported(spelling(b""));
     }
     let Some(record) = state.slot(node).map(|slot| &slot.record) else {
         return false;
@@ -2001,12 +1997,12 @@ fn left_out(
 
 /// The spellings of the paths a collection of `snapshot`, a dirty link's pinned revision, reports
 /// from `node`, the node the pin exposes, below the link's path `below`, sorted, as the product
-/// walks a linked State: none for a file; the link's own path for a dirty-add directory with no
-/// child but `Discarded` ones; else each dirty child not `Discarded`, a file, a dirty add
-/// [`reported_add`] keeps and a dirty delete reported, a dirty directory but a delete descended
-/// into. `None` where the pinned
-/// node is a link or the walk meets a dirty one, the product following either into a third State,
-/// or a node, a name or a chain the snapshot does not hold: not modelled, as no fixture holds one.
+/// walks a linked State: none for a file; the link's own path for a pinned directory that stands
+/// for itself, as [`stands_alone`] says of a root; each dirty child not `Discarded`, a file, a
+/// directory [`reported_marked`] keeps and a dirty delete reported, a dirty directory but a delete
+/// descended into. `None` where the pinned node is a link or the walk meets a dirty one, the
+/// product following either into a third State, or a node, a name or a chain the snapshot does not
+/// hold: not modelled, as no fixture holds one.
 fn linked_paths(snapshot: &Snapshot, node: NodeID, below: u64) -> Option<Vec<u64>> {
     let (pinned, _) = snapshot.slot(node)?;
     let mut paths = Vec::new();
@@ -2028,7 +2024,7 @@ fn linked_paths(snapshot: &Snapshot, node: NodeID, below: u64) -> Option<Vec<u64
             } else if record.is_link() {
                 return None;
             } else {
-                if reported_add(record) {
+                if reported_marked(record) {
                     paths.push(spelled);
                 }
                 if record.is_dirty_delete() {
@@ -2038,7 +2034,7 @@ fn linked_paths(snapshot: &Snapshot, node: NodeID, below: u64) -> Option<Vec<u64
                 }
             }
         }
-        if dir == node && empty && pinned.is_directory() && pinned.is_dirty_add() {
+        if dir == node && stands(pinned, empty) {
             paths.push(below);
         }
     }
@@ -2046,11 +2042,27 @@ fn linked_paths(snapshot: &Snapshot, node: NodeID, below: u64) -> Option<Vec<u64
     Some(paths)
 }
 
-/// Whether `dir` is a dirty-add directory with no child but `Discarded` ones, which a walk passes:
-/// a collection's empty root, reported at its own path unless the State's root.
-fn empty_add(state: &StateModel, dir: NodeID) -> bool {
-    (state.slot(dir)).is_some_and(|slot| slot.record.is_directory() && slot.record.is_dirty_add())
-        && state.children(dir).all(|(_, word)| word.is_discarded())
+/// Whether `dir` stands for itself as a collection's root, reported at its own path unless the
+/// State's root: [`stands`] of its record, empty where it holds no child but `Discarded` ones,
+/// which a walk passes.
+fn stands_alone(state: &StateModel, dir: NodeID) -> bool {
+    (state.slot(dir)).is_some_and(|slot| {
+        stands(
+            &slot.record,
+            state.children(dir).all(|(_, word)| word.is_discarded()),
+        )
+    })
+}
+
+/// Whether `record`, a collection's root, stands for itself: a directory marked added or moved,
+/// not staged, whatever it holds, or a staged add holding nothing (`empty`).
+fn stands(record: &Node, empty: bool) -> bool {
+    record.is_directory()
+        && if record.is_staged() {
+            record.is_dirty_add() && empty
+        } else {
+            record.is_dirty_add() || record.is_dirty_move()
+        }
 }
 
 /// Each node below `dir` that [`left_out`] finds, into `reach`, descending as a collection does:
@@ -2184,12 +2196,13 @@ fn name_is_judged(call: &Call, answered: &Answered, is: bool) -> Option<String> 
 
 /// What is wrong with a collection's paths, by its call's own records, which rebuild its walk
 /// ([`walked`]). Each named file reported, each named directory it did not descend into reported,
-/// as a dirty delete, and no path more times than the nodes it named spell it, its empty root's
-/// once where it named none, which the State's root never is. Under the gate, where nothing lands
-/// between a child's words and its name: each named child dirty and in its directory as it read
-/// the name, each named directory descended into but a dirty delete and reported as a dirty add or
-/// a dirty delete, and its empty root reported as a dirty add; the gate alone catches a plain dirty
-/// directory reported, a clean child named, or a dirty delete descended into. Told apart by
+/// as a dirty delete, and no path more times than the nodes it named spell it, its root's once,
+/// which the State's root never is. Under the gate, where nothing lands between a child's words
+/// and its name: each named child dirty and in its directory as it read the name, each named
+/// directory descended into but a dirty delete and reported as a dirty add, a dirty move not
+/// staged or a dirty delete and no other, and its root reported where it stands for itself
+/// ([`stands_alone`]); the gate alone catches a plain dirty directory reported, a clean child
+/// named, or a dirty delete descended into. Told apart by
 /// nothing, as no fixture makes them: a slot freed and grabbed again within the collection, a
 /// directory pushed and then freed or made a file before its pop, which reads no head, a link
 /// freed between its words and its name, and in a run of no gate a directory named twice whose
@@ -2302,7 +2315,7 @@ fn collected_judged(
         linked.extend(paths);
     }
     linked.sort_unstable();
-    let (empty, root_empty) = (spelling(b""), namings.is_empty() && root != ROOT_NODE);
+    let (empty, own_root) = (spelling(b""), root != ROOT_NODE);
     for same in call.paths.chunk_by(|one, other| one == other) {
         let path = same[0];
         let below = linked.partition_point(|&linked| linked <= path)
@@ -2312,7 +2325,7 @@ fn collected_judged(
                 spells == path && naming.held.is_none_or(|held| !held.is_link())
             })
             .count()
-            + usize::from(root_empty && path == empty)
+            + usize::from(own_root && path == empty)
             + below;
         if same.len() > spells && !(unjudged && spells == 0) {
             return Some(if spells == 0 {
@@ -2347,34 +2360,32 @@ fn collected_judged(
         if !held.is_directory() {
             continue;
         }
-        let (deleted, added) = (held.is_dirty_delete(), reported_add(&held));
+        let (deleted, marked) = (held.is_dirty_delete(), reported_marked(&held));
         // A dirty delete pushes nothing, so no head is bound to one under the gate.
         let fault = match (descended, reported(path)) {
             (false, _) if !deleted => {
                 format!("did not descend into {node}, which the model held no dirty delete")
             }
-            (_, true) if held.is_dirty_add() && !added => {
-                format!("reported {node}, a dirty-add directory its children carry")
-            }
-            (_, true) if !added && !deleted => format!(
-                "reported {node}, a directory the model held neither a dirty add nor a dirty \
-                 delete"
+            (_, true) if !marked && !deleted => format!(
+                "reported {node}, a directory the model held neither a dirty add, a dirty move \
+                 nor a dirty delete"
             ),
-            (_, false) if added || deleted => format!(
-                "did not report {node}, a directory the model held a dirty add or a dirty delete"
+            (_, false) if marked || deleted => format!(
+                "did not report {node}, a directory the model held a dirty add, a dirty move or a \
+                 dirty delete"
             ),
             _ => continue,
         };
         return Some(format!("a call of '{name}' {fault}"));
     }
-    match (root_empty, reported(empty), answered.root_empty_add) {
+    match (own_root, reported(empty), answered.root_stands) {
         (true, true, false) => Some(format!(
-            "a call of '{name}' reported its empty root {root}, which the model held no dirty add \
-             with no children"
+            "a call of '{name}' reported its root {root}, which the model held standing for \
+             nothing"
         )),
         (true, false, true) => Some(format!(
-            "a call of '{name}' did not report its empty root {root}, which the model held a \
-             dirty add with no children"
+            "a call of '{name}' did not report its root {root}, which the model held standing \
+             for itself"
         )),
         _ => None,
     }

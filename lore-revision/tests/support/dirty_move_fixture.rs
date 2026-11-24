@@ -361,6 +361,11 @@ pub fn made_directory(instance: &TestRepository, path: &str) {
     std::fs::create_dir(instance.path.join(path)).expect("mkdir");
 }
 
+/// Removes the file `path` below `instance`'s working tree.
+pub fn removed(instance: &TestRepository, path: &str) {
+    std::fs::remove_file(instance.path.join(path)).expect("the delete on disk");
+}
+
 /// Removes the directory `path` and everything in it below `instance`'s working tree.
 pub fn removed_directory(instance: &TestRepository, path: &str) {
     std::fs::remove_dir_all(instance.path.join(path)).expect("the delete on disk");
@@ -713,7 +718,8 @@ impl RemovedMove {
     /// at the target come back to it, marked deleted; where the committed path is taken, the node
     /// keeps its move, `n` stays, and what took the path is marked added. A file below a moved
     /// directory is then marked deleted at the Free and Committed targets; at the Added one it
-    /// keeps its move, and a stage stages its deletion. A stage stages the other marks.
+    /// keeps its move, and a stage stages its deletion. A stage stages the other marks, and a moved
+    /// directory the working tree no longer holds as deleted.
     pub fn held(self, settled: Settled) -> Vec<Held> {
         use Held::*;
         let held: &[Held] = match (self.target, self.directory, self.taken, settled) {
@@ -735,7 +741,7 @@ impl RemovedMove {
                 &[StagedDelete, StagedDelete, Nothing, Nothing, Nothing]
             }
             (Target::Added, true, true, Settled::Staged) => {
-                &[StagedAdd, Nothing, StagedAdd, StagedMove, StagedDelete]
+                &[StagedAdd, Nothing, StagedAdd, StagedDelete, StagedDelete]
             }
             (Target::Committed, false, false, Settled::Marked) => &[DirtyDelete, DirtyDelete],
             (Target::Committed, false, false, Settled::Staged) => &[StagedDelete, StagedDelete],
@@ -754,6 +760,9 @@ impl RemovedMove {
             (_, true, false, Settled::Marked) => &[DirtyDelete, DirtyDelete, Nothing, Nothing],
             (_, true, true, Settled::Marked) => &[DirtyAdd, Nothing, DirtyMove, DirtyDelete],
             (_, true, false, Settled::Staged) => &[StagedDelete, StagedDelete, Nothing, Nothing],
+            (Target::Free, true, true, Settled::Staged) => {
+                &[StagedAdd, Nothing, StagedDelete, StagedDelete]
+            }
             (_, true, true, Settled::Staged) => &[StagedAdd, Nothing, StagedMove, StagedDelete],
         };
         held.to_vec()

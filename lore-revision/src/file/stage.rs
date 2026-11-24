@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use futures::StreamExt;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use tokio::task::JoinSet;
@@ -19,6 +20,7 @@ use crate::interface::LoreArray;
 use crate::interface::LoreString;
 use crate::layer;
 use crate::link::LinkTracker;
+use crate::link::LinkedState;
 use crate::lore::Hash;
 use crate::lore::execution_context;
 use crate::lore_debug;
@@ -44,6 +46,7 @@ use crate::stage::StageOptions;
 use crate::stage::StageStats;
 use crate::state;
 use crate::state::Clear;
+use crate::state::DirtyPaths;
 use crate::state::Ext;
 use crate::state::Mark;
 use crate::state::NameChange;
@@ -68,12 +71,14 @@ struct TreeWalkPath {
     prefixes: Option<Arc<crate::util::fs::ResolvedPrefixes>>,
 }
 
-/// A shared ancestor once created: its node, and the path it was found at, which the walks below
-/// it start from rather than the spelling they were given.
+/// A shared ancestor once created: its node, the path it stands at once staged, which the walks
+/// below it start from rather than the spelling they were given, and the linked repository and
+/// State that hold it, where it lies inside a link.
 #[lore_macro::test_pub]
 struct CreatedAncestor {
     node: crate::node::NodeID,
     path: RelativePath,
+    linked: Option<LinkedState>,
 }
 
 /// Where the walk for a target starts. Neither answer is a failure: a target with no created
@@ -85,6 +90,7 @@ enum WalkStart {
     BelowAncestor {
         path: RelativePath,
         node: crate::node::NodeID,
+        linked: Option<LinkedState>,
         remainder: RelativePath,
     },
     /// The repository root, with the target untouched. The memo is keyed from that root, so this
@@ -108,11 +114,12 @@ fn walk_start(
     let Some((prefix, created)) = longest_ancestor(target.as_str(), ancestor_nodes) else {
         return WalkStart::FromRoot(target);
     };
-    let (path, node) = (created.path.clone(), created.node);
+    let (path, node, linked) = (created.path.clone(), created.node, created.linked.clone());
     target.pop_root_repeat(path_depth(prefix));
     WalkStart::BelowAncestor {
         path,
         node,
+        linked,
         remainder: target,
     }
 }
@@ -207,7 +214,7 @@ impl StageWalk {
     }
 
     /// Where a walk of `target` starts, and what it covers below that point, mapped into the
-    /// trees this walk writes.
+    /// trees this walk writes, or into the linked State holding the ancestor it starts at.
     fn walk(
         &self,
         target: RelativePath,
@@ -217,9 +224,18 @@ impl StageWalk {
             WalkStart::BelowAncestor {
                 path,
                 node,
+                linked,
                 remainder,
             } => TreeWalkPath {
-                at: self.at(path, node),
+                at: match linked {
+                    Some((repository, state)) => NodeMapping {
+                        repository,
+                        state,
+                        path,
+                        node,
+                    },
+                    None => self.at(path, node),
+                },
                 remainder,
                 prefixes: None,
             },
@@ -229,6 +245,17 @@ impl StageWalk {
                 prefixes: self.prefixes.clone(),
             },
         }
+    }
+
+    /// The queue a walk starting at `at` leaves its discards in: the stage's own, which answers for
+    /// the stage's own State, and none for a walk starting in a linked State, as for a walk that
+    /// crosses a link.
+    fn discards_at(
+        &self,
+        at: &NodeMapping,
+        discards: &Arc<stage::DiscardQueue>,
+    ) -> stage::PendingDiscards {
+        (at.repository.id == self.repository.id).then(|| discards.clone())
     }
 }
 
@@ -272,6 +299,11 @@ struct AncestorWalk {
 
 /// Create the node for every directory the targets share, by staging it without its
 /// children, as [`fan_out::create_shared_ancestors`] orders it.
+///
+/// A directory a walk reaches across a link, the root of a repository mounted whole among them, is
+/// recorded with the linked repository and State its stage reached, at the path the tree spells it
+/// at, so the walks below it start there and do not cross the link again; one whose stage reaches
+/// no node there, as a deletion, is left unrecorded, and the walks below it cross the link.
 async fn precreate_shared_ancestors<'a>(
     walk: &StageWalk,
     shared_ancestors: &'a [DepthPath],
@@ -304,13 +336,15 @@ async fn precreate_shared_ancestors<'a>(
              resolved,
          }| {
             let start = walk_path.at.clone();
+            let own = (walk.repository.clone(), walk.state.clone());
             let operation = walk.operation.clone();
             let stats = walk.stats.clone();
             let link_tracker = walk.link_tracker.clone();
             let global_mask = walk.global_mask.clone();
-            let discards = discards.clone();
+            let discards = walk.discards_at(&start, discards);
             async move {
-                let link = stage::stage_filesystem_path(
+                let mut reached = None;
+                let link = stage::stage_filesystem_path_reaching(
                     operation,
                     walk_path.at,
                     walk_path.remainder,
@@ -320,16 +354,27 @@ async fn precreate_shared_ancestors<'a>(
                     Some(link_tracker),
                     global_mask,
                     walk_path.prefixes,
-                    Some(discards),
+                    discards,
+                    Some(&mut reached),
                 )
                 .await?;
+                if let Some(reached) = reached {
+                    return Ok(Some(CreatedAncestor {
+                        node: reached.node,
+                        path: reached.path,
+                        linked: Some((reached.repository, reached.state)),
+                    }));
+                }
                 if !link.is_valid() {
                     return Ok(None);
                 }
-                let path = created_path(&start, &link).await?.unwrap_or(resolved);
+                let path = created_path(&start, link.node).await?;
                 Ok(Some(CreatedAncestor {
                     node: link.node,
-                    path,
+                    path: path.unwrap_or(resolved),
+                    linked: link
+                        .crosses_link(&own.0, &own.1)
+                        .then(|| (start.repository.clone(), start.state.clone())),
                 }))
             }
         },
@@ -339,15 +384,19 @@ async fn precreate_shared_ancestors<'a>(
 }
 
 /// The child each walk of a level of shared ancestors names below its start, from one listing of
-/// each node two or more of the walks start at, as [`TargetDirectory`] lists a directory several
-/// targets name a child of; a walk alone at its start is left to search. The level is in path
-/// order, so the walks below one directory follow each other. Each creation of the level adds only
-/// the child its own walk names, so the listing, taken before any of them starts, answers for the
-/// rest.
+/// each node of one State two or more of the walks start at, as [`TargetDirectory`] lists a
+/// directory several targets name a child of; a walk alone at its start is left to search. The
+/// level is in path order, so the walks below one directory follow each other. Each creation of the
+/// level adds only the child its own walk names, so the listing, taken before any of them starts,
+/// answers for the rest. A node ID names a node of its own State only: the walks below two links
+/// can start at one ID in two States.
 async fn resolve_level_children(
     mut level: Vec<AncestorWalk>,
 ) -> Result<Vec<AncestorWalk>, StageError> {
-    for run in level.chunk_by_mut(|left, right| left.walk.at.node == right.walk.at.node) {
+    for run in level.chunk_by_mut(|left, right| {
+        left.walk.at.node == right.walk.at.node
+            && Arc::ptr_eq(&left.walk.at.state, &right.walk.at.state)
+    }) {
         let [first, _, ..] = &*run else {
             continue;
         };
@@ -379,23 +428,19 @@ fn resolved_or_given(
         )
 }
 
-/// The path `created` stands at, spelled by the tree below `start`, the point its walk started
-/// from.
+/// The path at which `created`, a node of `start`'s State, stands, spelled by the tree below
+/// `start`, the point its walk started from.
 ///
 /// Staging the ancestor made the tree and the file system agree on that spelling: `Keep` renames
-/// the file system to the tree, `Rename` the tree to the file system. `None` where the walk crossed
-/// into a linked repository, whose nodes `start`'s state does not hold, which leaves the caller
-/// the spelling it resolved before staging.
+/// the file system to the tree, `Rename` the tree to the file system. `None` where `start` does not
+/// hold it, which leaves the caller the spelling it resolved before staging.
 async fn created_path(
     start: &NodeMapping,
-    created: &crate::node::NodeLink,
+    created: crate::node::NodeID,
 ) -> Result<Option<RelativePath>, StageError> {
-    if created.repository != start.repository.id {
-        return Ok(None);
-    }
     let below = start
         .state
-        .node_path_below(start.repository.clone(), created.node, start.node)
+        .node_path_below(start.repository.clone(), created, start.node)
         .await
         .forward::<StageError>("Failed to resolve the path of a shared ancestor")?;
     Ok(below.map(|below| {
@@ -504,7 +549,7 @@ impl TargetDirectories {
         if remainder.is_empty() {
             return Ok(KnownChild::Unresolved);
         }
-        if self.0.last().is_none_or(|(_, node, _)| *node != at.node) {
+        if (self.0.last()).is_none_or(|(path, node, _)| *node != at.node || *path != at.path) {
             self.0
                 .push((at.path.clone(), at.node, TargetDirectory::Unnamed));
         }
@@ -546,6 +591,7 @@ async fn spawn_target_walks(
                 break;
             }
         };
+        let target_discards = walk.discards_at(&walk_path.at, discards);
         lore_spawn!(
             tasks,
             stage::stage_filesystem_path(
@@ -558,7 +604,7 @@ async fn spawn_target_walks(
                 Some(walk.link_tracker.clone()),
                 walk.global_mask.clone(),
                 walk_path.prefixes,
-                Some(discards.clone()),
+                target_discards,
             )
         );
         if let Err(err) = lore_limit_drain_tasks!(
@@ -573,6 +619,114 @@ async fn spawn_target_walks(
         }
     }
     failure
+}
+
+/// The directories of `directories`, marked added or moved, that the working tree holds, which a
+/// stage takes as themselves; each other is pushed onto `paths`, staged as any absent path is,
+/// unless the paths below it carry it ([`carried_where_absent`]). Up to
+/// [`MAX_CONCURRENT_TREE_TASKS`] directories are looked up at once, in order. Boxed by its caller,
+/// which takes it only where the collection found such a directory, so its lookups stay out of the
+/// stage's future.
+async fn directories_held(
+    operation: &InstanceOperationImpl,
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    directories: Vec<RelativePath>,
+    paths: &mut Vec<RelativePath>,
+) -> Result<Vec<RelativePath>, StageError> {
+    let mut held = Vec::with_capacity(directories.len());
+    let mut found = futures::stream::iter(directories)
+        .map(|directory| async move {
+            let holds = holds_directory(operation, &directory).await?;
+            let staged = holds || !carried_where_absent(repository, state, &directory).await?;
+            Ok::<_, StageError>((directory, holds, staged))
+        })
+        .buffered(MAX_CONCURRENT_TREE_TASKS);
+    loop {
+        let Some(directory) = found.next().await else {
+            break;
+        };
+        match directory? {
+            (directory, true, _) => held.push(directory),
+            (directory, false, true) => paths.push(directory),
+            (_, false, false) => {}
+        }
+    }
+    Ok(held)
+}
+
+/// Whether the directory marked dirty at `path`, which the working tree no longer holds, is left to
+/// the paths below it: a new one holding nodes, as they carry it
+/// ([`state::marked_directory_carried_by_children`]). Any other is staged as an absent path is.
+async fn carried_where_absent(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    path: &RelativePath,
+) -> Result<bool, StageError> {
+    let Ok((node_link, (held_repository, held_state))) = state
+        .find_relative_held(repository.clone(), ROOT_NODE, path.as_str())
+        .await
+    else {
+        return Ok(false);
+    };
+    let node = held_state
+        .node(held_repository, node_link.node)
+        .await
+        .forward::<StageError>("Failed to read a directory the working tree no longer holds")?;
+    Ok(state::marked_directory_carried_by_children(&node))
+}
+
+/// Whether the working tree holds a directory at `path`, resolved as a stage resolves a target
+/// ([`stage::stage_filesystem_path`]).
+async fn holds_directory(
+    operation: &InstanceOperationImpl,
+    path: &RelativePath,
+) -> Result<bool, StageError> {
+    let (resolved, info) = crate::util::fs::filesystem_path_and_info(operation, "", path, None)
+        .await
+        .unwrap_or_else(|_| (path.clone(), None));
+    let info = match info {
+        Some(info) => info,
+        None => operation
+            .file_info(&resolved)
+            .await
+            .forward_any::<StageError>("Failed to describe a directory to stage")?,
+    };
+    Ok(info.is_dir())
+}
+
+/// The directories a stage creates before its walks, a depth at a time, by staging each without
+/// its children ([`precreate_shared_ancestors`]): those two or more of `antichain` and `alone`
+/// share ([`fan_out::shared_ancestors`]), and each of `alone`, the directories marked added or
+/// moved the working tree holds, staged as themselves, their nodes and their parents alone. One an
+/// entry of `antichain` covers is left to that entry's walk, and a shared directory one of `alone`
+/// spells in another case gives way to it, so each node is created once.
+#[lore_macro::test_pub]
+fn created_first(antichain: &[RelativePath], alone: &[RelativePath]) -> Vec<DepthPath> {
+    if alone.is_empty() {
+        return fan_out::shared_ancestors(antichain);
+    }
+    let alone: Vec<&RelativePath> = (alone.iter())
+        .filter(|directory| !directory.covered_in(antichain))
+        .collect();
+    let mut targets: Vec<&str> = (antichain.iter().map(RelativePath::as_str))
+        .chain(alone.iter().map(|directory| directory.as_str()))
+        .collect();
+    targets.sort_unstable();
+    let spelled: std::collections::HashSet<&str> = (alone.iter())
+        .map(|directory| directory.as_lowercase_str())
+        .collect();
+    let mut created: Vec<DepthPath> = fan_out::shared_ancestors(&targets)
+        .into_iter()
+        .filter(|shared| !spelled.contains(shared.path().to_lowercase().as_str()))
+        .collect();
+    created.extend(
+        alone
+            .iter()
+            .map(|directory| DepthPath::new(directory.as_str().to_string())),
+    );
+    created.sort_unstable();
+    created
 }
 
 /// Spawn a walk per targeted layer into `tasks`, reporting the first failure as
@@ -798,10 +952,23 @@ pub async fn stage(
             .await?;
 
         let RoutedTargets {
-            current_repository_paths,
+            mut current_repository_paths,
+            current_repository_directories,
             layer_paths,
         } = route_and_resolve_targets(&repository, &state, &paths, &layer_target_refs, options)
             .await?;
+        let alone = if current_repository_directories.is_empty() {
+            Vec::new()
+        } else {
+            Box::pin(directories_held(
+                &operation,
+                &repository,
+                &state,
+                current_repository_directories,
+                &mut current_repository_paths,
+            ))
+            .await?
+        };
 
         // A root target covers the whole tree; otherwise collapse overlaps so a
         // parent target subsumes anything that would be staged beneath it.
@@ -811,7 +978,7 @@ pub async fn stage(
         } else {
             RelativePath::dedup_to_supersets(current_repository_paths)
         };
-        let shared_ancestors = fan_out::shared_ancestors(&antichain);
+        let shared_ancestors = created_first(&antichain, &alone);
         let main_count = antichain.len() + shared_ancestors.len();
         // A layer may be targeted by several paths; serialize each only once.
         let staged_layers: std::collections::BTreeSet<usize> = layer_paths
@@ -1012,6 +1179,8 @@ async fn leaves_nothing_staged(
 struct RoutedTargets {
     /// Paths to walk in the current repository.
     current_repository_paths: Vec<RelativePath>,
+    /// Directories of the current repository staged as themselves ([`DirtyPaths::directories`]).
+    current_repository_directories: Vec<RelativePath>,
     /// Layer index, and the path relative to that layer's mount. An empty path
     /// stages the layer's whole subtree.
     ///
@@ -1046,6 +1215,7 @@ async fn route_and_resolve_targets(
 ) -> Result<RoutedTargets, StageError> {
     let mut routed = RoutedTargets {
         current_repository_paths: Vec::with_capacity(paths.len()),
+        current_repository_directories: Vec::new(),
         layer_paths: Vec::new(),
     };
     let mut resolve_tasks = JoinSet::new();
@@ -1088,9 +1258,7 @@ async fn route_and_resolve_targets(
             MAX_CONCURRENT_TREE_TASKS,
             &mut failure,
             join_failure,
-            |resolved| {
-                resolved.map(|resolved| resolved.collect_into(&mut routed.current_repository_paths))
-            },
+            |resolved| resolved.map(|resolved| resolved.collect_into(&mut routed)),
         )
         .await;
     }
@@ -1100,9 +1268,7 @@ async fn route_and_resolve_targets(
         1,
         &mut failure,
         join_failure,
-        |resolved| {
-            resolved.map(|resolved| resolved.collect_into(&mut routed.current_repository_paths))
-        },
+        |resolved| resolved.map(|resolved| resolved.collect_into(&mut routed)),
     )
     .await;
     match failure {
@@ -1118,21 +1284,27 @@ async fn route_and_resolve_targets(
 /// mostly those. Naming that case keeps the common result off the heap.
 enum ResolvedTarget {
     Single(RelativePath),
-    Multiple(Vec<RelativePath>),
+    Multiple(DirtyPaths),
 }
 
 impl ResolvedTarget {
-    fn collect_into(self, targets: &mut Vec<RelativePath>) {
+    fn collect_into(self, routed: &mut RoutedTargets) {
         match self {
-            ResolvedTarget::Single(path) => targets.push(path),
-            ResolvedTarget::Multiple(paths) => targets.extend(paths),
+            ResolvedTarget::Single(path) => routed.current_repository_paths.push(path),
+            ResolvedTarget::Multiple(collected) => {
+                routed.current_repository_paths.extend(collected.paths);
+                routed
+                    .current_repository_directories
+                    .extend(collected.directories);
+            }
         }
     }
 }
 
 /// Resolve `relative_path` to the concrete set of repository-relative paths to
-/// stage. Without `scan`, a directory resolves to its dirty descendants (empty
-/// when none); `scan`, single files, paths with no node, and a directory marked
+/// stage. Without `scan`, a directory resolves to the paths
+/// [`State::collect_dirty_paths`] collects at it (none when nothing is dirty);
+/// `scan`, single files, paths with no node, and a directory marked
 /// dirty as deleted resolve to the path itself, the last so that its deletion is
 /// staged whole, as [`State::collect_dirty_paths`] records one below.
 ///
@@ -1880,4 +2052,51 @@ pub(crate) fn is_path_under_layer_mask<S: AsRef<str>>(relative_path: &str, mask:
         }
     }
     false
+}
+
+/// The walks of a stage by name, run for tests.
+#[cfg(feature = "test-util")]
+pub mod test_util {
+    use std::sync::Arc;
+
+    use super::StageWalk;
+    use crate::fs::filesystem_provider::InstanceOperationImpl;
+    use crate::link::LinkTracker;
+    use crate::repository::RepositoryContext;
+    use crate::stage;
+    use crate::stage::StageError;
+    use crate::stage::StageOptions;
+    use crate::state::NodeMapping;
+    use crate::state::State;
+    use crate::util::path::RelativePath;
+
+    /// Where the walk of each of `targets` starts, once the directories they share are created
+    /// first in `state` with the default options. The queue of discards answers for `state`
+    /// rather than the revision the stage was built on, so only walks that leave none, as below a
+    /// link, are walked as a stage walks them.
+    pub async fn walk_starts(
+        operation: Arc<InstanceOperationImpl>,
+        repository: Arc<RepositoryContext>,
+        state: Arc<State>,
+        link_tracker: Arc<LinkTracker>,
+        targets: &[RelativePath],
+    ) -> Result<Vec<NodeMapping>, StageError> {
+        let walk = StageWalk {
+            operation,
+            repository,
+            state: state.clone(),
+            stats: Arc::default(),
+            link_tracker,
+            global_mask: None,
+            prefixes: None,
+            options: StageOptions::default(),
+        };
+        let shared = super::created_first(&RelativePath::dedup_to_supersets(targets.to_vec()), &[]);
+        let discards = Arc::new(stage::DiscardQueue::new(state));
+        let ancestors = super::precreate_shared_ancestors(&walk, &shared, &discards).await?;
+        Ok(targets
+            .iter()
+            .map(|target| walk.walk(target.clone(), &ancestors).at)
+            .collect())
+    }
 }

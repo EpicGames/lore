@@ -5594,17 +5594,16 @@ impl State {
         Ok(walked.answer.is_some())
     }
 
-    /// Collect the repository-relative paths of all dirty nodes at or under
-    /// `root_node`, the set to stage. `base_path` is `root_node`'s path and the
-    /// prefix of every returned path. A link at `root_node` and each dirty link
-    /// below it are followed into the linked state each pins, up to
-    /// [`MAX_LINK_DEPTH`] links deep.
+    /// What a stage without `--scan` takes at or under `root_node` ([`DirtyPaths`]). `base_path` is
+    /// `root_node`'s path and the prefix of every returned path. A link at `root_node` and each
+    /// dirty link below it are followed into the linked state each pins, up to [`MAX_LINK_DEPTH`]
+    /// links deep.
     pub async fn collect_dirty_paths(
         &self,
         repository: Arc<RepositoryContext>,
         root_node: NodeID,
         base_path: RelativePath,
-    ) -> Result<Vec<RelativePath>, StateError> {
+    ) -> Result<DirtyPaths, StateError> {
         if let Some(pin) = self.link_pin(repository.clone(), root_node).await? {
             return Self::collect_pinned_dirty_paths(pin, &repository, base_path, 0).await;
         }
@@ -5629,7 +5628,7 @@ impl State {
         repository: &Arc<RepositoryContext>,
         path: RelativePath,
         link_depth: usize,
-    ) -> Result<Vec<RelativePath>, StateError> {
+    ) -> Result<DirtyPaths, StateError> {
         let (linked_repository, linked_state) = pin.open(repository).await?;
         Box::pin(linked_state.collect_dirty_paths_linked(
             linked_repository,
@@ -5640,14 +5639,18 @@ impl State {
         .await
     }
 
+    /// [`Self::collect_dirty_paths`] in a state reached through `link_depth` links. A directory
+    /// marked added or moved is a change of its own, whatever it holds, the collection's root but
+    /// the repository's included ([`stages_as_itself`]); the marked changes below it are collected
+    /// as well.
     async fn collect_dirty_paths_linked(
         &self,
         repository: Arc<RepositoryContext>,
         root_node: NodeID,
         base_path: RelativePath,
         link_depth: usize,
-    ) -> Result<Vec<RelativePath>, StateError> {
-        let mut result = Vec::new();
+    ) -> Result<DirtyPaths, StateError> {
+        let mut result = DirtyPaths::default();
         let force = execution_context().globals().force();
         // Work in immutable `RelativePath` throughout: `push_into_buf` borrows
         // the parent (no per-sibling clone) and a single `freeze` per retained
@@ -5663,10 +5666,14 @@ impl State {
                 .await
                 .forward::<StateError>("Failed to get children for dirty path collection")?;
 
-            if node_id == root_node && children.is_empty() && !path.is_empty() {
+            if node_id == root_node && !path.is_empty() {
                 let node = self.node(repository.clone(), node_id).await?;
-                let tracked = node.is_dirty_add()
-                    && node.is_directory()
+                let itself = stages_as_itself(&node);
+                let whole = node.is_directory()
+                    && node.is_dirty_add()
+                    && node.is_staged()
+                    && children.is_empty();
+                let tracked = (itself || whole)
                     && !force
                     && self
                         .tracks(
@@ -5675,8 +5682,7 @@ impl State {
                             NodeFlags::from_bits_retain(node.flags),
                         )
                         .await?;
-                if node.is_dirty_add()
-                    && node.is_directory()
+                if (itself || whole)
                     && (force
                         || repository.filter.should_descend(
                             states,
@@ -5684,9 +5690,12 @@ impl State {
                             FilterMode::TRACKED.at(tracked),
                         ))
                 {
-                    result.push(path);
+                    if itself {
+                        result.directories.push(path.clone());
+                    } else {
+                        result.paths.push(path.clone());
+                    }
                 }
-                continue;
             }
 
             for &child_id in &children {
@@ -5734,26 +5743,24 @@ impl State {
                 }
 
                 if child.is_file() {
-                    result.push(child_path);
+                    result.paths.push(child_path);
                 } else if child.is_link() {
                     if link_depth < MAX_LINK_DEPTH {
-                        let linked_paths = Self::collect_pinned_dirty_paths(
+                        let linked = Self::collect_pinned_dirty_paths(
                             child.linked_node(),
                             &repository,
                             child_path,
                             link_depth,
                         )
                         .await?;
-                        result.extend(linked_paths);
+                        result.paths.extend(linked.paths);
+                        result.directories.extend(linked.directories);
                     }
                 } else if child.is_directory() {
-                    // A new (dirty-add) directory is itself a change to stage. One
-                    // only marked, not staged, is that only where it is empty, with
-                    // no child to carry it: one holding nodes is carried by them,
-                    // and recorded itself it would stage everything the working
-                    // tree holds below it, marked or not.
-                    if child.is_dirty_add() && !marked_directory_carried_by_children(&child) {
-                        result.push(child_path.clone());
+                    if stages_as_itself(&child) {
+                        result.directories.push(child_path.clone());
+                    } else if child.is_dirty_add() {
+                        result.paths.push(child_path.clone());
                     }
                     // A dirty-delete directory is staged as the deletion of its
                     // whole subtree: stage_delete on a directory recurses and
@@ -5761,7 +5768,7 @@ impl State {
                     // and don't descend — collecting descendants here would only
                     // queue redundant deletes that stage_delete already covers.
                     if child.is_dirty_delete() {
-                        result.push(child_path);
+                        result.paths.push(child_path);
                     } else {
                         stack.push((child_id, child_path, child_states));
                     }
@@ -7682,11 +7689,30 @@ fn dirty_path_contributes(child: &Node, skip_staged: bool) -> bool {
         && !marked_directory_carried_by_children(child)
 }
 
-/// Whether `node` is a new directory only marked dirty, not staged, whose children carry it.
-/// Recorded itself, it would be staged or re-marked whole, taking in everything the working tree
-/// holds below it, marked or not. A staged one is still recorded: its path is what stages the
-/// removal of what staging put below it.
-fn marked_directory_carried_by_children(node: &Node) -> bool {
+/// What a stage without `--scan` takes at or under a node ([`State::collect_dirty_paths`]).
+#[derive(Debug, Default)]
+pub struct DirtyPaths {
+    /// The paths staged with what the working tree holds below them: files, deletions with their
+    /// subtrees, and staged adds, whose walk removes what staging put below them that the working
+    /// tree no longer holds.
+    pub paths: Vec<RelativePath>,
+    /// The directories staged as themselves, their nodes and their parents alone
+    /// ([`stages_as_itself`]).
+    pub directories: Vec<RelativePath>,
+}
+
+/// Whether a stage takes `node` as itself, its node and its parents alone: a directory marked
+/// added or moved, not staged, a change of its own whatever it holds.
+fn stages_as_itself(node: &Node) -> bool {
+    node.is_directory() && !node.is_staged() && (node.is_dirty_add() || node.is_dirty_move())
+}
+
+/// Whether `node` is a new directory only marked dirty, not staged, whose children carry it: a
+/// stage leaves one the working tree no longer holds to the paths below it, and a dirty walk
+/// records no path of it, as re-marked whole it would take in everything the working tree holds
+/// below it, marked or not. A staged one is still recorded: its path is what stages the removal
+/// of what staging put below it.
+pub(crate) fn marked_directory_carried_by_children(node: &Node) -> bool {
     node.is_dirty_add() && !node.is_staged() && node.is_directory() && node.child().is_some()
 }
 

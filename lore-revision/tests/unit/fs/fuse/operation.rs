@@ -1210,12 +1210,26 @@ fn operation_of(fs: &Arc<FuseFilesystem>) -> Arc<InstanceOperationImpl> {
     ))
 }
 
-/// Staging a name spelled in another case keeps the tree's spelling by renaming on the
-/// filesystem, which a mount refuses as read-only rather than as an internal failure.
+/// Staging a name the mount spells in another case than the tree keeps the tree's spelling by
+/// renaming on the filesystem, which a mount refuses as read-only rather than as an internal
+/// failure.
 #[tokio::test]
 async fn staging_a_case_change_on_a_mount_reports_read_only() {
     in_context(async {
         let m = mounted().await;
+        let served = m.fs.state();
+        let node_at = async |path: &str| {
+            served
+                .find_node_link(m.fixture.repository.clone(), path)
+                .await
+                .expect("a served path")
+                .node
+        };
+        let (dir, file) = (node_at("dir").await, node_at("dir/a.txt").await);
+        served
+            .node_reattach(m.fixture.repository.clone(), file, dir, "A.txt")
+            .await
+            .expect("the mount spells A.txt");
         let repository = Arc::new(
             RepositoryContext::new(
                 fuse_fixture::default_repository_creation_args(

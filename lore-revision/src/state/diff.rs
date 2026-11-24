@@ -2604,7 +2604,8 @@ impl Settling {
 
     /// A directory both hold: a delete staged for it is taken back, one `from` holds as an add
     /// not yet committed stays an add, one a dirty move took to a path the current revision lacks
-    /// keeps its move, and one reported only for the mark `from` carries is dropped.
+    /// keeps its move, one the tree spells otherwise in case alone is marked moved, and one
+    /// reported only for the mark `from` carries is dropped.
     async fn settle_directory(
         &mut self,
         mut change: NodeChange,
@@ -2631,6 +2632,9 @@ impl Settling {
             change.to = self.node_side(node_id, path).await?;
             change.flags = compute_change_flags(&self.node(node_id).await?);
             return Ok(Some(change));
+        }
+        if marks && change.is_case_only_move() && !self.node(node_id).await?.is_dirty_move() {
+            self.mark(node_id, SettledAction::Move).await?;
         }
         let measured = change.flags.contains(change::Flags::Modify) || change.flags.is_conflict();
         if change.action == FileAction::Keep && !measured {

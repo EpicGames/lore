@@ -3,7 +3,9 @@
 //! The chain steps a stage of a directory's dirty files takes, counted process-wide.
 //!
 //! A process of its own: the stage spawns a walk per file onto the runtime's workers, whose
-//! finds only the process-wide count covers, which another test's finds would add to.
+//! finds only the process-wide count covers, which another test's finds would add to. The tests
+//! of this binary take [`COUNTING`] for their whole body, so no test's steps land in another's
+//! count.
 #![allow(clippy::disallowed_methods)] // Test fixture writes; not subject to write-token discipline.
 
 use lore_base::runtime::LORE_CONTEXT;
@@ -27,6 +29,9 @@ use helper::test_store_create;
 
 /// How many files each directory of the test holds.
 const FILES: usize = 256;
+
+/// Held by each test of this binary for its whole body, as the step counts are process-wide.
+static COUNTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The steps every thread's finds and children walks have taken.
 #[derive(Clone, Copy)]
@@ -145,6 +150,7 @@ async fn children_staged(
 /// tmpfs does, puts the first target's directory last in the chain the dirty marks built.
 #[tokio::test]
 async fn staging_a_directorys_dirty_files_searches_its_chain_for_none_of_them() {
+    let _counting = COUNTING.lock().await;
     let (immutable_store, mutable_store, execution) =
         test_store_create().await.expect("the stores");
     LORE_CONTEXT
@@ -288,6 +294,7 @@ async fn folders_staged(instance: &TestRepository, staged: &State, dir: &str) ->
 /// a few listings of the directory, and a few steps for each new directory and file.
 #[tokio::test]
 async fn staging_new_directories_of_a_committed_directory_lists_it_once() {
+    let _counting = COUNTING.lock().await;
     let (immutable_store, mutable_store, execution) =
         test_store_create().await.expect("the stores");
     LORE_CONTEXT

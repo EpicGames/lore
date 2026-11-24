@@ -394,7 +394,7 @@ pub async fn filesystem_path_and_info(
     #[cfg(target_os = "linux")]
     {
         let initial_path = candidate_path(base, find_path.as_str());
-        if let Ok(info) = operation.file_info(&initial_path).await
+        if let Ok(info) = operation.file_info_as_spelled(&initial_path).await
             && info.exists()
         {
             return Ok((find_path.clone(), Some(info)));

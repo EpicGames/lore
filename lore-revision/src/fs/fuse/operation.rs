@@ -1427,6 +1427,42 @@ fn io_errno(error: &std::io::Error) -> Errno {
     Errno(error.raw_os_error().unwrap_or(libc::EIO))
 }
 
+impl FuseOperation {
+    /// What the file at `path` is, as [`InstanceOperation::file_info`] reports it; nothing there
+    /// where `as_spelled` asks for `path`'s spelling and the State spells it otherwise.
+    async fn info_at(&self, path: &RelativePath, as_spelled: bool) -> Result<FileInfo, FsError> {
+        if path.is_empty() {
+            return Ok(FileInfo::Directory);
+        }
+        let Some(located) = self
+            .located(path)
+            .await?
+            .filter(|located| !as_spelled || located.spelled.as_str() == path.as_str())
+        else {
+            return Ok(FileInfo::NotExist);
+        };
+        let entry = located.entry;
+        if is_dir(&entry) {
+            return Ok(FileInfo::Directory);
+        }
+        if let Some(host) = located.host {
+            return host_info(&host)
+                .await
+                .map_err(|error| host_error(path, &error));
+        }
+        let served = self.filesystem.served();
+        let mtime = self
+            .filesystem
+            .scoped(self.filesystem.recorded_times().mtime_for(
+                &served.repository,
+                path,
+                self.filesystem.base_time(),
+            ))
+            .await;
+        Ok(file_info_of(&entry, mtime))
+    }
+}
+
 impl InstanceOperation for FuseOperation {
     /// Diffs the filesystem State at `diff.filesystem_path` against `diff.from` by address,
     /// descending only where either side is dirty, and marks `diff.from` only as the intent asks.
@@ -1505,32 +1541,19 @@ impl InstanceOperation for FuseOperation {
         })
     }
 
-    async fn file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
-        if path.is_empty() {
-            return Ok(FileInfo::Directory);
-        }
-        let Some(located) = self.located(path).await? else {
-            return Ok(FileInfo::NotExist);
-        };
-        let entry = located.entry;
-        if is_dir(&entry) {
-            return Ok(FileInfo::Directory);
-        }
-        if let Some(host) = located.host {
-            return host_info(&host)
-                .await
-                .map_err(|error| host_error(path, &error));
-        }
-        let served = self.filesystem.served();
-        let mtime = self
-            .filesystem
-            .scoped(self.filesystem.recorded_times().mtime_for(
-                &served.repository,
-                path,
-                self.filesystem.base_time(),
-            ))
-            .await;
-        Ok(file_info_of(&entry, mtime))
+    fn file_info(
+        &self,
+        path: &RelativePath,
+    ) -> impl Future<Output = Result<FileInfo, FsError>> + Send {
+        self.info_at(path, false)
+    }
+
+    /// The served State's index answers a path in any case, so the spelling it holds is compared.
+    fn file_info_as_spelled(
+        &self,
+        path: &RelativePath,
+    ) -> impl Future<Output = Result<FileInfo, FsError>> + Send {
+        self.info_at(path, true)
     }
 
     async fn untracked_file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {

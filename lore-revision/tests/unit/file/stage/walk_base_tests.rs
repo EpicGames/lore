@@ -21,6 +21,7 @@ fn created<'a>(
                 CreatedAncestor {
                     node,
                     path: path(given),
+                    linked: None,
                 },
             )
         })
@@ -45,6 +46,7 @@ fn below_ancestor(start: WalkStart) -> (RelativePath, lore_revision::node::NodeI
             path,
             node,
             remainder,
+            ..
         } => (path, node, remainder),
         WalkStart::FromRoot(_) => panic!("an ancestor was created"),
     }
@@ -106,6 +108,7 @@ fn walk_start_starts_at_the_path_the_ancestor_was_created_at() {
         CreatedAncestor {
             node: NODE_AB,
             path: path("A/B"),
+            linked: None,
         },
     );
 

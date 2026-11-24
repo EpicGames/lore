@@ -783,6 +783,18 @@ pub trait InstanceOperation: Send + Sync {
         path: &RelativePath,
     ) -> impl Future<Output = Result<FileInfo, FsError>> + Send;
 
+    /// What [`file_info`](Self::file_info) reports where the working tree spells the path as
+    /// `path` does, and [`FileInfo::NotExist`] where it spells it otherwise. It stands beside
+    /// `file_info` so that a provider holding its own index, which answers a path in any case,
+    /// answers both in the one lookup a stage takes per target. The default is `file_info`, which
+    /// answers so only where the file system tells case apart.
+    fn file_info_as_spelled(
+        &self,
+        path: &RelativePath,
+    ) -> impl Future<Output = Result<FileInfo, FsError>> + Send {
+        self.file_info(path)
+    }
+
     /// What [`file_info`](Self::file_info) reports, read from the working tree rather than
     /// from the tree the path is tracked in.
     ///
@@ -1747,6 +1759,17 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Swfs(this) => this.file_info(path).await,
             #[cfg(target_os = "linux")]
             StaticDispatchInstanceOperation::Fuse(this) => this.file_info(path).await,
+        }
+    }
+
+    async fn file_info_as_spelled(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
+        match &self.dispatch {
+            #[cfg(feature = "test-util")]
+            StaticDispatchInstanceOperation::Test(this) => this.file_info_as_spelled(path).await,
+            StaticDispatchInstanceOperation::Os(this) => this.file_info_as_spelled(path).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.file_info_as_spelled(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.file_info_as_spelled(path).await,
         }
     }
 

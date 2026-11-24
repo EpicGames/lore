@@ -3,10 +3,11 @@
 //! The dirty paths held to the model (`collect_dirty_paths`): a collection lists each directory it
 //! descends into from a head read of its own, then reads each child's words and names each dirty
 //! one, so each path it reports is the names it read, one hop at a time, from its root down: a
-//! named file's, a named directory's it reported as a dirty add or a dirty delete, and its empty
-//! root's where it holds a dirty add. In a scheduler's run nothing lands between a child's words
-//! and its name, so each child named carried then what its answer says; and every node in place,
-//! named and dirty below dirty directories throughout from the root's head read is among its paths.
+//! named file's, a named directory's it reported as a dirty add, a dirty move or a dirty delete,
+//! and its root's where it stands for itself. In a scheduler's run nothing lands between a child's
+//! words and its name, so each child named carried then what its answer says; and every node in
+//! place, named and dirty below dirty directories throughout from the root's head read is among its
+//! paths.
 
 use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
@@ -134,10 +135,10 @@ fn a_collection_reports_what_it_named_and_nothing_else() {
 
 /// A directory a collection named and did not descend into, a dirty delete, it reports; in a
 /// scheduler's run it descends into each directory it named but a dirty delete, reports each it
-/// named as a dirty delete or a dirty add staged or heading no chain and no other, and its empty
-/// root where it holds a dirty add.
+/// named as a dirty delete, a dirty add or a dirty move, whatever it holds, and no other, and its
+/// root where it stands for itself.
 #[test]
-fn a_collection_reports_a_directory_by_its_dirty_add_or_delete() {
+fn a_collection_reports_a_directory_by_its_mark() {
     let made = snapshot();
     let named_a = |flags| {
         [
@@ -186,26 +187,30 @@ fn a_collection_reports_a_directory_by_its_dirty_add_or_delete() {
     caught(
         &gated(&made, &added, vec![collect(ROOT_NODE, (2, 6), &[])]),
         6,
-        "did not report 1, a directory the model held a dirty add or a dirty delete",
+        "did not report 1, a directory the model held a dirty add, a dirty move or a dirty delete",
     );
-    // `a` holding `f` and `g` and only marked: they carry it.
-    let carried = [named_a(NodeFlags::DirtyAdd), head(4, 0)].concat();
-    clean(&gated(
-        &made,
-        &carried,
-        vec![collect(ROOT_NODE, (2, 6), &[])],
-    ));
-    caught(
-        &gated(&made, &carried, vec![collect(ROOT_NODE, (2, 6), &["a"])]),
-        6,
-        "reported 1, a dirty-add directory its children carry",
-    );
+    // `a` holding `f` and `g`, only marked added or moved: its own path all the same.
+    for flags in [NodeFlags::DirtyAdd, NodeFlags::DirtyMove] {
+        let marked = [named_a(flags), head(4, 0)].concat();
+        clean(&gated(
+            &made,
+            &marked,
+            vec![collect(ROOT_NODE, (2, 6), &["a"])],
+        ));
+        caught(
+            &gated(&made, &marked, vec![collect(ROOT_NODE, (2, 6), &[])]),
+            6,
+            "did not report 1, a directory the model held a dirty add, a dirty move or a dirty \
+             delete",
+        );
+    }
     let plain = [named_a(NodeFlags::Dirty), head(4, 0)].concat();
     clean(&gated(&made, &plain, vec![collect(ROOT_NODE, (2, 6), &[])]));
     caught(
         &gated(&made, &plain, vec![collect(ROOT_NODE, (2, 6), &["a"])]),
         6,
-        "reported 1, a directory the model held neither a dirty add nor a dirty delete",
+        "reported 1, a directory the model held neither a dirty add, a dirty move nor a dirty \
+         delete",
     );
     caught(
         &gated(
@@ -216,6 +221,16 @@ fn a_collection_reports_a_directory_by_its_dirty_add_or_delete() {
         5,
         "did not descend into 1, which the model held no dirty delete",
     );
+    // `b` holding `h`, marked added or moved: its empty path all the same.
+    for flags in [NodeFlags::DirtyAdd, NodeFlags::DirtyMove] {
+        let marked = [flagging_of(&made, 1, B, flags), head_of(B, 2, 0)].concat();
+        clean(&gated(&made, &marked, vec![collect(B, (2, 4), &[""])]));
+        caught(
+            &gated(&made, &marked, vec![collect(B, (2, 4), &[])]),
+            4,
+            "did not report its root 4, which the model held standing for itself",
+        );
+    }
     // `b` emptied, its `h` moved into `a`: its empty path where it holds a dirty add.
     let emptied = |flags| {
         [
@@ -240,7 +255,7 @@ fn a_collection_reports_a_directory_by_its_dirty_add_or_delete() {
             vec![collect(B, (3, 5), &[""])],
         ),
         5,
-        "reported its empty root 4, which the model held no dirty add",
+        "reported its root 4, which the model held standing for nothing",
     );
     caught(
         &gated(
@@ -249,7 +264,7 @@ fn a_collection_reports_a_directory_by_its_dirty_add_or_delete() {
             vec![collect(B, (3, 5), &[])],
         ),
         5,
-        "did not report its empty root 4, which the model held a dirty add",
+        "did not report its root 4, which the model held standing for itself",
     );
     // Left out by a run of any scheduler, a dirty add empty throughout from its head read.
     caught(

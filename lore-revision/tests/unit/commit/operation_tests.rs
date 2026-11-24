@@ -502,6 +502,7 @@ async fn assert_kept_marked_dirty(instance: &TestRepository, at_source: AtSource
         )
         .await
         .expect("the dirty paths")
+        .paths
         .iter()
         .map(|path| path.as_str().to_string())
         .collect();

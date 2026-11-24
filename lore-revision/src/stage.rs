@@ -576,7 +576,7 @@ async fn is_uncommitted_child(
 /// its node, so what the working tree shows there is no change.
 #[lore_macro::test_pub]
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn stage_filesystem_path(
+pub(crate) fn stage_filesystem_path(
     operation: Arc<InstanceOperationImpl>,
     base: NodeMapping,
     remainder_path: RelativePath,
@@ -587,6 +587,39 @@ pub(crate) async fn stage_filesystem_path(
     layer_mask: Option<Arc<Vec<String>>>,
     prefixes: Option<Arc<util::fs::ResolvedPrefixes>>,
     discards: PendingDiscards,
+) -> impl Future<Output = Result<NodeLink, StageError>> {
+    stage_filesystem_path_reaching(
+        operation,
+        base,
+        remainder_path,
+        known,
+        stats,
+        options,
+        link_tracker,
+        layer_mask,
+        prefixes,
+        discards,
+        None,
+    )
+}
+
+/// [`stage_filesystem_path`], which sets `reached_link`, where given, to the node it staged at the
+/// end of `remainder_path` in the linked State it reached across a link, at the path the tree spells
+/// it at once staged. It leaves `reached_link` as it is where that node is in `base`'s State, or
+/// where it stages no node there.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn stage_filesystem_path_reaching(
+    operation: Arc<InstanceOperationImpl>,
+    base: NodeMapping,
+    remainder_path: RelativePath,
+    known: KnownChild,
+    stats: Arc<StageStats>,
+    options: StageOptions,
+    link_tracker: Option<Arc<crate::link::LinkTracker>>,
+    layer_mask: Option<Arc<Vec<String>>>,
+    prefixes: Option<Arc<util::fs::ResolvedPrefixes>>,
+    discards: PendingDiscards,
+    reached_link: Option<&mut Option<NodeMapping>>,
 ) -> Result<NodeLink, StageError> {
     debug_assert!(
         matches!(known, KnownChild::Unresolved) || !remainder_path.is_empty(),
@@ -722,6 +755,11 @@ pub(crate) async fn stage_filesystem_path(
             .await?
         {
             return Ok(node_link);
+        }
+        if let Some(reached) = reached_link
+            && !Arc::ptr_eq(&descent.state, &state)
+        {
+            *reached = Some(descent.mapping());
         }
 
         // Finally, if the given path is a directory we should recurse and stage everything below it
@@ -1043,8 +1081,8 @@ impl StageDescent {
     /// A descent standing at `base`, with the filter verdict folded once for its path, which the
     /// descent steps a component at a time from there.
     ///
-    /// Not part of [`stage_filesystem_path`]: the path it borrows to fold the verdict would be
-    /// reserved there across the directory walk.
+    /// Not part of [`stage_filesystem_path_reaching`]: the path it borrows to fold the verdict would
+    /// be reserved there across the directory walk.
     fn at(base: &NodeMapping) -> Result<Self, StageError> {
         let relative_path = base.path.to_buf_with_capacity(RelativePath::COMPONENT_ROOM);
         let repository_root = base.repository.require_path()?;
@@ -1063,6 +1101,16 @@ impl StageDescent {
             relative_path,
             unkept: INVALID_NODE,
         })
+    }
+
+    /// The node the descent stands at, in the State holding it, at the path the tree spells it at.
+    fn mapping(&self) -> NodeMapping {
+        NodeMapping {
+            repository: self.repository.clone(),
+            state: self.state.clone(),
+            path: self.relative_path.clone().freeze(),
+            node: self.node,
+        }
     }
 
     /// Stage each component of `remainder_path` in turn and step into the node it names, and
@@ -1087,7 +1135,7 @@ impl StageDescent {
     /// deleted beside a staged one of its name.
     ///
     /// Its own future: inline, what a step holds across its awaits would be reserved in the
-    /// directory walk's state of [`stage_filesystem_path`].
+    /// directory walk's state of [`stage_filesystem_path_reaching`].
     #[allow(clippy::too_many_arguments)]
     async fn descend(
         &mut self,

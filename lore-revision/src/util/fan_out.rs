@@ -42,10 +42,11 @@ pub(crate) fn longest_ancestor<'a, 'n, T>(
 /// contiguous per depth. Only such a directory is a place where parallel walks
 /// would race to create the same node.
 ///
-/// `targets` must be an antichain in lexicographic order, which puts the targets
-/// under a directory in one run: a directory is shared exactly when two
-/// neighbours agree that far, and emitting it at the first target of its run
-/// yields the set once over.
+/// `targets` must be in lexicographic order, which puts the targets under a
+/// directory in one run: a directory is shared exactly when two neighbours agree
+/// that far, and emitting it at the first target of its run yields the set once
+/// over. A target may lie above others, the first of their run, and is no shared
+/// directory of its own.
 ///
 /// The result is prefix-closed and holds one case variation of each entry when
 /// the targets do, as [`RelativePath::dedup_to_supersets`] leaves them, so a

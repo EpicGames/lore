@@ -267,8 +267,8 @@ async fn a_walk_skips_a_node_carrying_a_planted_reserved_name() {
                 .await
                 .expect("collecting dirty paths must not fail on the planted node");
             assert_eq!(
-                collected
-                    .iter()
+                (collected.paths.iter())
+                    .chain(&collected.directories)
                     .map(|path| path.as_str())
                     .collect::<Vec<_>>(),
                 vec!["alpha"]

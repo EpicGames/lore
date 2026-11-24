@@ -1104,8 +1104,9 @@ async fn the_dirty_paths_collected_at_a_link_are_those_of_the_state_it_pins() {
                     .map(|path| path.as_str().to_string())
                     .collect::<Vec<_>>()
             };
-            assert_eq!(spelled(&at_link), ["lib/d", "lib/d/f.txt"]);
-            assert_eq!(spelled(&at_root), spelled(&at_link));
+            assert_eq!(spelled(&at_link.paths), ["lib/d", "lib/d/f.txt"]);
+            assert_eq!(spelled(&at_root.paths), spelled(&at_link.paths));
+            assert_eq!(spelled(&at_root.directories), spelled(&at_link.directories));
         })
         .await;
 }

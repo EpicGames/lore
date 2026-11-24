@@ -2540,6 +2540,161 @@ async fn a_deleted_or_moved_directory_is_recorded_without_descending() {
     );
 }
 
+/// The paths `State::collect_dirty_paths` collects at `root`, whose path is `path`: those staged
+/// with what the working tree holds below them, then the directories staged as themselves, each
+/// sorted.
+async fn stage_targets(
+    state: &State,
+    repository: Arc<RepositoryContext>,
+    root: NodeID,
+    path: &str,
+) -> (Vec<String>, Vec<String>) {
+    let path = RelativePath::new_from_initial_path(path).expect("a clean relative path");
+    let collected = LORE_CONTEXT
+        .scope(
+            setup_test_execution(),
+            state.collect_dirty_paths(repository, root, path),
+        )
+        .await
+        .expect("collecting the stage's targets");
+    let spelled = |paths: &[RelativePath]| {
+        let mut spelled: Vec<String> = paths.iter().map(|path| path.as_str().to_string()).collect();
+        spelled.sort();
+        spelled
+    };
+    (spelled(&collected.paths), spelled(&collected.directories))
+}
+
+/// Each directory marked moved is a target of its own, whatever it holds: empty directories two
+/// levels deep, a deletion, an unchanged node, a node the view leaves out; and so is an empty one
+/// named itself. The marked changes below them are targets of their own too.
+#[tokio::test]
+async fn each_moved_directory_is_a_stage_target_of_its_own() {
+    let repository = null_repository_viewing(&["secret.bin"]).await;
+    let state = State::new();
+    let add = async |parent, name, flags| {
+        add_dirty_node(&state, repository.clone(), parent, name, flags).await
+    };
+
+    let moved = add(ROOT_NODE, "dir", NodeFlags::DirtyMove).await;
+    let sub = add(moved, "Sub", NodeFlags::DirtyMove).await;
+    add(sub, "Deep", NodeFlags::DirtyMove).await;
+    let other = add(moved, "Other", NodeFlags::DirtyMove).await;
+    let emptied = add(ROOT_NODE, "emptied", NodeFlags::DirtyMove).await;
+    add(
+        emptied,
+        "gone.txt",
+        NodeFlags::DirtyDelete | NodeFlags::File,
+    )
+    .await;
+    let kept = add(ROOT_NODE, "kept", NodeFlags::DirtyMove).await;
+    add(kept, "a.txt", NodeFlags::File).await;
+    let hidden = add(ROOT_NODE, "hidden", NodeFlags::DirtyMove).await;
+    add(hidden, "secret.bin", NodeFlags::DirtyMove | NodeFlags::File).await;
+
+    assert_eq!(
+        stage_targets(&state, repository.clone(), ROOT_NODE, "").await,
+        (
+            vec!["emptied/gone.txt".to_string()],
+            [
+                "dir",
+                "dir/Other",
+                "dir/Sub",
+                "dir/Sub/Deep",
+                "emptied",
+                "hidden",
+                "kept"
+            ]
+            .map(String::from)
+            .to_vec()
+        )
+    );
+    assert_eq!(
+        stage_targets(&state, repository, other, "dir/Other").await,
+        (Vec::new(), vec!["dir/Other".to_string()])
+    );
+}
+
+/// Each directory marked added is a target of its own, whatever it holds, beside the marked
+/// changes below it; a staged add is a path staged with what the working tree holds below it, as
+/// it holds what staging put there.
+#[tokio::test]
+async fn each_added_directory_is_a_stage_target_of_its_own() {
+    let repository = null_repository().await;
+    let state = State::new();
+    let add = async |parent, name, flags| {
+        add_dirty_node(&state, repository.clone(), parent, name, flags).await
+    };
+
+    add(ROOT_NODE, "empty", NodeFlags::DirtyAdd).await;
+    let holding = add(ROOT_NODE, "holding", NodeFlags::DirtyAdd).await;
+    add(holding, "a.txt", NodeFlags::DirtyAdd | NodeFlags::File).await;
+    let staged = add(
+        ROOT_NODE,
+        "staged",
+        NodeFlags::DirtyAdd | NodeFlags::StagedAdd,
+    )
+    .await;
+    add(staged, "b.txt", NodeFlags::DirtyAdd | NodeFlags::File).await;
+
+    assert_eq!(
+        stage_targets(&state, repository, ROOT_NODE, "").await,
+        (
+            ["holding/a.txt", "staged", "staged/b.txt"]
+                .map(String::from)
+                .to_vec(),
+            ["empty", "holding"].map(String::from).to_vec()
+        )
+    );
+}
+
+/// A moved directory's moved files, and a moved file and an added empty directory elsewhere, are
+/// targets of their own beside the directories.
+#[tokio::test]
+async fn the_stage_targets_of_a_moved_directory_holding_files_are_it_and_its_files() {
+    let repository = null_repository().await;
+    let state = State::new();
+    let moved_file = NodeFlags::DirtyMove | NodeFlags::File;
+
+    let moved = add_dirty_node(
+        &state,
+        repository.clone(),
+        ROOT_NODE,
+        "e",
+        NodeFlags::DirtyMove,
+    )
+    .await;
+    add_dirty_node(&state, repository.clone(), moved, "a.txt", moved_file).await;
+    let sub = add_dirty_node(
+        &state,
+        repository.clone(),
+        moved,
+        "sub",
+        NodeFlags::DirtyMove,
+    )
+    .await;
+    add_dirty_node(&state, repository.clone(), sub, "b.txt", moved_file).await;
+    add_dirty_node(&state, repository.clone(), ROOT_NODE, "g.txt", moved_file).await;
+    add_dirty_node(
+        &state,
+        repository.clone(),
+        ROOT_NODE,
+        "new",
+        NodeFlags::DirtyAdd,
+    )
+    .await;
+
+    assert_eq!(
+        stage_targets(&state, repository, ROOT_NODE, "").await,
+        (
+            ["e/a.txt", "e/sub/b.txt", "g.txt"]
+                .map(String::from)
+                .to_vec(),
+            ["e", "e/sub", "new"].map(String::from).to_vec()
+        )
+    );
+}
+
 /// The buffer the walk names into carries the whole ancestry, and a sibling
 /// visited after a descent is named against its own parent again.
 ///
