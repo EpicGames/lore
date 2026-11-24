@@ -199,6 +199,8 @@ use crate::repository::RepositoryWriteToken;
 use crate::repository::is_reserved_node_name;
 use crate::repository::prefetch;
 use crate::revision::RevisionMetadata;
+use crate::runtime::CancellationCheck;
+use crate::runtime::check_cancelled;
 use crate::stage::stage_delete;
 use crate::store::KeyType;
 use crate::store::StoreMatch;
@@ -8368,6 +8370,9 @@ pub async fn gather_tree_paths(
         include_last_revision,
     )
     .await?;
+    // A linked subtree that fails to read is skipped, so the walk checks once more before it
+    // reports a complete tree.
+    check_cancelled()?;
     walk.indices = HashMap::new();
     Ok(walk)
 }
@@ -8433,7 +8438,7 @@ async fn enumerate_children(
 
 /// Skips the linked subtree at `revision` of `repository` that failed with `err`: logs the failure,
 /// at debug level for what is not found, and counts it in `failures` where given. A read refused
-/// as `SlowDown` is returned instead, to fail the walk.
+/// as `SlowDown`, and a cancelled walk, are returned instead, to fail the walk.
 #[lore_macro::test_pub]
 fn skip_linked_subtree(
     prefix: &str,
@@ -8443,7 +8448,7 @@ fn skip_linked_subtree(
     failures: Option<&mut AttributionFailures>,
 ) -> Result<(), StateError> {
     match err {
-        StateErrors::SlowDown(_) => return Err(err),
+        StateErrors::SlowDown(_) | StateErrors::Cancelled(_) => return Err(err),
         StateErrors::NotFound(_)
         | StateErrors::NodeNotFound(_)
         | StateErrors::LinkNotFound(_)
@@ -8522,6 +8527,7 @@ async fn gather_tree_paths_node(
     } else {
         false
     };
+    check_cancelled()?;
     let last_revision = match attribution.as_deref_mut() {
         Some(attribution) => {
             attribution
@@ -12502,7 +12508,11 @@ async fn collect_name_fragments(
     blocks: Vec<Address>,
 ) -> Result<Vec<Address>, StateError> {
     let mut tasks = JoinSet::new();
+    let cancellation = CancellationCheck::current();
     for address in blocks {
+        if cancellation.check().is_err() {
+            break;
+        }
         lore_spawn!(
             tasks,
             futures::FutureExt::map(
@@ -12530,6 +12540,8 @@ async fn collect_name_fragments(
         }
     }
 
+    // A read that failed because the request was dropped reports the drop, not the read.
+    check_cancelled()?;
     if let Some(err) = failure {
         return Err(err);
     }
@@ -13023,6 +13035,9 @@ pub async fn collect_fragments(
     fragments.sort_unstable();
     fragments.dedup();
     lore_debug!("Collected {} new addresses in total", fragments.len());
+    // The collections stop early once cancelled, and some of them swallow their own errors, so a
+    // cancelled call returns no list at all rather than one that may be missing addresses.
+    check_cancelled()?;
 
     Ok(fragments)
 }
@@ -13063,7 +13078,11 @@ async fn collect_new_file_fragments(
     let mut tasks = JoinSet::new();
     let mut failure = None;
     let mut from_index = 0;
+    let cancellation = CancellationCheck::current();
     for to_named_node in to.children {
+        if cancellation.check().is_err() {
+            break;
+        }
         let to_node_id = to_named_node.node;
         let to_node = to.state.node(to.repository.clone(), to_node_id).await;
         let Ok(to_node) = to_node else {
@@ -13139,6 +13158,7 @@ async fn collect_new_file_fragments(
     if let Some(err) = failure {
         return Err(err);
     }
+    check_cancelled()?;
 
     Ok(new_addresses)
 }
@@ -13306,7 +13326,11 @@ async fn collect_new_addresses(
 
     const MAX_TASKS: usize = 1000;
     let mut task = JoinSet::new();
+    let cancellation = CancellationCheck::current();
     for address in addresses {
+        if cancellation.check().is_err() {
+            break;
+        }
         if address.hash.is_zero() {
             continue;
         }
@@ -13391,6 +13415,9 @@ async fn collect_new_addresses(
             new_addresses.append(&mut address);
         }
     }
+    // A cancelled call returns no list at all: the recursion swallows its errors, so a list
+    // gathered while cancelled could be missing addresses its caller would then never check.
+    check_cancelled()?;
 
     Ok(new_addresses)
 }

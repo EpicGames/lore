@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::pin::Pin;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -36,6 +37,7 @@ use tracing::warn;
 
 use crate::grpc::extract_correlation_id;
 use crate::grpc::send_err;
+use crate::grpc::until_request_cancelled;
 use crate::util::REPLICATION_USER_ID;
 use crate::util::setup_execution;
 
@@ -74,7 +76,7 @@ impl ReplicationService for LoreReplicationService {
         request: Request<Streaming<ReplicationPutRequest>>,
     ) -> Result<Response<Self::PutStream>, Status> {
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-        let mut stream = request.into_inner();
+        let stream = request.into_inner();
 
         // TODO(jcohen): make this capacity configurable or unbounded
         let message_limit = 8192;
@@ -96,6 +98,9 @@ impl ReplicationService for LoreReplicationService {
                 execution,
                 async move {
                     let task_limiter = Arc::new(Semaphore::new(message_limit));
+                    // Ends once nobody reads the answers. An item already started finishes, so no
+                    // store operation is cut off part way.
+                    let mut stream = pin!(until_request_cancelled(stream));
                     while let Some(req) = stream.next().await {
                         if let Err(e) = req {
                             debug!(error = ?e, "Error reading message from stream");

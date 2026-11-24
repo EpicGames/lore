@@ -20,6 +20,7 @@ use tracing::warn;
 use super::path_diff::link_pin_path_diffs;
 use super::path_diff::map_to_path_diff;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::FilterCancelledExt;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
@@ -80,7 +81,7 @@ pub async fn handler(
                 )
             })
             .await;
-            match result.filter_slow_down()? {
+            match result.filter_slow_down()?.filter_cancelled()? {
                 Ok((_, mut changes)) => {
                     change::sort_by_path(&mut changes);
                     debug!("Found {} changes", changes.len());

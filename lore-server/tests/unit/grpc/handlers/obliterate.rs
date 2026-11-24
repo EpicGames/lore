@@ -363,6 +363,80 @@ async fn succeeds_for_authorized_request_with_existing_address() {
     );
 }
 
+/// A cancelled obliterate answers CANCELLED before it obliterates the address or notifies of it.
+#[tokio::test]
+async fn a_cancelled_obliterate_leaves_the_address() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, _) = test_store_create().await.unwrap();
+
+    let context: Context = rand::random();
+    let payload = Bytes::from_static(b"test payload");
+    let hash = lore_storage::hash::hash_slice(&payload);
+    let address = Address { hash, context };
+    immutable_store
+        .clone()
+        .put(
+            repository,
+            address,
+            Fragment {
+                flags: 0,
+                size_payload: payload.len() as u32,
+                size_content: payload.len() as u64,
+            },
+            Some(payload.clone()),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // No expectation is set, so a notification fails the test.
+    let notification = Arc::new(MockNotificationSender::new());
+    let hook_dispatcher = HookDispatcher::empty();
+    let verifier = make_verifier(good_key_service());
+    let resources = vec![ResourcePermission {
+        resource_id: format!("urc-{repository}"),
+        permission: vec!["obliterate".to_string()],
+    }];
+
+    let mut request = Request::new(ObliterateRequest {
+        address: Some(address.into()),
+    });
+    request.metadata_mut().insert_bin(
+        REPOSITORY_ID_KEY,
+        tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+    );
+    let value: MetadataValue<tonic::metadata::Ascii> =
+        format!("Bearer {}", make_jwt(Some(resources)))
+            .parse()
+            .unwrap();
+    request.metadata_mut().insert("authorization", value);
+
+    let cancellation = lore_revision::runtime::Cancellation::new();
+    cancellation.cancel();
+    let status = lore_server::util::core_hop::with_request_cancellation(
+        cancellation,
+        handler(
+            request,
+            &legacy_authorizer(),
+            immutable_store.clone(),
+            mutable_store,
+            notification,
+            &hook_dispatcher,
+            &Some(verifier).into(),
+        ),
+    )
+    .await
+    .expect_err("a cancelled obliterate stops before it obliterates");
+    assert_eq!(status.code(), Code::Cancelled, "{status:?}");
+
+    let (_fragment, stored) = immutable_store
+        .get(repository, address)
+        .await
+        .and_then(lore_storage::StoreGetData::into_payload)
+        .expect("the address is still present");
+    assert_eq!(stored, payload);
+}
+
 /// Tier 1 reads `obliterate` from a role claim.
 #[tokio::test]
 async fn a_tier_1_obliterate_role_permits() {

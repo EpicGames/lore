@@ -144,6 +144,7 @@ pub struct LoreRevisionSyncRevisionEventData {
 
 #[error_set]
 pub enum SyncError {
+    Cancelled,
     InvalidArguments,
     WriteRequired,
     NoRemote,

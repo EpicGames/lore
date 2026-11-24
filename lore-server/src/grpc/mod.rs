@@ -1,7 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use futures::FutureExt;
-
 use crate::authnz::repository_authorizer::Action;
 pub mod admin_service;
 pub mod environment;
@@ -22,7 +20,10 @@ pub mod storage;
 pub mod storage_service;
 pub mod thinclient;
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Context as TaskContext;
+use std::task::Poll;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -32,7 +33,9 @@ mod replication_service;
 pub mod tower;
 
 pub use admin_service::LoreAdminService;
+use futures::Stream;
 pub use grpc_internal_server::GrpcInternalServerBuilder;
+use lore_base::error::Cancelled;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_revision::branch::BranchError;
@@ -49,12 +52,14 @@ use lore_revision::notification::NotificationSender;
 use lore_revision::repository::RepositoryError;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::repository::ServerContext;
+use lore_revision::runtime::Cancellation;
 use lore_revision::state::StateError;
 use lore_storage::StoreError;
 use lore_telemetry::InstrumentProvider;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 use lore_transport::grpc::PARTITION_ID_KEY;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
+use pin_project::pin_project;
 pub use repository::LoreRepositoryV1Service;
 pub use revision::LoreRevisionV1Service;
 pub use revision_service::LoreRevisionService;
@@ -64,7 +69,9 @@ pub use server::GrpcTimeouts;
 pub use storage_service::LoreStorageService;
 pub use thinclient::LoreThinClientV1Service;
 use tokio::sync::mpsc::Sender;
-use tokio::time::timeout;
+use tokio::time::Sleep;
+use tokio::time::sleep;
+use tokio_util::sync::WaitForCancellationFutureOwned;
 use tonic::Code;
 use tonic::Extensions;
 use tonic::Status;
@@ -88,6 +95,9 @@ use crate::hooks::traits::HookError;
 use crate::hooks::traits::StatusCode;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::storage::messages::MessageHandleError;
+use crate::util::core_hop::poll_with_request_cancellation;
+use crate::util::core_hop::request_cancellation;
+use crate::util::core_hop::request_is_cancelled;
 use crate::util::get_user_id_from_token_ref;
 
 /// Matches the Infrastructure alerting rule regex
@@ -398,11 +408,14 @@ pub(crate) fn delete_branch_detached(
 ///
 /// Not an `async fn`, which would hold `task` in its future as well as spawn it: the task starts
 /// at the call, and the answer holds only its handle.
+#[lore_macro::test_pub]
 fn run_detached<T: Send + 'static>(
     what: &'static str,
     task: impl Future<Output = T> + Send + 'static,
 ) -> impl Future<Output = Result<T, Status>> {
-    let handle = lore_base::lore_spawn!(tracing::Instrument::in_current_span(task));
+    let handle = lore_base::lore_spawn!(tracing::Instrument::in_current_span(
+        crate::util::core_hop::outliving_request(task)
+    ));
     async move {
         handle.await.map_err(|err| {
             warn_error_to_status(&err, |err| {
@@ -743,13 +756,76 @@ pub fn authorization_timeout_status() -> Status {
     Status::cancelled("Authorization timeout exceeded")
 }
 
-pub fn timeout_grpc<T>(
+/// Runs a request handler with a deadline.
+///
+/// At the deadline the handler is cancelled, not dropped: it runs on to its next cancellation
+/// check, so a write it has started is never cut off part way. A handler that still fails as
+/// cancelled reports the timeout, and one that completes regardless keeps its result.
+pub fn timeout_grpc<T, F>(duration: Duration, fut: F) -> TimeoutGrpc<F>
+where
+    F: Future<Output = Result<T, Status>>,
+{
+    TimeoutGrpc {
+        handler: fut,
+        sleep: sleep(duration),
+        duration,
+        deadline: None,
+        elapsed: false,
+    }
+}
+
+/// The future [`timeout_grpc`] returns. It holds the handler future once, in place.
+#[pin_project]
+pub struct TimeoutGrpc<F> {
+    #[pin]
+    handler: F,
+    #[pin]
+    sleep: Sleep,
     duration: Duration,
-    fut: impl Future<Output = Result<T, Status>>,
-) -> impl Future<Output = Result<T, Status>> {
-    timeout(duration, fut).map(|result| {
-        result.unwrap_or_else(|_| Err(Status::cancelled("Request handler timeout exceeded")))
-    })
+    /// The handler's cancellation: a child of the request's, made on first poll.
+    deadline: Option<Cancellation>,
+    elapsed: bool,
+}
+
+impl<T, F> Future for TimeoutGrpc<F>
+where
+    F: Future<Output = Result<T, Status>>,
+{
+    type Output = Result<T, Status>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let deadline = this.deadline.get_or_insert_with(|| {
+            request_cancellation().map_or_else(Cancellation::new, |request| request.child())
+        });
+        let handler = this.handler;
+        if let Poll::Ready(result) =
+            poll_with_request_cancellation(deadline.clone(), || handler.poll(cx))
+        {
+            return Poll::Ready(match result {
+                // A client that left after the deadline keeps its own status. Any other
+                // CANCELLED returned after the deadline is reported as the timeout.
+                Err(status)
+                    if *this.elapsed
+                        && status.code() == Code::Cancelled
+                        && !deadline.is_parent_cancelled() =>
+                {
+                    Err(Status::cancelled("Request handler timeout exceeded"))
+                }
+                result => result,
+            });
+        }
+        if !*this.elapsed && this.sleep.poll(cx).is_ready() {
+            warn!(
+                timeout_ms = this.duration.as_millis(),
+                "Request handler timeout exceeded, cancelling"
+            );
+            *this.elapsed = true;
+            // Wakes the handler if it waits for cancellation, so it is polled again to see it.
+            deadline.cancel();
+        }
+        Poll::Pending
+    }
 }
 
 pub trait FilterSlowDownExt<T, E> {
@@ -789,6 +865,109 @@ impl_filter_slow_down!(
     RepositoryMetadataError,
     StateError,
     StoreError,
+);
+
+/// Fails with `CANCELLED` once the request being served has been cancelled, whether or not the
+/// caller has entered the request's execution context yet.
+///
+/// Call it only where returning leaves no partial write behind, as with
+/// [`lore_revision::runtime::check_cancelled`].
+pub fn check_request_cancelled() -> Result<(), Status> {
+    if request_is_cancelled() {
+        return Err(Status::cancelled(Cancelled.to_string()));
+    }
+    Ok(())
+}
+
+/// `stream`, ending once the request being served is cancelled rather than at its next message.
+pub fn until_request_cancelled<S: Stream>(stream: S) -> UntilCancelled<S> {
+    UntilCancelled {
+        stream,
+        cancellation: request_cancellation(),
+        waiting: None,
+        ended: false,
+    }
+}
+
+/// The stream [`until_request_cancelled`] returns. Each poll reads the cancellation's flags
+/// before polling the inner stream, and only an inner stream that is waiting also waits on the
+/// cancellation, so a message costs no lock.
+#[pin_project]
+pub struct UntilCancelled<S> {
+    #[pin]
+    stream: S,
+    cancellation: Option<Cancellation>,
+    #[pin]
+    waiting: Option<WaitForCancellationFutureOwned>,
+    ended: bool,
+}
+
+impl<S: Stream> Stream for UntilCancelled<S> {
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<S::Item>> {
+        let mut this = self.project();
+        if *this.ended {
+            return Poll::Ready(None);
+        }
+        if this
+            .cancellation
+            .as_ref()
+            .is_some_and(Cancellation::is_cancelled)
+        {
+            *this.ended = true;
+            return Poll::Ready(None);
+        }
+        if let Poll::Ready(item) = this.stream.poll_next(cx) {
+            *this.ended = item.is_none();
+            return Poll::Ready(item);
+        }
+        let Some(cancellation) = this.cancellation.as_ref() else {
+            return Poll::Pending;
+        };
+        if this.waiting.is_none() {
+            this.waiting.set(Some(cancellation.cancelled()));
+        }
+        if let Some(waiting) = this.waiting.as_pin_mut()
+            && waiting.poll(cx).is_ready()
+        {
+            *this.ended = true;
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    }
+}
+
+pub trait FilterCancelledExt<T, E> {
+    fn filter_cancelled(self) -> Result<Result<T, E>, Status>;
+}
+
+/// Implements [`FilterCancelledExt`] for error sets that declare a `Cancelled` variant: an
+/// operation that stopped because nobody waits for it any more becomes `CANCELLED`, and every
+/// other outcome passes through for the caller to match on.
+macro_rules! impl_filter_cancelled {
+    ($($error:ty),+ $(,)?) => {
+        $(
+            impl<T> FilterCancelledExt<T, $error> for Result<T, $error> {
+                fn filter_cancelled(self) -> Result<Result<T, $error>, Status> {
+                    if let Err(err) = &self
+                        && err.is_cancelled()
+                    {
+                        return Err(Status::cancelled(err.to_string()));
+                    }
+                    Ok(self)
+                }
+            }
+        )+
+    };
+}
+
+impl_filter_cancelled!(
+    BranchError,
+    DiffError,
+    LinkError,
+    RepositoryError,
+    StateError
 );
 
 /// Converts a failed result into `Ok(None)` when `discard` accepts the error,

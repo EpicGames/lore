@@ -43,6 +43,7 @@ pub const DEFAULT_CONTEXT_LINES: u32 = 3;
 
 #[error_set]
 pub enum DiffError {
+    Cancelled,
     LinkPinsDiverge,
     InvalidArguments,
     InvalidPath,

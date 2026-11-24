@@ -42,6 +42,7 @@ use super::helpers::link_pin_change_to_diff_change;
 use super::helpers::node_change_to_diff_change;
 use super::helpers::resolve_to_identifier;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::FilterCancelledExt;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
@@ -73,9 +74,8 @@ pub const DEFAULT_REVISION_DIFF_SOURCE_CAP: usize = 100_000;
 /// through `LoreThinClientV1Service` into the per-request handler.
 #[derive(Clone, Copy, Debug)]
 pub struct RevisionDiffConfig {
-    /// Source-side change-count cap. The handler passes this to
-    /// `branch::diff3_with_source_cap` so the producer aborts with
-    /// `BranchError::Oversized` before target's walk runs.
+    /// Source-side change-count cap. A 3-way diff whose source side changes more paths than
+    /// this fails with `BranchError::Oversized` before the target side is walked.
     pub source_cap: usize,
     /// Permit count for the parallel history-walk semaphore inside
     /// `revision::diff3_with_source_cap`, and for the revision
@@ -398,16 +398,19 @@ async fn run_two_way(
         diff_revision_paths(repo_clone, from_state, to_state, None, producer_tx).await
     });
     while let Some(item) = producer_rx.recv().await {
-        let change = item.filter_slow_down()?.map_err(|err| {
-            warn!(
-                {REPOSITORY_ID} = %repository.id,
-                from = %from_sig_clone,
-                to = %to_sig_clone,
-                ?err,
-                "Failed to calculate 2-way revision diff",
-            );
-            warn_error_to_status(&err, |e| Status::internal(e.to_string()))
-        })?;
+        let change = item
+            .filter_slow_down()?
+            .filter_cancelled()?
+            .map_err(|err| {
+                warn!(
+                    {REPOSITORY_ID} = %repository.id,
+                    from = %from_sig_clone,
+                    to = %to_sig_clone,
+                    ?err,
+                    "Failed to calculate 2-way revision diff",
+                );
+                warn_error_to_status(&err, |e| Status::internal(e.to_string()))
+            })?;
         let Ok(index) = partitions
             .resolve_or_announce(change.content_repository_id(), tx)
             .await
@@ -434,7 +437,7 @@ async fn run_two_way(
         }
     };
 
-    match produced.filter_slow_down()? {
+    match produced.filter_slow_down()?.filter_cancelled()? {
         Ok(()) => Ok(()),
         Err(err) => {
             warn!(
@@ -474,35 +477,34 @@ async fn run_three_way(
     // sets present (see `docs/specs/streaming-revision-diff.md`
     // "Limitations"). We can't change that here, but we can keep the
     // *handler* a pure passthrough.
-    let base =
-        branch::resolve_diff3_base(repository.clone(), from_branch, from_sig, to_branch, to_sig)
-            .await
-            .filter_slow_down()?
-            .map_err(|err| {
-                warn!(
-                    {REPOSITORY_ID} = %repository.id,
-                    from_branch = %from_branch,
-                    to_branch = %to_branch,
-                    ?err,
-                    "Failed to resolve 3-way base revision",
-                );
-                if err.is_divergent() {
-                    Status::failed_precondition(err.to_string())
-                } else if err.is_invalid_arguments() {
-                    Status::invalid_argument(err.to_string())
-                } else if err.is_max_history_search_depth() {
-                    Status::resource_exhausted(err.to_string())
-                } else {
-                    warn_error_to_status(&err, |e| Status::internal(e.to_string()))
-                }
-            })?;
-
-    if base.is_zero() {
-        // No common ancestor — disjoint histories.
-        return Err(Status::failed_precondition(
-            "RevisionDiff: no common ancestor between revisions",
-        ));
-    }
+    let (base, merges) = branch::resolve_diff3_base_and_merges(
+        repository.clone(),
+        from_branch,
+        from_sig,
+        to_branch,
+        to_sig,
+    )
+    .await
+    .filter_slow_down()?
+    .filter_cancelled()?
+    .map_err(|err| {
+        warn!(
+            {REPOSITORY_ID} = %repository.id,
+            from_branch = %from_branch,
+            to_branch = %to_branch,
+            ?err,
+            "Failed to resolve 3-way base revision",
+        );
+        if err.is_divergent() {
+            Status::failed_precondition(err.to_string())
+        } else if err.is_invalid_arguments() {
+            Status::invalid_argument(err.to_string())
+        } else if err.is_max_history_search_depth() {
+            Status::resource_exhausted(err.to_string())
+        } else {
+            warn_error_to_status(&err, |e| Status::internal(e.to_string()))
+        }
+    })?;
 
     // One side is an ancestor of the other, for example through a merge's
     // second parent, which the branch checks in `stream_diff` do not see.
@@ -522,11 +524,11 @@ async fn run_three_way(
     let (producer_tx, mut producer_rx) = mpsc::channel::<Result<DiffItem, BranchError>>(256);
     let repo_clone = repository.clone();
     let producer = AbortOnDropHandle::new(lore_spawn!(async move {
-        Box::pin(branch::diff3_with_source_cap(
+        Box::pin(branch::diff3_with_base(
             repo_clone,
-            from_branch,
+            base,
+            merges,
             from_sig,
-            to_branch,
             to_sig,
             None,
             false,
@@ -564,7 +566,7 @@ async fn run_three_way(
     }
 
     while let Some(item) = producer_rx.recv().await {
-        let item = item.map_err(|err| {
+        let item = item.filter_cancelled()?.map_err(|err| {
             warn!(
                 {REPOSITORY_ID} = %repository.id,
                 from_branch = %from_branch,
@@ -611,6 +613,7 @@ async fn run_three_way(
     // `target`.
     match producer.await {
         Ok(Ok(_summary)) => Ok(()),
+        Ok(Err(err)) if err.is_cancelled() => Err(Status::cancelled(err.to_string())),
         Ok(Err(err)) => {
             warn!(
                 {REPOSITORY_ID} = %repository.id,

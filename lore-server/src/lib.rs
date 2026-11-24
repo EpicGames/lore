@@ -27,3 +27,5 @@ pub mod util;
 mod correlation;
 #[cfg(feature = "test-util")]
 pub mod correlation;
+#[cfg(feature = "test-util")]
+pub mod test_util;

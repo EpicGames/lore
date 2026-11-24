@@ -34,6 +34,7 @@ use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
 use crate::repository::RepositoryContext;
 use crate::repository::is_reserved_node_name;
+use crate::runtime::CancellationCheck;
 use crate::state::State;
 use crate::state::StateError;
 use crate::state::Stop;
@@ -371,12 +372,18 @@ async fn walk_line(
     let mut line_ended = newer.revision_number() <= bound;
     let mut pager = find::LinePager::new(repository.clone(), shared.lines_ahead.clone());
     let mut failure = None;
+    let cancellation = CancellationCheck::current();
     loop {
         while !line_ended
             && !live.is_empty()
             && !shared.stopped()
             && issued - in_order.taken() < shared.window
         {
+            if let Err(cancelled) = cancellation.check() {
+                failure = Some(cancelled.into());
+                line_ended = true;
+                break;
+            }
             let permit = match shared.permit(!comparisons.is_empty()).await {
                 Ok(Some(permit)) => permit,
                 Ok(None) => break,

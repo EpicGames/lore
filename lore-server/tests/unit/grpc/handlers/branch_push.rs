@@ -1836,21 +1836,187 @@ mod push {
     }
 }
 
+mod cancelled_push {
+    use lore_revision::runtime::Cancellation;
+    use lore_server::test_util::PushStep;
+    use lore_server::test_util::step_push;
+    use lore_server::util::core_hop::with_request_cancellation;
+    use lore_server::util::setup_execution;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_cancelled_push_answers_cancelled_and_leaves_the_head() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                random::<RepositoryId>(),
+                lore_revision::state::allow_all_repositories(),
+            ));
+            let branch = create_test_branch(&repository).await;
+            let chain = push_linear_revisions(&repository, branch, Hash::default(), 1..=1).await;
+            let state = serialize_revision(&repository, branch, chain[0], Hash::default(), 2).await;
+
+            let cancellation = Cancellation::new();
+            cancellation.cancel();
+            let cancelled = with_request_cancellation(cancellation, async {
+                setup_execution("test", String::default(), String::default())
+            })
+            .await;
+
+            let mut report = PushReport::new(PushHandler::Legacy, Default::default());
+            let result = LORE_CONTEXT
+                .scope(
+                    cancelled,
+                    push(
+                        repository.clone(),
+                        None,
+                        branch,
+                        state.revision(),
+                        crate::util::test_support::PUSH_ANY,
+                        false,
+                        false,
+                        DEFAULT_HISTORY_STEP_SIZE,
+                        RevisionListAcceleration::default(),
+                        &mut report,
+                    ),
+                )
+                .await;
+            let Err(status) = result else {
+                panic!("a cancelled push stops before it moves the head");
+            };
+            assert_eq!(status.code(), Code::Cancelled, "{status:?}");
+
+            let head = branch::load_latest(repository.clone(), branch)
+                .await
+                .expect("the branch has a head");
+            assert_eq!(head, chain[0], "the head stays where it was");
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_push_cancelled_once_its_merge_is_diffed_writes_no_merge() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                random::<RepositoryId>(),
+                lore_revision::state::allow_all_repositories(),
+            ));
+            let branch = create_test_branch(&repository).await;
+            let chain = push_linear_revisions(&repository, branch, Hash::default(), 1..=2).await;
+            // Rooted at revision 1 while the latest is 2, so the push has to merge.
+            let divergent = serialize_revision_adding_a_file(
+                &repository,
+                branch,
+                chain[0],
+                Hash::default(),
+                2,
+                "merged.txt",
+            )
+            .await;
+
+            let cancellation = Cancellation::new();
+            let request = with_request_cancellation(cancellation.clone(), async {
+                setup_execution("test", String::default(), String::default())
+            })
+            .await;
+            let (reached_tx, mut reached) = tokio::sync::mpsc::unbounded_channel();
+            let resume = Arc::new(tokio::sync::Notify::new());
+
+            let mut report = PushReport::new(PushHandler::Legacy, Default::default());
+            let pushing = LORE_CONTEXT.scope(
+                request,
+                step_push(
+                    reached_tx,
+                    resume.clone(),
+                    push(
+                        repository.clone(),
+                        None,
+                        branch,
+                        divergent.revision(),
+                        crate::util::test_support::PUSH_ANY,
+                        false,
+                        true,
+                        DEFAULT_HISTORY_STEP_SIZE,
+                        RevisionListAcceleration::default(),
+                        &mut report,
+                    ),
+                ),
+            );
+            let cancelling = async {
+                assert_eq!(reached.recv().await, Some(PushStep::MergeDiffed));
+                cancellation.cancel();
+                resume.notify_one();
+            };
+            let (result, ()) = tokio::join!(pushing, cancelling);
+            let Err(status) = result else {
+                panic!("a push cancelled before its merge is applied stops");
+            };
+            assert_eq!(status.code(), Code::Cancelled, "{status:?}");
+
+            let latest = branch::load_latest(repository.clone(), branch)
+                .await
+                .expect("the branch has a latest revision");
+            assert_eq!(latest, chain[1], "no merge is stored");
+        }))
+        .await;
+    }
+}
+
 mod push_outcome_of {
     use super::*;
 
     #[test]
     fn a_push_that_returned_is_declined_ahead_of_errored_and_completed_otherwise() {
-        assert_eq!(PushOutcome::of(true, true, true), PushOutcome::Declined);
-        assert_eq!(PushOutcome::of(true, true, false), PushOutcome::Declined);
-        assert_eq!(PushOutcome::of(true, false, true), PushOutcome::Error);
-        assert_eq!(PushOutcome::of(true, false, false), PushOutcome::Completed);
+        assert_eq!(
+            PushOutcome::of(true, true, PushFailure::Error),
+            PushOutcome::Declined
+        );
+        assert_eq!(
+            PushOutcome::of(true, true, PushFailure::None),
+            PushOutcome::Declined
+        );
+        assert_eq!(
+            PushOutcome::of(true, false, PushFailure::Error),
+            PushOutcome::Error
+        );
+        assert_eq!(
+            PushOutcome::of(true, false, PushFailure::None),
+            PushOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn a_push_that_returned_a_cancellation_is_cancelled() {
+        assert_eq!(
+            PushOutcome::of(true, false, PushFailure::Cancelled),
+            PushOutcome::Cancelled
+        );
+        assert_eq!(
+            PushOutcome::of(true, true, PushFailure::Cancelled),
+            PushOutcome::Declined
+        );
     }
 
     #[test]
     fn a_push_dropped_before_it_returned_is_cancelled_whatever_it_had_set() {
-        assert_eq!(PushOutcome::of(false, false, false), PushOutcome::Cancelled);
-        assert_eq!(PushOutcome::of(false, true, true), PushOutcome::Cancelled);
+        assert_eq!(
+            PushOutcome::of(false, false, PushFailure::None),
+            PushOutcome::Cancelled
+        );
+        assert_eq!(
+            PushOutcome::of(false, true, PushFailure::Error),
+            PushOutcome::Cancelled
+        );
     }
 }
 

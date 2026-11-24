@@ -23,6 +23,7 @@ enum_dispatch = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 http = { workspace = true }
+http-body = { workspace = true }
 hyper = { workspace = true, features = ["server", "http2"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 jsonwebtoken = { workspace = true }
@@ -96,7 +97,6 @@ lore-storage = { workspace = true, features = ["test-util"] }
 lore-transport = { workspace = true, features = ["test-util"] }
 axum-test = { version = "18.1.0", default-features = false }
 rcgen = { workspace = true }
-http-body = "1.0.1"
 http-body-util = "0.1.3"
 indexmap = { workspace = true }
 mockall = { workspace = true }

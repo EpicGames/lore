@@ -71,6 +71,7 @@ pub enum SwfsMountError {}
 
 #[error_set]
 pub enum SwfsWorkError {
+    Cancelled,
     LinkPinsDiverge,
     NodeNotFound,
     LinkNotFound,

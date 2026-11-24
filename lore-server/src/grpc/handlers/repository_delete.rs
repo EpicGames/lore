@@ -26,6 +26,7 @@ use crate::authnz::repository_registry::RepositoryRegistry;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::RepositoryAdministration;
 use crate::grpc::ServerResultExt;
+use crate::grpc::check_request_cancelled;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
@@ -111,6 +112,7 @@ async fn repository_delete(
         );
         return Err(Status::permission_denied("Not repository owner"));
     }
+    check_request_cancelled()?;
     registry.remove(authorization, repository.id).await?;
 
     repository::store_name_to_id(

@@ -485,7 +485,8 @@ impl HookDispatcher {
             let ctx_clone = ctx.clone();
             let correlation_id = correlation_id.clone();
 
-            lore_spawn!(async move {
+            // The hook follows a completed operation, so it runs whether or not the client waits.
+            lore_spawn!(crate::util::core_hop::outliving_request(async move {
                 let start = Instant::now();
 
                 let result =
@@ -516,7 +517,7 @@ impl HookDispatcher {
                         );
                     }
                 }
-            });
+            }));
         }
     }
 }

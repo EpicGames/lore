@@ -2127,3 +2127,59 @@ async fn load_attributed_revision_reads_the_revision_record() {
     }))
     .await;
 }
+
+mod cancelled_request {
+    use lore_revision::runtime::Cancellation;
+    use lore_server::util::core_hop::with_request_cancellation;
+
+    use super::*;
+
+    /// A cancelled request resolves its revision, then ends the stream in CANCELLED after the
+    /// header rather than walking the tree.
+    #[tokio::test]
+    async fn a_cancelled_walk_answers_cancelled_after_the_header() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+                allow_all_repositories(),
+            ));
+            let (_branch_id, signature) =
+                push_branch_with_files(&repository_context, &["a.txt", "b.txt"]).await;
+
+            let cancellation = Cancellation::new();
+            cancellation.cancel();
+            let items = with_request_cancellation(cancellation, async move {
+                let response = handler(
+                    make_request(repository, Query::Signature(signature.into()), None, None),
+                    immutable_store,
+                    mutable_store,
+                    allow_all(),
+                    DEFAULT_HISTORY_STEP_SIZE,
+                    RevisionListAcceleration::default(),
+                )
+                .await
+                .expect("the signature resolves before the walk starts");
+                collect(response).await
+            })
+            .await;
+
+            let [header, ended] = items.as_slice() else {
+                panic!("expected a header and an error, got {items:?}");
+            };
+            let header = header.as_ref().expect("the header is sent");
+            assert!(
+                matches!(header.payload, Some(Payload::Header(_))),
+                "{header:?}"
+            );
+            let status = ended.as_ref().expect_err("the walk ends in an error");
+            assert_eq!(status.code(), tonic::Code::Cancelled, "{status:?}");
+        }))
+        .await;
+    }
+}

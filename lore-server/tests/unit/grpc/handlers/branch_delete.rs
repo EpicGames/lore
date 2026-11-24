@@ -242,6 +242,62 @@ async fn no_delete_notification_for_branch_delete_errors() {
     .await;
 }
 
+#[tokio::test]
+async fn a_cancelled_request_leaves_the_branch_and_sends_no_notification() {
+    let repository = random::<RepositoryId>();
+    let branch = BranchId::from(uuid::Uuid::now_v7());
+
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    // No expectation is set, so a notification fails the test.
+    let notification_sender = Arc::new(MockNotificationSender::new());
+    let instrument_provider = TestInstrumentProvider {};
+
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+            lore_revision::state::allow_all_repositories(),
+        ));
+
+        create_test_branch(repository_context.clone(), branch).await;
+
+        let mut request = Request::new(BranchDeleteRequest {
+            branch: branch.into(),
+        });
+        request.metadata_mut().insert_bin(
+            REPOSITORY_ID_KEY,
+            tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+        );
+
+        let cancellation = lore_revision::runtime::Cancellation::new();
+        cancellation.cancel();
+        let hook_dispatcher = Arc::new(HookDispatcher::empty());
+        let status = lore_server::util::core_hop::with_request_cancellation(
+            cancellation,
+            handler(
+                request,
+                &crate::util::test_support::allow_all_authorizer(),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &hook_dispatcher,
+                &instrument_provider,
+            ),
+        )
+        .await
+        .expect_err("a cancelled request stops before it deletes");
+        assert_eq!(status.code(), tonic::Code::Cancelled, "{status:?}");
+
+        branch::metadata(repository_context.clone(), branch)
+            .await
+            .expect("the branch is still there");
+    }))
+    .await;
+}
+
 /// A delete that settles a restore stopped after its claim, dropped while it reads the branch's
 /// metadata, as one whose deadline passes or whose client leaves is, still settles it, notifies of
 /// the deleted branch and spawns its post hooks: the delete runs on in a task of its own, which

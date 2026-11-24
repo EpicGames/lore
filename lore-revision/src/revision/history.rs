@@ -61,6 +61,7 @@ impl LoreRevisionHistoryEntryEventData {
 
 #[error_set]
 pub enum RevisionHistoryError {
+    Cancelled,
     LinkPinsDiverge,
     AddressNotFound,
     Disconnected,

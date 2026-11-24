@@ -312,6 +312,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cancelled_tree_walk_returns_no_tree() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let repository = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store,
+                    mutable_store,
+                    rand::random::<RepositoryId>(),
+                    lore_revision::state::allow_all_repositories(),
+                ));
+                let state = State::new();
+                for name in ["a", "b", "c"] {
+                    let node = Node {
+                        flags: NodeFlags::File.bits(),
+                        name_hash: hash_string(name),
+                        ..Default::default()
+                    };
+                    state
+                        .node_add(repository.clone(), ROOT_NODE, node, name)
+                        .await
+                        .expect("Failed to add node");
+                }
+
+                let cancellation = lore_revision::runtime::Cancellation::new();
+                cancellation.cancel();
+                let cancelled = Arc::new(
+                    lore_revision::interface::ExecutionContext::new_client(
+                        lore_revision::interface::LoreGlobalArgs::default(),
+                        lore_revision::relay::EventDispatcher::no_dispatch(),
+                    )
+                    .with_cancellation(cancellation),
+                );
+                let Err(err) = LORE_CONTEXT
+                    .scope(
+                        cancelled,
+                        lore_revision::state::gather_tree_paths(
+                            state,
+                            repository,
+                            lore_revision::util::path::RelativePath::new(),
+                            0,
+                            false,
+                        ),
+                    )
+                    .await
+                else {
+                    panic!("a cancelled walk returns no tree");
+                };
+                assert!(err.is_cancelled(), "{err:?}");
+            }))
+            .await
+            .expect("Task failed");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_fragment_collection_returns_no_list() {
+        let (_immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+                let immutable_store = LocalImmutableStore::new(
+                    None,
+                    lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("Failed to create store");
+                let write_token =
+                    lore_revision::repository::RepositoryWriteToken::acquire(path.as_path()).await;
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        default_repository_creation_args(immutable_store.clone(), mutable_store)
+                            .with_path(&path),
+                    )
+                    .with_write_token(write_token.share()),
+                );
+
+                let state_from = State::new();
+                let state_to = State::new();
+                let name = "test-node";
+                let node = Node {
+                    name_hash: hash_string(name),
+                    ..Default::default()
+                };
+                state_to
+                    .node_add(repository.clone(), ROOT_NODE, node, name)
+                    .await
+                    .expect("Failed to add node");
+                state_from
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize from state");
+                let signature_to = state_to
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize to state");
+                let state_to = State::deserialize(repository.clone(), signature_to)
+                    .await
+                    .expect("Failed to deserialize state");
+
+                let cancellation = lore_revision::runtime::Cancellation::new();
+                cancellation.cancel();
+                let cancelled = Arc::new(
+                    lore_revision::interface::ExecutionContext::new_client(
+                        lore_revision::interface::LoreGlobalArgs::default(),
+                        lore_revision::relay::EventDispatcher::no_dispatch(),
+                    )
+                    .with_cancellation(cancellation),
+                );
+                let err = LORE_CONTEXT
+                    .scope(
+                        cancelled,
+                        collect_new_fragments(
+                            repository.clone(),
+                            state_from,
+                            state_to,
+                            true,
+                            Arc::new(StoreRequestTracker::default()),
+                        ),
+                    )
+                    .await
+                    .expect_err("a cancelled collection returns no list");
+                assert!(err.is_cancelled(), "{err:?}");
+            }))
+            .await
+            .expect("Task failed");
+    }
+
+    #[tokio::test]
     async fn collect_new_name_fragments() {
         let (_immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");

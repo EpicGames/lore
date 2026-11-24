@@ -28,6 +28,7 @@ use super::repository_query::repository_query_name;
 use crate::authnz::repository_registry::RepositoryRegistry;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
+use crate::grpc::check_request_cancelled;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
@@ -246,6 +247,7 @@ async fn repository_create(
         };
     }
 
+    check_request_cancelled()?;
     registry.add(authorization, repository.id, name).await?;
 
     // Set up the repository metadata

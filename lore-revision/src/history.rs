@@ -17,6 +17,7 @@ use crate::repository::RepositoryContext;
 
 #[error_set]
 pub enum HistoryError {
+    Cancelled,
     AddressNotFound,
     Disconnected,
     InvalidArguments,

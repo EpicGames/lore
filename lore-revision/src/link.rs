@@ -77,6 +77,7 @@ pub mod update;
 
 #[error_set]
 pub enum LinkError {
+    Cancelled,
     NodeNotFound,
     LinkNotFound,
     LinkPinsDiverge,

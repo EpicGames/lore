@@ -592,6 +592,73 @@ mod unlock {
     }
 }
 
+mod cancelled_request {
+    use lore_proto::lock::LockRequest;
+    use lore_proto::lock::Resource;
+    use lore_proto::lock::UnlockRequest;
+    use lore_revision::runtime::Cancellation;
+    use lore_server::util::core_hop::with_request_cancellation;
+
+    use super::*;
+
+    fn one_resource() -> Vec<Resource> {
+        vec![Resource {
+            branch: Default::default(),
+            hash: Default::default(),
+            description: "".to_string(),
+        }]
+    }
+
+    fn with_repository<T>(message: T) -> Request<T> {
+        let mut request = Request::new(message);
+        request.metadata_mut().insert_bin(
+            REPOSITORY_ID_KEY,
+            tonic::metadata::BinaryMetadataValue::from_bytes(random::<RepositoryId>().data()),
+        );
+        request
+    }
+
+    fn cancelled() -> Cancellation {
+        let cancellation = Cancellation::new();
+        cancellation.cancel();
+        cancellation
+    }
+
+    /// A cancelled lock answers CANCELLED without reaching the lock store, which the mock
+    /// refuses.
+    #[tokio::test]
+    async fn a_cancelled_lock_takes_no_lock() {
+        let lock_service = super::lock_service(super::store::MockMockLockStore::new());
+
+        let status = with_request_cancellation(
+            cancelled(),
+            lock_service.lock(with_repository(LockRequest {
+                resources: one_resource(),
+            })),
+        )
+        .await
+        .expect_err("a cancelled lock stops before it locks");
+        assert_eq!(status.code(), Code::Cancelled, "{status:?}");
+    }
+
+    /// A cancelled unlock answers CANCELLED without reaching the lock store, which the mock
+    /// refuses.
+    #[tokio::test]
+    async fn a_cancelled_unlock_releases_no_lock() {
+        let lock_service = super::lock_service(super::store::MockMockLockStore::new());
+
+        let status = with_request_cancellation(
+            cancelled(),
+            lock_service.unlock(with_repository(UnlockRequest {
+                resources: one_resource(),
+            })),
+        )
+        .await
+        .expect_err("a cancelled unlock stops before it unlocks");
+        assert_eq!(status.code(), Code::Cancelled, "{status:?}");
+    }
+}
+
 /// Elevated action checks: unlock elevates on `owner`/`admin`,
 /// admin-lock requires `migrate`, both answered by the configured
 /// authorizer from the verified token — on both OIDC tiers.

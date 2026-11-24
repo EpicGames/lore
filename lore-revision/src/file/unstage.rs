@@ -123,6 +123,7 @@ pub struct LoreFileUnstageFileEventData {
 
 #[error_set]
 pub enum UnstageError {
+    Cancelled,
     LinkPinsDiverge,
     InvalidArguments,
     InvalidPath,

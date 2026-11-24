@@ -18,6 +18,7 @@ use tracing::debug;
 use tracing::info;
 
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::FilterCancelledExt;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
@@ -65,6 +66,7 @@ pub async fn handler(
             tree(repository.clone(), revision, path, max_depth, false)
                 .await
                 .filter_slow_down()?
+                .filter_cancelled()?
                 .map(|result| {
                     debug!("Got tree");
                     Response::new(RevisionTreeResponse {

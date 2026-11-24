@@ -1530,3 +1530,149 @@ async fn touched_link_is_announced_to_every_caller() {
     }))
     .await;
 }
+
+mod cancelled_request {
+    use lore_revision::runtime::Cancellation;
+    use lore_server::util::core_hop::with_request_cancellation;
+
+    use super::*;
+
+    /// Runs the diff of `from` against `to` as a cancelled request, answering what the stream
+    /// carried.
+    async fn cancelled_diff(
+        repository: RepositoryId,
+        immutable_store: Arc<dyn ImmutableStore>,
+        mutable_store: Arc<dyn MutableStore>,
+        from: Hash,
+        to: Hash,
+    ) -> Vec<Result<RevisionDiffResponse, Status>> {
+        let cancellation = Cancellation::new();
+        cancellation.cancel();
+        with_request_cancellation(cancellation, async move {
+            let response = handler(
+                make_request(
+                    repository,
+                    QueryFrom::SignatureFrom(from.into()),
+                    QueryTo::SignatureTo(to.into()),
+                    false,
+                ),
+                immutable_store,
+                mutable_store,
+                allow_all(),
+                RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+            )
+            .await
+            .expect("the revisions resolve before the diff starts");
+            collect(response).await
+        })
+        .await
+    }
+
+    /// Asserts the stream ended in CANCELLED without carrying a change or conflict.
+    fn assert_cancelled_without_changes(items: &[Result<RevisionDiffResponse, Status>]) {
+        let (last, earlier) = items.split_last().expect("the stream carries an answer");
+        let status = last.as_ref().expect_err("the stream ends in an error");
+        assert_eq!(status.code(), tonic::Code::Cancelled, "{status:?}");
+        for item in earlier {
+            let item = item.as_ref().expect("only the last item is an error");
+            assert!(
+                matches!(item.payload, Some(Payload::Header(_))),
+                "a cancelled diff carries no changes, got {item:?}",
+            );
+        }
+    }
+
+    /// A cancelled 2-way diff ends its stream in CANCELLED rather than diffing.
+    #[tokio::test]
+    async fn a_cancelled_two_way_diff_answers_cancelled() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+                allow_all_repositories(),
+            ));
+            let main = create_branch(&repository_context, "main", vec![]).await;
+            let rev1 = push_revision(
+                &repository_context,
+                main,
+                Hash::default(),
+                1,
+                &[("a.txt", b"v1".as_slice())],
+            )
+            .await;
+            let rev2 = push_revision(
+                &repository_context,
+                main,
+                rev1,
+                2,
+                &[("a.txt", b"v1".as_slice()), ("b.txt", b"new".as_slice())],
+            )
+            .await;
+
+            let items =
+                cancelled_diff(repository, immutable_store, mutable_store, rev1, rev2).await;
+            assert_cancelled_without_changes(&items);
+        }))
+        .await;
+    }
+
+    /// A cancelled 3-way diff ends its stream in CANCELLED rather than diffing.
+    #[tokio::test]
+    async fn a_cancelled_three_way_diff_answers_cancelled() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+                allow_all_repositories(),
+            ));
+            let main = create_branch(&repository_context, "main", vec![]).await;
+            let main_rev = push_revision(
+                &repository_context,
+                main,
+                Hash::default(),
+                1,
+                &[("conflict.txt", b"base".as_slice())],
+            )
+            .await;
+            let mut tips = Vec::new();
+            for (name, content) in [("branch_a", b"by-a".as_slice()), ("branch_b", b"by-b")] {
+                let branch_id = create_branch(
+                    &repository_context,
+                    name,
+                    vec![BranchPoint {
+                        branch: main,
+                        revision: main_rev,
+                    }],
+                )
+                .await;
+                tips.push(
+                    push_revision(
+                        &repository_context,
+                        branch_id,
+                        main_rev,
+                        1,
+                        &[("conflict.txt", content)],
+                    )
+                    .await,
+                );
+            }
+
+            let items =
+                cancelled_diff(repository, immutable_store, mutable_store, tips[0], tips[1]).await;
+            assert_cancelled_without_changes(&items);
+        }))
+        .await;
+    }
+}

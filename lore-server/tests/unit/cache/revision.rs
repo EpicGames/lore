@@ -114,6 +114,19 @@ async fn load_step_key(
         .filter(|revision| !revision.is_zero())
 }
 
+/// An execution whose request has been cancelled.
+fn cancelled_execution() -> Arc<lore_revision::interface::ExecutionContext> {
+    let cancellation = lore_revision::runtime::Cancellation::new();
+    cancellation.cancel();
+    Arc::new(
+        lore_revision::interface::ExecutionContext::new_client(
+            lore_revision::interface::LoreGlobalArgs::default(),
+            lore_revision::relay::EventDispatcher::no_dispatch(),
+        )
+        .with_cancellation(cancellation),
+    )
+}
+
 mod load_cached_list {
     use super::*;
 
@@ -241,6 +254,29 @@ mod try_backfill_segment {
                 panic!("a failing store must not be read as an unsealed segment");
             };
             assert!(!err.is_slow_down() && !err.is_address_not_found());
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_request_skips_the_backfill() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository = test_repository(immutable_store, mutable_store);
+            let branch = BranchId::from(uuid::Uuid::now_v7());
+
+            let Err(err) = LORE_CONTEXT
+                .scope(
+                    cancelled_execution(),
+                    try_backfill_segment(&repository, branch, 150, STEP_ONE_HUNDRED, true),
+                )
+                .await
+            else {
+                panic!("a cancelled backfill must not be read as an unsealed segment");
+            };
+            assert!(err.is_cancelled(), "{err:?}");
         }))
         .await;
     }
@@ -674,6 +710,53 @@ mod store_history_step {
                     .expect("load cached list")
                     .is_none()
             );
+        }))
+        .await;
+    }
+}
+
+mod resolve_via_step_key {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_cancelled_request_is_reported_rather_than_read_as_a_miss() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository = test_repository(immutable_store, mutable_store);
+            let branch = BranchId::from(uuid::Uuid::now_v7());
+            let chain = serialize_linear_chain(&repository, 150).await;
+            let older = load_state(&repository, chain[149]).await;
+            let newer = serialize_jump_revision(&repository, chain[149], 400).await;
+            store_history_step(
+                repository.clone(),
+                branch,
+                STEP_ONE_HUNDRED,
+                RevisionListAcceleration {
+                    step_keys: true,
+                    list_cache: false,
+                },
+                older,
+                newer,
+            )
+            .await;
+
+            let Err(err) = LORE_CONTEXT
+                .scope(
+                    cancelled_execution(),
+                    lore_server::cache::revision::resolve_via_step_key(
+                        &repository,
+                        branch,
+                        150,
+                        STEP_ONE_HUNDRED,
+                    ),
+                )
+                .await
+            else {
+                panic!("a cancelled lookup must not be read as a miss");
+            };
+            assert!(err.is_cancelled(), "{err:?}");
         }))
         .await;
     }

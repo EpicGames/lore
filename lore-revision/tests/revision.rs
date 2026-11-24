@@ -202,6 +202,61 @@ mod tests {
             .await;
     }
 
+    // The latest names a state that is never stored: the search stops before it reads one.
+    #[allow(clippy::disallowed_methods)]
+    #[tokio::test]
+    async fn a_cancelled_resolve_by_number_returns_cancelled() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let (immutable, mutable, _execution) =
+                    test_store_create().await.expect("Failed to create stores");
+                let tempdir = generate_tempdir();
+                let write_token =
+                    lore_revision::repository::RepositoryWriteToken::acquire(tempdir.path()).await;
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        default_repository_creation_args(immutable, mutable)
+                            .with_path(tempdir.path()),
+                    )
+                    .with_write_token(write_token.share()),
+                );
+                let branch = lore_base::types::BranchId::from(uuid::Uuid::now_v7());
+                lore_revision::branch::store_latest(
+                    repository.clone(),
+                    branch,
+                    lore_base::types::Hash::default(),
+                    lore_base::types::Hash::from([1; 32]),
+                    lore_revision::branch::BranchLatestStatus::Divergent,
+                )
+                .await
+                .expect("Seeding the latest must succeed");
+
+                let cancellation = lore_revision::runtime::Cancellation::new();
+                cancellation.cancel();
+                let cancelled = Arc::new(
+                    lore_revision::interface::ExecutionContext::new_client(
+                        lore_revision::interface::LoreGlobalArgs::default(),
+                        lore_revision::relay::EventDispatcher::no_dispatch(),
+                    )
+                    .with_cancellation(cancellation),
+                );
+                let err = LORE_CONTEXT
+                    .scope(
+                        cancelled,
+                        revision::resolve_boxed(
+                            repository,
+                            format!("{branch}@1"),
+                            ResolveSearchLocation::Local,
+                        ),
+                    )
+                    .await
+                    .expect_err("a cancelled resolve finds no revision");
+                assert!(err.is_cancelled(), "{err:?}");
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn test_diff3() {
         let (_immutable_store, _mutable_store, execution) =

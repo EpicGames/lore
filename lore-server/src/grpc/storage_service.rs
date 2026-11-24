@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::pin::Pin;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -50,6 +51,7 @@ use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::get_user_id;
 use crate::grpc::require_action;
+use crate::grpc::until_request_cancelled;
 use crate::legacy::rpc::storage_service_server::StorageService;
 use crate::protocol::attribute_map::get_user_id_from_context;
 use crate::protocol::attribute_map::repository_id_from_context;
@@ -135,7 +137,7 @@ impl StorageService for LoreStorageService {
         )?);
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-        let mut stream = request.into_inner();
+        let stream = request.into_inner();
 
         // TODO(psharpe): Make channel capacity configurable
         let (tx, rx) = mpsc::channel(8192);
@@ -148,6 +150,9 @@ impl StorageService for LoreStorageService {
             Arc::new(self.latency_histogram_ms(METRICS_STREAMING_MESSAGE_HANDLER_LATENCY));
 
         lore_spawn!(LORE_CONTEXT.scope(execution, async move {
+            // Ends once nobody reads the answers. An item already started finishes, so no
+            // store operation is cut off part way.
+            let mut stream = pin!(until_request_cancelled(stream));
             while let Some(request) = stream.next().await {
                 let immutable_store = immutable_store.clone();
                 let repository_authorizer = repository_authorizer.clone();
@@ -283,7 +288,7 @@ impl StorageService for LoreStorageService {
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
 
         // Stream of fragments
-        let mut stream = request.into_inner();
+        let stream = request.into_inner();
 
         // TODO(psharpe): make this capacity configurable or unbounded
         let (tx, rx) = mpsc::channel(8192);
@@ -296,6 +301,9 @@ impl StorageService for LoreStorageService {
             Arc::new(self.latency_histogram_ms(METRICS_STREAMING_MESSAGE_HANDLER_LATENCY));
 
         lore_spawn!(LORE_CONTEXT.scope(execution, async move {
+            // Ends once nobody reads the answers. An item already started finishes, so no
+            // store operation is cut off part way.
+            let mut stream = pin!(until_request_cancelled(stream));
             while let Some(req) = stream.next().await {
                 let immutable_store = immutable_store.clone();
                 let repository_authorizer = repository_authorizer.clone();
@@ -501,7 +509,7 @@ impl StorageService for LoreStorageService {
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
 
-        let mut stream = request.into_inner();
+        let stream = request.into_inner();
 
         let (tx, rx) = mpsc::channel(8192);
         let immutable_store = self.immutable_store.clone();
@@ -514,6 +522,9 @@ impl StorageService for LoreStorageService {
             LORE_CONTEXT.scope(
                 execution,
                 async move {
+                    // Ends once nobody reads the answers. An item already started finishes, so no
+                    // store operation is cut off part way.
+                    let mut stream = pin!(until_request_cancelled(stream));
                     while let Some(req) = stream.next().await {
                         let immutable_store = immutable_store.clone();
                         let repository_authorizer = repository_authorizer.clone();

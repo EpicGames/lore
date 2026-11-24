@@ -38,6 +38,7 @@ use super::get_user_id;
 use super::timeout_grpc;
 use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::check_request_cancelled;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::no_repository_access_status;
@@ -275,6 +276,7 @@ pub async fn unlock_implementation(
 
     LORE_CONTEXT
         .scope(execution, async move {
+            check_request_cancelled()?;
             let resources = lock_store
                 .unlock_resources(user_id.as_str(), !elevated_caller, repository, &resources)
                 .await
@@ -328,6 +330,7 @@ async fn lock_as_user(
 
     let lock_resources: Vec<LockResource> = resources.into_iter().map(Into::into).collect();
 
+    check_request_cancelled()?;
     let locks = lock_store
         .lock_resources(owner_id, repository, &lock_resources)
         .await

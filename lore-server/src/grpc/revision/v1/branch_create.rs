@@ -26,6 +26,7 @@ use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::BranchWriteFollowUp;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
+use crate::grpc::check_request_cancelled;
 use crate::grpc::create_branch_detached;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
@@ -179,6 +180,7 @@ pub async fn branch_create_implementation(
 
             debug!({BRANCH_ID} = %branch, branch_name = %name, stack = ?stack, "Creating branch");
 
+            check_request_cancelled()?;
             let branch_id = create_branch_detached(
                 repository.clone(),
                 branch,

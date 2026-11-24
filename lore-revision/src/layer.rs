@@ -52,6 +52,7 @@ use crate::util::path::RelativePath;
 
 #[error_set]
 pub enum LayerError {
+    Cancelled,
     LinkPinsDiverge,
     AlreadyLinked,
     LayerNotFound,

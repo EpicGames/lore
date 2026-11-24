@@ -49,6 +49,7 @@ mod refusal;
 mod relay;
 mod repository;
 mod revision;
+mod runtime;
 mod service_state;
 mod stage;
 mod state;

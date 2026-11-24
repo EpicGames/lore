@@ -38,6 +38,7 @@ use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision;
 use lore_revision::revision::ResolveSearchLocation;
+use lore_revision::runtime::check_cancelled;
 use lore_revision::state::State;
 use lore_revision::state::StateError;
 use lore_storage::StoreError;
@@ -130,14 +131,14 @@ fn interpret_cache_read<T, E: ErrorSet>(
 }
 
 /// Acceleration data is an optimisation, so an entry that cannot be read
-/// costs time rather than correctness: every failure but backpressure is
-/// answered as a miss and left to the slower path. Backpressure is the one
-/// failure that must not be, since the slower path is more work against the
-/// store that asked for less.
+/// costs time rather than correctness: every failure but backpressure and
+/// cancellation is answered as a miss and left to the slower path. Neither of
+/// those may be, since the slower path is more work against a store that asked
+/// for less, or for a request no one is waiting on.
 fn acceleration_miss<T>(result: Result<Option<T>, StateError>) -> Result<Option<T>, StateError> {
     match result {
         Ok(value) => Ok(value),
-        Err(err) if err.is_slow_down() => Err(err),
+        Err(err) if err.is_slow_down() || err.is_cancelled() => Err(err),
         Err(_) => Ok(None),
     }
 }
@@ -205,6 +206,8 @@ pub(crate) async fn try_backfill_segment(
     step_size: u64,
     seal: bool,
 ) -> Result<Option<CachedRevisionList>, StateError> {
+    // A backfill reads a whole segment and may write it, so a dropped request skips it.
+    check_cancelled()?;
     let target_b = revision_number.div_ceil(step_size) * step_size;
     let Some(next_b) = target_b.checked_add(step_size) else {
         return Ok(None);
@@ -340,8 +343,8 @@ pub(crate) async fn store_cached_list(
 /// pushed, (b) the parent chain reaches the root (zero hash), (c) the walk
 /// exceeds `max_items`, or (d) a state deserialization fails. Cases (a) and
 /// (b) set `reached_terminator = true`, signalling that the lowest segment
-/// touched is fully traversed. A store asking the caller to back off aborts the
-/// walk instead of reporting a partial traversal as a complete one.
+/// touched is fully traversed. A store asking the caller to back off, or a
+/// cancelled read, aborts the walk instead of reporting a partial traversal.
 pub(crate) async fn walk_segment_revisions(
     repository: &Arc<RepositoryContext>,
     anchor_hash: Hash,
@@ -359,7 +362,7 @@ pub(crate) async fn walk_segment_revisions(
         }
         let state = match State::deserialize(repository.clone(), hash).await {
             Ok(state) => state,
-            Err(err) if err.is_slow_down() => return Err(err),
+            Err(err) if err.is_slow_down() || err.is_cancelled() => return Err(err),
             Err(_) => break,
         };
         let number = state.revision_number();
@@ -651,6 +654,7 @@ async fn resolve_from_acceleration(
 /// than as absence: acceleration data can be stale or predate a key change, and
 /// a caller that treated that as "no such revision" would report an existing
 /// revision as missing.
+#[lore_macro::test_pub]
 pub(crate) async fn resolve_via_step_key(
     repository: &Arc<RepositoryContext>,
     branch: BranchId,

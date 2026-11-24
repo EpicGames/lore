@@ -1856,6 +1856,7 @@ impl RepositoryContext {
 
 #[error_set]
 pub enum RepositoryError {
+    Cancelled,
     LinkPinsDiverge,
     RepositoryAlreadyExists,
     RepositoryNotFound,

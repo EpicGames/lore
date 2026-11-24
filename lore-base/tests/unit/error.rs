@@ -139,6 +139,7 @@ fn registry() -> Vec<(&'static str, Group, i32)> {
             Group::Connectivity,
             ServiceUnavailable { reason: text() }.ffi_code(),
         ),
+        ("Cancelled", Group::Connectivity, Cancelled.ffi_code()),
         (
             "NothingStaged",
             Group::RepositoryState,

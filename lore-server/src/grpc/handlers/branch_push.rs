@@ -64,8 +64,10 @@ use tracing::warn;
 use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::cache::revision::store_history_step;
+use crate::grpc::FilterCancelledExt;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
+use crate::grpc::check_request_cancelled;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
@@ -264,6 +266,27 @@ const _: () = {
     }
 };
 
+/// The error a push, or its verification, returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushFailure {
+    /// It returned without an error.
+    None,
+    /// It returned an error status other than `CANCELLED`.
+    Error,
+    /// It returned `CANCELLED`.
+    Cancelled,
+}
+
+impl PushFailure {
+    fn of<T>(result: &Result<T, Status>) -> Self {
+        match result {
+            Ok(_) => PushFailure::None,
+            Err(status) if status.code() == tonic::Code::Cancelled => PushFailure::Cancelled,
+            Err(_) => PushFailure::Error,
+        }
+    }
+}
+
 /// How a push timed by [`PushReport`] ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PushOutcome {
@@ -276,9 +299,9 @@ pub enum PushOutcome {
     /// authorization or for a zero revision, or it panicked. A request without a valid repository
     /// header is rejected before its report exists and is not recorded.
     Error,
-    /// The handler future was dropped before it returned, such as by the handler timeout or a
-    /// server shutting down. A client that disconnects does not drop it: the handler runs on to
-    /// completion on the core runtime.
+    /// The push stopped because nobody waited for it any more: the client went away or the
+    /// handler timeout elapsed. Also a handler future dropped before it returned, such as by a
+    /// server shutting down.
     Cancelled,
 }
 
@@ -286,14 +309,14 @@ impl PushOutcome {
     /// How something that returned, or was dropped before it returned, ended. A push declined
     /// and answered with an error status is declined.
     #[lore_macro::test_pub]
-    fn of(finished: bool, declined: bool, errored: bool) -> Self {
-        match (finished, declined, errored) {
+    fn of(finished: bool, declined: bool, failure: PushFailure) -> Self {
+        match (finished, declined, failure) {
             // Dropped while unwinding: it failed, rather than being cut off from outside.
             (false, _, _) if std::thread::panicking() => PushOutcome::Error,
-            (false, _, _) => PushOutcome::Cancelled,
+            (false, _, _) | (true, false, PushFailure::Cancelled) => PushOutcome::Cancelled,
             (true, true, _) => PushOutcome::Declined,
-            (true, false, true) => PushOutcome::Error,
-            (true, false, false) => PushOutcome::Completed,
+            (true, false, PushFailure::Error) => PushOutcome::Error,
+            (true, false, PushFailure::None) => PushOutcome::Completed,
         }
     }
 
@@ -332,8 +355,8 @@ pub struct PushReport {
     exist_started: Option<Instant>,
     /// When the verification returned, with success or an error.
     verified_at: Option<Instant>,
-    verification_failed: bool,
-    errored: bool,
+    verification_failure: PushFailure,
+    failure: PushFailure,
     /// Whether the push left the head where it was for the client to resolve.
     declined: bool,
     /// The prefetch run beside the verification's tree walk.
@@ -400,8 +423,8 @@ impl PushReport {
             collect_started: None,
             exist_started: None,
             verified_at: None,
-            verification_failed: false,
-            errored: false,
+            verification_failure: PushFailure::None,
+            failure: PushFailure::None,
             declined: false,
             verify_prefetch: Arc::default(),
             merge_prefetch: Arc::default(),
@@ -424,15 +447,15 @@ impl PushReport {
     /// Runs `body` in `execution` with the report, and marks the push completed or errored by
     /// what `body` returns. A future dropped before then drops the report unfinished, which
     /// records the push as cancelled.
-    pub async fn run<T, E>(
+    pub async fn run<T>(
         mut self,
         execution: Arc<ExecutionContext>,
-        body: impl AsyncFnOnce(&mut PushReport) -> Result<T, E>,
-    ) -> Result<T, E> {
+        body: impl AsyncFnOnce(&mut PushReport) -> Result<T, Status>,
+    ) -> Result<T, Status> {
         LORE_CONTEXT
             .scope(execution, async move {
                 let result = body(&mut self).await;
-                self.errored = result.is_err();
+                self.failure = PushFailure::of(&result);
                 self.finish();
                 result
             })
@@ -456,7 +479,7 @@ impl PushReport {
             add_phase_time(&mut phase_durations, self.phase, now - self.phase_started);
             now
         };
-        let outcome = PushOutcome::of(self.finished_at.is_some(), self.declined, self.errored);
+        let outcome = PushOutcome::of(self.finished_at.is_some(), self.declined, self.failure);
         let verify_end = self.verified_at.unwrap_or(end);
         let verify_collect = self
             .collect_started
@@ -613,7 +636,7 @@ impl PushReport {
     /// Records the verification's timings, labelled with how the verification itself ended, and
     /// its store requests.
     fn record_verification(&self, summary: &PushSummary, handler: &KeyValue) {
-        let outcome = PushOutcome::of(self.verified_at.is_some(), false, self.verification_failed);
+        let outcome = PushOutcome::of(self.verified_at.is_some(), false, self.verification_failure);
         let completed_with_nothing_collected =
             outcome == PushOutcome::Completed && self.collected_addresses.unwrap_or(0) == 0;
         let attributes = [handler.clone(), KeyValue::new("outcome", outcome.label())];
@@ -1310,6 +1333,7 @@ async fn prepare_push(
         return Ok(PreparedPush::Done(HeadUpdate::declined(loaded.head)));
     };
 
+    check_request_cancelled()?;
     // Both a plain push and a fast-forward merge verify the incoming revision against its own
     // parents, which do not depend on the head. Without this check a client could reference
     // fragments that were never fully uploaded.
@@ -1348,7 +1372,7 @@ async fn verify_incoming_fragments(
     )
     .await;
     report.verified_at = Some(Instant::now());
-    report.verification_failed = verified.is_err();
+    report.verification_failure = PushFailure::of(&verified);
     verified?;
 
     Ok(VerifiedParents { parent, other })
@@ -1371,6 +1395,7 @@ async fn store_new_head(
     report: &mut PushReport,
 ) -> Result<HeadUpdate, Status> {
     report.enter(PushPhase::Commit);
+    check_request_cancelled()?;
     let HeadAndIncoming {
         head: mut current,
         incoming,
@@ -1394,6 +1419,10 @@ async fn store_new_head(
     }
 
     loop {
+        // Every pass starts with the latest revision unmoved by this push: the first, or a retry
+        // after the latest revision moved underneath it. Once a store lands, the loop returns
+        // without checking again.
+        check_request_cancelled()?;
         report.store_latest_attempts += 1;
         let previous_head = try_store_latest(repository.clone(), branch, current, new_head)
             .await
@@ -1481,6 +1510,9 @@ async fn try_fast_forward_merge(
 
     loop {
         report.enter(PushPhase::FastForwardMerge);
+        // As in the plain push, a pass reaches here only while the latest revision is unmoved by
+        // this push.
+        check_request_cancelled()?;
 
         // Three-way diff: base=original merge target, source=incoming merge, target=current head
         debug!(
@@ -1508,11 +1540,14 @@ async fn try_fast_forward_merge(
             }));
             beside_prefetch(diff, prefetch.as_pin_mut()).await
         };
-        let mut diff_result = diffed.filter_slow_down()?.warn_map_err(|err| {
-            Status::internal(format!(
-                "Failed to compute diff3 for fast-forward merge: {err}"
-            ))
-        })?;
+        let mut diff_result = diffed
+            .filter_slow_down()?
+            .filter_cancelled()?
+            .warn_map_err(|err| {
+                Status::internal(format!(
+                    "Failed to compute diff3 for fast-forward merge: {err}"
+                ))
+            })?;
         debug!(
             changes = diff_result.changes.len(),
             conflicts = diff_result.conflicts.len(),
@@ -1527,9 +1562,15 @@ async fn try_fast_forward_merge(
             report.fast_forward_merge_changes = None;
             return Ok(HeadUpdate::declined(current_head));
         }
-        // Recorded before the merge is applied, so a push cancelled while applying or storing it
+        // Recorded before the merge is applied, so a push that stops or fails short of storing it
         // still reports the size of the merge it was working on.
         report.fast_forward_merge_changes = Some(diff_result.changes.len() as u64);
+        #[cfg(feature = "test-util")]
+        crate::test_util::push_step(crate::test_util::PushStep::MergeDiffed).await;
+        // Applying the merge writes its tree, so a dropped push stops here rather than write a
+        // merge. A pass that loses the swap stops at the loop's next check, leaving the merge it
+        // wrote unreferenced, as a push stopped after uploading leaves its fragments.
+        check_request_cancelled()?;
 
         // Deserialize the current head state to use as base for the new merge revision
         let state_current = State::deserialize(repository.clone(), current_head)
@@ -1741,6 +1782,7 @@ async fn collect_new_addresses(
         )
             .instrument(span!(Level::DEBUG, "collect_new_addresses"))
             .await
+            .filter_cancelled()?
             .warn_map_err(|err| {
                 if let Some(converted_error) = err.as_address_not_found() {
                     return address_not_found_status(
@@ -1874,6 +1916,8 @@ async fn verify_fragments(
 
     let mut tasks = JoinSet::new();
     while !new_fragments.is_empty() || !tasks.is_empty() {
+        // Each wave is joined in full before the next, so no query is in flight here.
+        check_request_cancelled()?;
         let num_addresses = new_fragments.len();
         let batch_span = span!(
             Level::DEBUG,

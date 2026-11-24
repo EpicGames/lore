@@ -25,6 +25,7 @@ use crate::state;
 
 #[error_set]
 pub enum ResetError {
+    Cancelled,
     LinkPinsDiverge,
     NodeNotFound,
     LinkNotFound,

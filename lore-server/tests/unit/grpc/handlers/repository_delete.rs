@@ -448,3 +448,55 @@ mod zero_repository_id {
         .await;
     }
 }
+
+mod cancelled_request {
+    use lore_revision::runtime::Cancellation;
+    use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use lore_server::util::core_hop::with_request_cancellation;
+
+    use super::*;
+
+    /// A cancelled delete answers CANCELLED before it tears down any of the repository.
+    #[tokio::test]
+    async fn answers_cancelled_and_deletes_nothing() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let id = random::<RepositoryId>();
+            seed_repository(immutable_store.clone(), mutable_store.clone(), id, "alice").await;
+
+            let cancellation = Cancellation::new();
+            cancellation.cancel();
+            let status = with_request_cancellation(
+                cancellation,
+                handler(
+                    delete_request(id, AuthorizationToken::default()),
+                    &RepositoryRegistry::Unregistered,
+                    &(Arc::new(AllowAllRepositoryAuthorizer) as Arc<dyn RepositoryAuthorizer>),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    &TestInstrumentProvider,
+                ),
+            )
+            .await
+            .expect_err("a cancelled delete stops before it deletes");
+            assert_eq!(status.code(), tonic::Code::Cancelled, "{status:?}");
+
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                id,
+                allow_all_repositories(),
+            ));
+            repository::metadata_hash(repository.clone())
+                .await
+                .expect("the stored metadata survives");
+            let mapped = repository::id_from_name(repository, "the-repository")
+                .await
+                .expect("the name still maps to the repository");
+            assert_eq!(mapped, id);
+        }))
+        .await;
+    }
+}

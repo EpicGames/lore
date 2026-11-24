@@ -230,6 +230,16 @@ pub struct ServiceUnavailable {
     pub reason: String,
 }
 
+/// The caller left or timed out, so the operation stopped without leaving partially completed
+/// work.
+///
+/// Unlike [`Disconnected`], which reports a transport failure while the caller is still waiting,
+/// this means nobody is waiting for the result.
+#[derive(Debug, Clone, Error, FfiError)]
+#[error("Operation cancelled")]
+#[ffi_code(33)]
+pub struct Cancelled;
+
 // ---------------------------------------------------------------------------
 // Repository state (40–55)
 //

@@ -1054,6 +1054,9 @@ pub struct ExecutionContext {
     /// The environment of the process that relayed this call, read in place of this process's
     /// through [`lore_base::env::var`]. `None` for a call made in this process.
     environment: Option<CallEnvironment>,
+    /// Cancelled once nobody is waiting for this call's result. `None` for a call nothing can
+    /// cancel, such as a client command.
+    cancellation: Option<crate::runtime::Cancellation>,
 }
 
 impl ExecutionContext {
@@ -1116,6 +1119,19 @@ impl ExecutionContext {
         }
     }
 
+    /// This context, for a call that stops at its next cancellation check once `cancellation` is
+    /// cancelled.
+    pub fn with_cancellation(self, cancellation: crate::runtime::Cancellation) -> Self {
+        Self {
+            cancellation: Some(cancellation),
+            ..self
+        }
+    }
+
+    pub fn cancellation(&self) -> Option<&crate::runtime::Cancellation> {
+        self.cancellation.as_ref()
+    }
+
     /// This context for a holder that serves past the call that made it, a mounted filesystem,
     /// for a caller with `environment` under `globals`: this mode, and a dispatcher that sends
     /// nowhere, as no call awaits what the holder logs.
@@ -1138,6 +1154,28 @@ impl ExecutionContext {
             mode: self.mode,
             caller_state: self.caller_state.clone(),
             environment,
+            ..Default::default()
+        }
+    }
+
+    /// This context for work a server call starts that runs to its end even once nobody waits for
+    /// the call, such as what follows a write: the same call and user, adding to the same write
+    /// accounting, with nothing to cancel it. Its dispatcher sends nowhere, as a server call's
+    /// does, and it has its own push statistics and slots.
+    pub async fn outliving(&self) -> Self {
+        let mut dispatcher = EventDispatcher::new(None);
+        dispatcher
+            .correlation_id
+            .clone_from(&self.dispatcher.correlation_id);
+        Self {
+            globals: self.globals.clone(),
+            dispatcher,
+            log_level: self.log_level,
+            user_id: Mutex::new(self.user_id().await),
+            mode: self.mode,
+            caller_state: self.caller_state.clone(),
+            fragment_stats: OnceLock::from(self.fragment_stats().clone()),
+            environment: self.environment.clone(),
             ..Default::default()
         }
     }
@@ -1202,6 +1240,7 @@ impl Default for ExecutionContext {
             push_stats: OnceLock::new(),
             push_budget: OnceLock::new(),
             environment: None,
+            cancellation: None,
         }
     }
 }

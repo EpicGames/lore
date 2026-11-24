@@ -331,3 +331,65 @@ async fn a_store_failure_fails_the_create_as_internal() {
     }))
     .await;
 }
+
+/// A cancelled create answers CANCELLED before it writes the branch or notifies of it.
+#[tokio::test]
+async fn a_cancelled_create_writes_no_branch() {
+    let repository = random::<RepositoryId>();
+    let branch_id = BranchId::from(uuid::Uuid::now_v7());
+
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    // No expectation is set, so a notification fails the test.
+    let notification_sender = Arc::new(MockNotificationSender::new());
+    let instrument_provider = TestInstrumentProvider {};
+
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let mut request = Request::new(BranchCreateRequest {
+            branch: branch_id.into(),
+            name: branch::DEFAULT_DEFAULT_NAME.into(),
+            creator: "creator".into(),
+            created: 1,
+            category: "category".into(),
+            stack: vec![],
+            revision_deprecated: None,
+            parent_deprecated: None,
+        });
+        request.metadata_mut().insert_bin(
+            REPOSITORY_ID_KEY,
+            tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+        );
+
+        let cancellation = lore_revision::runtime::Cancellation::new();
+        cancellation.cancel();
+        let hook_dispatcher = Arc::new(HookDispatcher::empty());
+        let status = lore_server::util::core_hop::with_request_cancellation(
+            cancellation,
+            handler(
+                request,
+                &crate::util::test_support::allow_all_authorizer(),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &hook_dispatcher,
+                &instrument_provider,
+            ),
+        )
+        .await
+        .expect_err("a cancelled create stops before it writes the branch");
+        assert_eq!(status.code(), tonic::Code::Cancelled, "{status:?}");
+
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+            allow_all_repositories(),
+        ));
+        let err = branch::metadata(repository_context, branch_id)
+            .await
+            .expect_err("no branch is written");
+        assert!(err.is_branch_not_found(), "unexpected error: {err:?}");
+    }))
+    .await;
+}

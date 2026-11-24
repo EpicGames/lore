@@ -611,6 +611,52 @@ mod direct_handling {
         .await;
     }
 
+    /// A cancelled create answers CANCELLED before it writes the branch or notifies of it.
+    #[tokio::test]
+    async fn a_cancelled_create_writes_no_branch() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        // No expectation is set, so a notification fails the test.
+        let notification_sender = Arc::new(MockNotificationSender::new());
+        let instrument_provider = TestInstrumentProvider {};
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let cancellation = lore_revision::runtime::Cancellation::new();
+            cancellation.cancel();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
+            let err = lore_server::util::core_hop::with_request_cancellation(
+                cancellation,
+                handler(
+                    create_request(repository, "main"),
+                    &crate::util::test_support::allow_all_authorizer(),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    notification_sender.clone(),
+                    &None, /* no forwarded requests */
+                    &hook_dispatcher,
+                    &instrument_provider,
+                ),
+            )
+            .await
+            .expect_err("a cancelled create stops before it writes the branch");
+            assert_eq!(err.code(), tonic::Code::Cancelled, "{err:?}");
+
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+                allow_all_repositories(),
+            ));
+            let err = branch::load_name_to_id_local(repository_context, "main")
+                .await
+                .expect_err("a cancelled create maps no name");
+            assert!(err.is_branch_not_found(), "unexpected error: {err:?}");
+        }))
+        .await;
+    }
+
     #[tokio::test]
     async fn oversized_name_is_rejected_before_pre_hooks() {
         let repository = random::<RepositoryId>();

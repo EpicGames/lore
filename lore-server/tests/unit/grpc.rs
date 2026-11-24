@@ -517,6 +517,12 @@ mod may_administer {
 mod timeout_grpc_tests {
     use std::time::Duration;
 
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_revision::runtime::Cancellation;
+    use lore_revision::runtime::check_cancelled;
+    use lore_server::util::core_hop::with_request_cancellation;
+    use lore_server::util::setup_execution;
+
     use super::*;
 
     #[tokio::test]
@@ -535,16 +541,88 @@ mod timeout_grpc_tests {
         assert_eq!(status.message(), "missing");
     }
 
+    /// A handler that runs until its call is cancelled, then fails as cancelled.
+    async fn until_cancelled() -> Result<i32, Status> {
+        let execution = setup_execution("test", String::default(), String::default());
+        LORE_CONTEXT
+            .scope(execution, async {
+                loop {
+                    if check_cancelled().is_err() {
+                        return Err(Status::cancelled("stopped"));
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+    }
+
     #[tokio::test]
-    async fn returns_cancelled_when_future_exceeds_timeout() {
+    async fn holds_the_handler_future_once() {
+        let handler = async {
+            let buffer = [0u8; 4096];
+            tokio::task::yield_now().await;
+            Ok::<_, Status>(buffer.len())
+        };
+        let handler_size = size_of_val(&handler);
+        let timed = timeout_grpc(Duration::from_secs(1), handler);
+        assert!(
+            size_of_val(&timed) < 2 * handler_size,
+            "the timeout holds {} bytes for a handler of {handler_size}",
+            size_of_val(&timed)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancels_the_handler_at_the_deadline_and_reports_the_timeout() {
+        let status = timeout_grpc(Duration::from_millis(10), until_cancelled())
+            .await
+            .expect_err("the handler stops once cancelled");
+        assert_eq!(status.code(), Code::Cancelled);
+        assert_eq!(status.message(), "Request handler timeout exceeded");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_handler_that_finishes_past_the_deadline_keeps_its_result() {
         let fut = async {
             tokio::time::sleep(Duration::from_secs(10)).await;
             Ok::<_, Status>(42)
         };
-        let result = timeout_grpc(Duration::from_millis(10), fut).await;
-        let status = result.unwrap_err();
+        let value = timeout_grpc(Duration::from_millis(10), fut)
+            .await
+            .expect("the handler is not dropped at the deadline");
+        assert_eq!(value, 42);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_cancelled_after_the_deadline_keeps_its_own_status() {
+        let request = Cancellation::new();
+        let cancel_late = request.clone();
+        let handler = async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancel_late.cancel();
+            Err::<i32, _>(Status::cancelled("client left"))
+        };
+        let status =
+            with_request_cancellation(request, timeout_grpc(Duration::from_millis(10), handler))
+                .await
+                .expect_err("the handler fails as cancelled");
         assert_eq!(status.code(), Code::Cancelled);
-        assert!(status.message().contains("timeout"));
+        assert_eq!(status.message(), "client left");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_the_request_cancels_the_handler_before_the_deadline() {
+        let request = Cancellation::new();
+        let handler = with_request_cancellation(
+            request.clone(),
+            timeout_grpc(Duration::from_secs(3600), until_cancelled()),
+        );
+        request.cancel();
+        let status = handler
+            .await
+            .expect_err("the handler stops once its request is cancelled");
+        assert_eq!(status.code(), Code::Cancelled);
+        assert_eq!(status.message(), "stopped");
     }
 }
 
@@ -757,5 +835,100 @@ mod hook_error_to_status {
         let error = HookError::panic("auth", "boom");
 
         assert_eq!(hook_error_to_status(error).code(), Code::Internal);
+    }
+}
+
+mod until_request_cancelled {
+    use std::time::Duration;
+
+    use futures::StreamExt;
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_revision::runtime::Cancellation;
+    use lore_server::grpc::until_request_cancelled;
+    use lore_server::util::core_hop::with_request_cancellation;
+    use lore_server::util::setup_execution;
+
+    #[tokio::test]
+    async fn a_waiting_stream_ends_once_the_request_is_cancelled() {
+        let request = Cancellation::new();
+        let execution = with_request_cancellation(request.clone(), async {
+            setup_execution("test", String::default(), String::default())
+        })
+        .await;
+        let next = LORE_CONTEXT
+            .scope(execution, async {
+                let mut stream =
+                    std::pin::pin!(until_request_cancelled(futures::stream::pending::<u32>()));
+                request.cancel();
+                tokio::time::timeout(Duration::from_secs(5), stream.next()).await
+            })
+            .await
+            .expect("the stream ends without another message");
+        assert_eq!(next, None);
+    }
+
+    #[tokio::test]
+    async fn a_stream_already_waiting_ends_once_the_request_is_cancelled() {
+        let request = Cancellation::new();
+        let execution = with_request_cancellation(request.clone(), async {
+            setup_execution("test", String::default(), String::default())
+        })
+        .await;
+        let next = LORE_CONTEXT
+            .scope(execution, async {
+                let mut stream =
+                    std::pin::pin!(until_request_cancelled(futures::stream::pending::<u32>()));
+                assert!(futures::poll!(stream.next()).is_pending());
+                request.cancel();
+                tokio::time::timeout(Duration::from_secs(5), stream.next()).await
+            })
+            .await
+            .expect("the cancellation wakes the waiting stream");
+        assert_eq!(next, None);
+    }
+
+    #[tokio::test]
+    async fn every_message_passes_while_the_request_is_live() {
+        let request = Cancellation::new();
+        let execution = with_request_cancellation(request, async {
+            setup_execution("test", String::default(), String::default())
+        })
+        .await;
+        let items = LORE_CONTEXT
+            .scope(execution, async {
+                until_request_cancelled(futures::stream::iter([1, 2, 3]))
+                    .collect::<Vec<_>>()
+                    .await
+            })
+            .await;
+        assert_eq!(items, [1, 2, 3]);
+    }
+}
+
+mod run_detached {
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_revision::runtime::Cancellation;
+    use lore_revision::runtime::check_cancelled;
+    use lore_server::util::core_hop::with_request_cancellation;
+    use lore_server::util::setup_execution;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn the_task_is_not_cancelled_with_its_request() {
+        let cancellation = Cancellation::new();
+        cancellation.cancel();
+        let request = with_request_cancellation(cancellation, async {
+            setup_execution("test", String::default(), String::default())
+        })
+        .await;
+
+        let checked = LORE_CONTEXT
+            .scope(request, async {
+                run_detached("test", async { check_cancelled() }).await
+            })
+            .await
+            .expect("the task runs to its end");
+        checked.expect("the task does not see its request's cancellation");
     }
 }

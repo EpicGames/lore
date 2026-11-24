@@ -81,6 +81,8 @@ use crate::revision;
 use crate::revision::Diff3Summary;
 use crate::revision::DiffItem;
 use crate::revision::DiffResult;
+use crate::runtime::CancellationCheck;
+use crate::runtime::check_cancelled;
 use crate::state;
 use crate::state::State;
 use crate::state::StateData;
@@ -317,6 +319,7 @@ pub struct LoreBranchUnprotectEventData {
 
 #[error_set]
 pub enum BranchError {
+    Cancelled,
     LinkPinsDiverge,
     BranchNotFound,
     BranchAlreadyExists,
@@ -5120,19 +5123,58 @@ pub async fn diff3_with_source_cap(
     ))
     .await?;
 
-    // `resolve_diff3_base` is documented never to return this, so reaching it is a
-    // bug rather than a repository state. Refuse anyway: the alternative is a diff
-    // against the empty tree that conflicts on every path in both branches.
-    if base_revision.is_zero() {
-        lore_error!(
-            "Resolved a zero base revision for branch {source_branch} revision {source_revision} and branch {target_branch} revision {target_revision}"
-        );
-        return Err(BranchError::from(Divergent));
-    }
+    diff3_with_base(
+        repository,
+        base_revision,
+        merges,
+        source_revision,
+        target_revision,
+        path,
+        include_same,
+        auto_resolve,
+        source_cap,
+        history_walk_concurrency,
+        graft_view,
+        link_settlement,
+        tx,
+    )
+    .await
+}
 
+/// The 3-way diff of `source_revision` and `target_revision` against `base_revision`.
+///
+/// `base_revision` and `merges` must come from one [`resolve_diff3_base_and_merges`] call for
+/// the same two revisions: `merges` is what that base's search proved, and describes no other
+/// base.
+#[allow(clippy::too_many_arguments)]
+pub async fn diff3_with_base(
+    repository: Arc<RepositoryContext>,
+    base_revision: Hash,
+    merges: revision::MergesAcross,
+    source_revision: Hash,
+    target_revision: Hash,
+    path: Option<RelativePath>,
+    include_same: bool,
+    auto_resolve: bool,
+    source_cap: Option<usize>,
+    history_walk_concurrency: Option<usize>,
+    graft_view: Option<Arc<crate::filter::Filter>>,
+    link_settlement: revision::LinkSettlement,
+    tx: mpsc::Sender<Result<DiffItem, BranchError>>,
+) -> Result<Diff3Summary, BranchError> {
     lore_debug!(
         "Revision diff base {base_revision} source {source_revision} target {target_revision}"
     );
+
+    // Base resolution refuses to answer a zero base, so reaching it is a bug rather than a
+    // repository state. Refuse anyway: the alternative is a diff against the empty tree that
+    // conflicts on every path on both sides.
+    if base_revision.is_zero() {
+        lore_error!(
+            "Asked for a 3-way diff of revision {source_revision} and revision {target_revision} against a zero base"
+        );
+        return Err(BranchError::from(Divergent));
+    }
 
     let summary = Diff3Summary {
         base: base_revision,
@@ -5164,9 +5206,9 @@ pub async fn diff3_with_source_cap(
 /// [`emit_diff_item_with_auto_resolve`].
 ///
 /// A function of its own because its items live across several awaits: kept in
-/// [`diff3_with_source_cap`] they would take space in its future while the base
-/// is resolved as well. The caller pins the diff, which takes the caller's
-/// arguments rather than a copy of them. Each item is relayed after the
+/// the caller's body they would take space in its future beside the diff. The
+/// caller pins the diff, which takes the caller's arguments rather than a copy
+/// of them. Each item is relayed after the
 /// `select!` that received it, and a diff that outlives the channel is awaited
 /// after the loop, so no item is held twice.
 #[lore_macro::test_pub]
@@ -5344,8 +5386,7 @@ pub fn resolve_diff3_base(
 /// [`resolve_diff3_base`], also answering what the search for the base proved about merges
 /// between the two branches: [`revision::MergesAcross::NoneAboveBase`] where the branches differ
 /// and no merge in the repository joins them above the base.
-#[lore_macro::test_pub]
-pub(crate) async fn resolve_diff3_base_and_merges(
+pub async fn resolve_diff3_base_and_merges(
     repository: Arc<RepositoryContext>,
     source_branch: BranchId,
     source_revision: Hash,
@@ -5756,7 +5797,9 @@ async fn find_revision_in_history_line(
     let mut line = load_history_line(repository.clone(), newer_revision).await?;
     let mut scanned = 0;
 
+    let cancellation = CancellationCheck::current();
     loop {
+        cancellation.check()?;
         if line[scanned..]
             .iter()
             .any(|&(_, revision)| revision == older_revision)
@@ -5825,7 +5868,9 @@ async fn find_common_revision_in_history_lines(
     let mut other_loaded = 0;
     let mut passed = (0, 0);
 
+    let cancellation = CancellationCheck::current();
     loop {
+        cancellation.check()?;
         for (line, loaded) in [(&self_line, self_loaded), (&other_line, other_loaded)] {
             if let Some((number, revision)) =
                 history::out_of_order(|index| line.get(index).copied(), loaded)
@@ -5997,6 +6042,14 @@ impl AncestorWalk {
         }
     }
 
+    /// Keeps `err` as the failure the search reports, unless an earlier walk failed first.
+    async fn record_failure(&self, err: StateError) {
+        let mut failure = self.failure.write().await;
+        if failure.is_none() {
+            *failure = Some(err);
+        }
+    }
+
     async fn prune_at_or_below(&self) -> u64 {
         match *self.common.read().await {
             Some((found_revision_number, _found_revision)) => {
@@ -6034,7 +6087,12 @@ async fn find_ancestor_walker(
     let mut revision = revision_start;
     let mut pager = find::LinePager::new(repository.clone(), walk.lines_ahead.clone());
     let mut below = u64::MAX;
+    let cancellation = CancellationCheck::current();
     while revision != Hash::default() {
+        // The search checks for cancellation itself once every walk has joined.
+        if cancellation.check().is_err() {
+            break;
+        }
         // Read the line a page at a time rather than a revision per request, no further down than
         // the walks prune: the floor, or the newest common ancestor found so far. A refused page
         // leaves each state to be read on its own below.
@@ -6046,10 +6104,7 @@ async fn find_ancestor_walker(
             Ok(state) => state,
             Err(err) => {
                 lore_warn!("Could not deserialize state for {revision} - aborting walk: {err}");
-                let mut failure = walk.failure.write().await;
-                if failure.is_none() {
-                    *failure = Some(err);
-                }
+                walk.record_failure(err).await;
                 break;
             }
         };
@@ -6231,6 +6286,7 @@ async fn search_common_ancestor_from_merges(
     });
 
     walk.join(&mut tasks).await;
+    check_cancelled()?;
 
     let found = *walk.common.read().await;
     let failure = walk.failure.write().await.take();

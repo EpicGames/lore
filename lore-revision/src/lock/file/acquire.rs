@@ -40,6 +40,7 @@ pub struct AcquireOptions {
 
 #[error_set]
 pub enum AcquireError {
+    Cancelled,
     LinkPinsDiverge,
     Disconnected,
     InvalidArguments,

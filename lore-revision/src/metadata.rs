@@ -51,6 +51,7 @@ pub const METADATA_MAX_SIZE: usize = 1024 * 1024;
 
 #[error_set]
 pub enum MetadataErrors {
+    Cancelled,
     LinkPinsDiverge,
     InvalidArguments,
     FileNotFound,

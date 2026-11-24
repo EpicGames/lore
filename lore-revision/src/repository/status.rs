@@ -362,6 +362,7 @@ impl StatusSummaryStats {
 
 #[error_set]
 pub enum StatusError {
+    Cancelled,
     LinkPinsDiverge,
     NodeNotFound,
     LinkNotFound,

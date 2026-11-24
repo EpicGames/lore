@@ -41,6 +41,9 @@ cancel safe. A dropped `JoinHandle` detaches its task, so one such task needs no
 than one such task, spawn them into a `DetachingJoinSet` (from `lore_base::runtime`), which detaches its tasks when
 dropped.
 
+Stop request work through the request's cancellation rather than by aborting its tasks. A spawned task inherits the
+cancellation with `LORE_CONTEXT`. See [Cancellation](async-futures.md#9-cancellation).
+
 ## Error handling
 
 Map `JoinError` (task panics/cancellations) to your error type via `.internal("...")` — it is a foreign error. Use `lore_drain_tasks!` as shorthand

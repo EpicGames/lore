@@ -50,6 +50,7 @@ use crate::node::NodeIDExt;
 #[cfg(target_os = "linux")]
 use crate::node::ROOT_NODE;
 use crate::repository::RepositoryContext;
+use crate::runtime::CancellationCheck;
 #[cfg(target_os = "linux")]
 use crate::state::AttachOutcome;
 use crate::state::ChangeSender;
@@ -689,7 +690,9 @@ async fn walk_pending_subtrees(
     filter_mode: FilterMode,
     stats: &DiffWalkStats,
 ) -> Result<(), StateError> {
+    let cancellation = CancellationCheck::current();
     loop {
+        cancellation.check()?;
         let Some(subtree) = work.pending.pop() else {
             break;
         };

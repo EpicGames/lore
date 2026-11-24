@@ -74,6 +74,7 @@ use crate::util::path::RelativePath;
 
 #[error_set]
 pub enum DirtyError {
+    Cancelled,
     LinkPinsDiverge,
     AddressNotFound,
     InvalidArguments,

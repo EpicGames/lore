@@ -395,3 +395,80 @@ mod zero_repository_id {
         .await;
     }
 }
+
+mod cancelled_request {
+    use std::sync::Arc;
+
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_proto::lore::repository::v1::RepositoryCreateRequest;
+    use lore_revision::lore::RepositoryId;
+    use lore_revision::repository;
+    use lore_revision::repository::RepositoryContext;
+    use lore_revision::runtime::Cancellation;
+    use lore_server::authnz::repository_registry::RepositoryRegistry;
+    use lore_server::grpc::repository::v1::repository_create::*;
+    use lore_server::hooks::HookDispatcher;
+    use lore_server::util::core_hop::with_request_cancellation;
+    use rand::random;
+    use tonic::Request;
+
+    use crate::store::test_support::test_store_create;
+
+    struct TestInstrumentProvider;
+
+    impl lore_telemetry::InstrumentProvider for TestInstrumentProvider {
+        fn namespace(&self) -> &'static str {
+            "test"
+        }
+    }
+
+    /// A cancelled create answers CANCELLED before it registers the name or stores the
+    /// repository's metadata.
+    #[tokio::test]
+    async fn answers_cancelled_and_stores_nothing() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let id = random::<RepositoryId>();
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let request = Request::new(RepositoryCreateRequest {
+                id: bytes::Bytes::copy_from_slice(id.data()),
+                name: "cancelled-create".into(),
+                default_branch_id: bytes::Bytes::from(lore_base::types::Context::from(
+                    uuid::Uuid::now_v7(),
+                )),
+                default_branch_name: "main".into(),
+                ..Default::default()
+            });
+            let cancellation = Cancellation::new();
+            cancellation.cancel();
+            let status = with_request_cancellation(
+                cancellation,
+                handler(
+                    request,
+                    &RepositoryRegistry::Unregistered,
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    &None,
+                    &HookDispatcher::empty(),
+                    &TestInstrumentProvider,
+                ),
+            )
+            .await
+            .expect_err("a cancelled create stops before it stores anything");
+            assert_eq!(status.code(), tonic::Code::Cancelled, "{status:?}");
+
+            let context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                id,
+                lore_revision::state::allow_all_repositories(),
+            ));
+            let err = repository::metadata_hash(context)
+                .await
+                .expect_err("no repository metadata is stored");
+            assert!(err.is_address_not_found(), "unexpected error: {err:?}");
+        }))
+        .await;
+    }
+}

@@ -59,6 +59,8 @@ use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::node::NodeIDExt;
 use crate::repository::RepositoryContext;
+use crate::runtime::CancellationCheck;
+use crate::runtime::check_cancelled;
 use crate::state;
 use crate::state::State;
 use crate::state::StateData;
@@ -490,6 +492,10 @@ pub async fn diff3_with_source_cap(
     };
     let target_repository = Arc::new(repository.to_filter_context(target_filter));
 
+    // The walks check as they go, but the source walk may have finished before the call was
+    // cancelled.
+    check_cancelled()?;
+
     lore_debug!("Diff target branch revisions (streaming)");
     let walker_repo = target_repository.clone();
     let walker_state_base = state_base.clone();
@@ -760,15 +766,18 @@ async fn merged_across(
     // `Arc<State>` over a deserialised revision blob, and at 10k+
     // conflicts unbounded fan-out blows past tens of GB of pinned state.
     //
-    // No abort path: on error we stop spawning and let in-flight tasks
-    // finish naturally. Cancel-safety is not something the surrounding
-    // code is designed to tolerate today (e.g. a task aborted mid-write
-    // to a downstream channel could surface a partial value), so let
-    // them run to completion.
+    // On error or cancellation we stop spawning and drain rather than abort: a walk aborted
+    // part way would drop a store read in flight. A cancelled walk stops at its own next
+    // check instead.
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(permits));
     let mut history_walks: JoinSet<Result<HistoryWalkOutcome, StateError>> = JoinSet::new();
     let mut walk_err: Option<StateError> = None;
+    let cancellation = CancellationCheck::current();
     for (idx, conflict) in joined_conflicts.iter().enumerate() {
+        if let Err(cancelled) = cancellation.check() {
+            walk_err = Some(cancelled.into());
+            break;
+        }
         if stands(conflict) {
             outcomes.push(HistoryWalkOutcome {
                 index: idx,
@@ -3111,9 +3120,11 @@ async fn find_last_merged_revision(
         return Ok(None);
     }
     let mut state_current = state_start.clone();
+    let cancellation = CancellationCheck::current();
     while state_current.revision_number() > state_branch_point.revision_number()
         && node_current.is_valid_node_id()
     {
+        cancellation.check()?;
         let node_index = NodeFileMetadataBlock::index(node_current);
         if let Ok(block) = state_current
             .block_file_metadata(repository.clone(), node_index)
@@ -3326,6 +3337,13 @@ fn absent_unless_sole_source<T, Source: ErrorSet>(
         return Ok(result.ok());
     }
     absent_unless(result, propagate, context)
+}
+
+/// Whether a failed search by number has to reach the caller rather than read as a missing
+/// revision: a throttled search would answer differently on retry, and a cancelled one is not
+/// wanted at all.
+fn stops_resolution(err: &find::FindError) -> bool {
+    err.is_slow_down() || err.is_cancelled()
 }
 
 /// A revision resolved from a specifier, with the branch it is taken on.
@@ -3677,7 +3695,7 @@ async fn resolve_revision_number(
         let found = absent_unless_sole_source(
             find::revision_by_number(repository.clone(), branch, head, revision_number).await,
             local_latest,
-            find::FindError::is_slow_down,
+            stops_resolution,
             "finding revision by number",
         )?;
         if let Some(found_revision) = found {
@@ -3688,7 +3706,7 @@ async fn resolve_revision_number(
         && let Some(head) = local_latest
         && let Some(found_revision) = absent_unless::<_, _, StateError>(
             find::revision_by_number(repository.clone(), branch, head, revision_number).await,
-            find::FindError::is_slow_down,
+            stops_resolution,
             "finding revision by number",
         )?
     {
@@ -3887,7 +3905,9 @@ pub(crate) async fn resolve_revision(
 
     if let Some(offset) = offset {
         let mut counter = offset;
+        let cancellation = CancellationCheck::current();
         while counter > 0 {
+            cancellation.check()?;
             let state = State::deserialize(repository.clone(), revision).await?;
             let parent = state.parent_self();
 

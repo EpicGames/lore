@@ -33,6 +33,7 @@ use tonic::Status;
 use tracing::debug;
 use tracing::warn;
 
+use crate::grpc::FilterCancelledExt;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::warn_error_to_status;
 
@@ -124,6 +125,7 @@ pub(super) async fn resolve_signature(
                 )
                 .await
                 .filter_slow_down()?
+                .filter_cancelled()?
                 .map_err(|err| {
                     if err.is_not_found() || err.is_revision_not_found() {
                         Status::not_found(format!(

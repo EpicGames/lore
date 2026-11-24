@@ -278,6 +278,7 @@ pub struct LoreRevisionCommitRevisionEventData {
 
 #[error_set]
 pub enum CommitError {
+    Cancelled,
     // User-actionable
     NothingStaged,
     BranchAdvanced,

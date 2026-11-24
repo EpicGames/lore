@@ -51,6 +51,7 @@ impl AncestorPoint {
 
 /// The branch whose acceleration data covers a revision number, and how much
 /// of that branch's history the requested branch shares.
+#[lore_macro::test_pub]
 pub(crate) struct HistoryOwner {
     pub branch: BranchId,
     /// Highest number on `branch` that the requested branch's history

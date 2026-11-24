@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::pin::Pin;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -38,6 +39,7 @@ use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::interpret_streaming_error;
 use crate::grpc::map_message_handle_error_to_status;
+use crate::grpc::until_request_cancelled;
 use crate::protocol::storage::get::handle_get;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::messages::MessageHandleError;
@@ -112,7 +114,7 @@ pub async fn handler(
     let repository = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-    let mut stream = request.into_inner();
+    let stream = request.into_inner();
 
     let (tx, rx) = mpsc::channel(super::STREAM_PROCESS_LIMIT);
 
@@ -126,6 +128,9 @@ pub async fn handler(
         .scope(execution, async move {
             lore_spawn!(async move {
                 let task_limiter = Arc::new(Semaphore::new(super::STREAM_PROCESS_LIMIT));
+                // Ends once nobody reads the answers. An item already started finishes, so no
+                // store operation is cut off part way.
+                let mut stream = pin!(until_request_cancelled(stream));
                 while let Some(request) = stream.next().await {
                     let permit = match Arc::clone(&task_limiter).acquire_owned().await {
                         Ok(p) => p,

@@ -39,6 +39,7 @@ pub struct LoreRevisionBisectEventData {
 
 #[error_set]
 pub enum BisectError {
+    Cancelled,
     LinkPinsDiverge,
     NodeNotFound,
     LinkNotFound,

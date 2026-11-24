@@ -25,6 +25,7 @@ use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::BranchWriteFollowUp;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
+use crate::grpc::check_request_cancelled;
 use crate::grpc::delete_branch_detached;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
@@ -151,6 +152,7 @@ pub async fn branch_delete_implementation(
 
             debug!({BRANCH_ID} = %branch_id, "Deleting branch");
 
+            check_request_cancelled()?;
             match delete_branch_detached(
                 repository.clone(),
                 branch_id,

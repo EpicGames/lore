@@ -33,6 +33,7 @@ use tonic::Status;
 use tonic::metadata::MetadataValue;
 use tracing::warn;
 
+use crate::grpc::FilterCancelledExt;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
@@ -161,6 +162,7 @@ async fn resolve_start(
                 )
                 .await
                 .filter_slow_down()?
+                .filter_cancelled()?
                 .unwrap_or_default()
             } else {
                 None
@@ -177,6 +179,7 @@ async fn resolve_start(
                 )
                 .await
                 .filter_slow_down()?
+                .filter_cancelled()?
                 .map_err(|err| Status::invalid_argument(format!("invalid identifier {err}")))?;
 
                 (hash, RevisionListStrategy::FullIteration)

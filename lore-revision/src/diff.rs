@@ -10,6 +10,7 @@ use tokio::task::JoinSet;
 
 use crate::change;
 use crate::change::NodeChange;
+use crate::errors::Cancelled;
 use crate::errors::InvalidArguments;
 use crate::errors::SlowDown;
 use crate::filter::FilterMode;
@@ -27,6 +28,7 @@ use crate::util::path::RelativePath;
 
 #[error_set]
 pub enum DiffError {
+    Cancelled,
     InvalidArguments,
     SlowDown,
 }

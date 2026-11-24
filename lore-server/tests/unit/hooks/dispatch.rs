@@ -1252,3 +1252,52 @@ fn test_dispatch_response_wrong_hook_point() {
     let response = dispatcher.dispatch_response(HookPoint::BranchPush, &ctx);
     assert!(response.message.is_none());
 }
+
+mod spawn_post {
+    use super::*;
+
+    /// A hook whose post-handler sends whether the call it runs under has been cancelled.
+    struct CancellationReportingHook {
+        observed: tokio::sync::mpsc::UnboundedSender<bool>,
+    }
+
+    #[async_trait]
+    impl Hook for CancellationReportingHook {
+        fn name(&self) -> &'static str {
+            "cancellation-reporting"
+        }
+
+        fn hook_points(&self) -> &'static [HookPoint] {
+            &[HookPoint::BranchPush]
+        }
+
+        async fn post_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
+            let cancelled = lore_revision::runtime::check_cancelled().is_err();
+            let _ = self.observed.send(cancelled);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_post_hook_is_not_cancelled_with_its_request() {
+        let cancellation = lore_revision::runtime::Cancellation::new();
+        cancellation.cancel();
+        let request = lore_server::util::core_hop::with_request_cancellation(cancellation, async {
+            test_execution_context()
+        })
+        .await;
+        let (observed, mut cancelled) = tokio::sync::mpsc::unbounded_channel();
+
+        LORE_CONTEXT
+            .scope(request, async {
+                let hooks: Vec<(String, Box<dyn Hook>)> = vec![(
+                    "cancellation-reporting".to_string(),
+                    Box::new(CancellationReportingHook { observed }),
+                )];
+                test_dispatcher(hooks).spawn_post(HookPoint::BranchPush, create_test_context());
+            })
+            .await;
+
+        assert_eq!(cancelled.recv().await, Some(false));
+    }
+}

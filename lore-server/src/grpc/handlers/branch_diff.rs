@@ -22,6 +22,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::FilterCancelledExt;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
@@ -156,7 +157,7 @@ async fn branch_diff_handler(
         auto_resolve,
     )
     .await;
-    match result.filter_slow_down()? {
+    match result.filter_slow_down()?.filter_cancelled()? {
         Ok(result) => {
             debug!("Found {} changes", result.changes.len());
             // The changes are base -> source; compare the registries over the

@@ -16,6 +16,7 @@ use lore_revision::metadata::BRANCH;
 use lore_revision::metadata::Metadata;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::runtime::CancellationCheck;
 use lore_revision::state;
 use lore_revision::state::StateError;
 use lore_revision::state::no_link_traversal;
@@ -40,6 +41,7 @@ use tracing::warn;
 use zerocopy::IntoBytes;
 
 use crate::cache;
+use crate::grpc::FilterCancelledExt;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
@@ -56,11 +58,12 @@ const MAX_REVISION_LIST_RESPONSE_ITEMS: usize = 100;
 const METRICS_START_KEY: &str = "start_type";
 const METRICS_LIST_STRATEGY_KEY: &str = "list_strategy";
 /// Revisions walked between progress reports from a [`descend_line`]. The
-/// descent reports its totals when it finishes, and the handler timeout can
-/// end it before it ever gets there, so a descent long enough to be worth
+/// descent reports its totals when it finishes, and cancelling the request
+/// can end it before it ever gets there, so a descent long enough to be worth
 /// diagnosing reports as it goes.
 const GAP_DESCENT_PROGRESS_HOPS: u64 = 10_000;
 
+#[lore_macro::test_pub]
 enum RevisionListStrategy {
     Direct,
     /// A walk down the line of the branch it holds, which seals the step
@@ -85,6 +88,7 @@ impl RevisionListStrategy {
 
 /// Outcome of `resolve_start`: either a pre-built page from the cache,
 /// or a starting hash that the walker still needs to expand.
+#[lore_macro::test_pub]
 enum ResolveStart {
     /// Page pre-built from cached segment items. Carries the branch
     /// (needed for the forward-cursor lookup) and the parent of the
@@ -419,6 +423,7 @@ async fn latest_line_start(
     )
     .await
     .filter_slow_down()?
+    .filter_cancelled()?
     .map_err(|err| warn_error_to_status(&err, |e| Status::internal(e.to_string())))?;
     match descent {
         Descent {
@@ -460,6 +465,7 @@ fn cached_start(
 /// walked down from the pointer: revision numbers fall along the line, so
 /// the walk reads at most one segment. A pointer numbered above B does not
 /// describe the line and is not followed.
+#[lore_macro::test_pub]
 async fn accelerated_start(
     repository: &Arc<RepositoryContext>,
     owner: &HistoryOwner,
@@ -472,6 +478,7 @@ async fn accelerated_start(
             cache::revision::load_cached_list(repository, owner.branch, number, history_step_size)
                 .await
                 .filter_slow_down()?
+                .filter_cancelled()?
                 .unwrap_or_default()
         && let Some(start) = segment_start(
             repository,
@@ -523,6 +530,7 @@ async fn accelerated_start(
         )
         .await
         .filter_slow_down()?
+        .filter_cancelled()?
         .unwrap_or_default()
         && let Some(start) = segment_start(
             repository,
@@ -558,6 +566,7 @@ async fn accelerated_start(
     )
     .await
     .filter_slow_down()?
+    .filter_cancelled()?
     .unwrap_or_default()
     else {
         return Ok(None);
@@ -587,6 +596,7 @@ async fn boundary_pointer(
         cache::revision::load_step_pointer(repository, branch, number, history_step_size)
             .await
             .filter_slow_down()?
+            .filter_cancelled()?
             .unwrap_or_default()
     else {
         return Ok(None);
@@ -716,6 +726,7 @@ async fn try_serve_signature_from_cache(
         cache::revision::load_cached_list(repository, branch, revision_number, history_step_size)
             .await
             .filter_slow_down()?
+            .filter_cancelled()?
             .unwrap_or_default()
     {
         (items, RevisionListStrategy::ListCache)
@@ -729,6 +740,7 @@ async fn try_serve_signature_from_cache(
         )
         .await
         .filter_slow_down()?
+        .filter_cancelled()?
         .unwrap_or_default() else {
             return Ok(None);
         };
@@ -1126,6 +1138,7 @@ async fn forward_target(
             cache::revision::load_cached_list(repository, branch, boundary, history_step_size)
                 .await
                 .filter_slow_down()?
+                .filter_cancelled()?
                 .unwrap_or_default()
         && let Some(item) = cached
             .items()
@@ -1140,6 +1153,7 @@ async fn forward_target(
     let walk = cache::revision::walk_segment_revisions(repository, anchor, first_number, max_items)
         .await
         .filter_slow_down()?
+        .filter_cancelled()?
         .map_err(|err| warn_error_to_status(&err, |e| Status::internal(e.to_string())))?;
     if !walk.reached_terminator {
         return Err(Status::internal(format!(
@@ -1175,8 +1189,8 @@ struct Descent {
 /// Uncapped by hop count: revision numbers strictly decrease along
 /// `parent_self`, so the walk ends at `number` or the root. A cap would fail
 /// every retry of a request deep in an unaccelerated history the same way,
-/// since each restarts from `anchor`. `RevisionList` is wrapped in
-/// `timeout_grpc` at the service layer, which bounds a deep walk.
+/// since each restarts from `anchor`. A deep walk ends when the request is
+/// cancelled, by the client or the handler timeout.
 async fn descend_line(
     repository: &Arc<RepositoryContext>,
     branch: BranchId,
@@ -1191,7 +1205,10 @@ async fn descend_line(
     let mut hops: u64 = 0;
     let mut sealed: u64 = 0;
 
+    let cancellation = CancellationCheck::current();
     while !hash.is_zero() {
+        // The sealing writes below are best-effort caches, so stopping between hops is safe.
+        cancellation.check()?;
         let current_state = state::State::deserialize(repository.clone(), hash).await?;
         let current_number = current_state.revision_number();
 
@@ -1347,6 +1364,7 @@ async fn forward_cursor(
 /// The lowest revision numbered above `first_number` on the line of `branch`
 /// from `anchor`, found by a [`descend_line`], or `None` when `anchor` is not
 /// numbered above it.
+#[lore_macro::test_pub]
 async fn forward_descent(
     repository: &Arc<RepositoryContext>,
     branch: BranchId,
@@ -1365,6 +1383,7 @@ async fn forward_descent(
     )
     .await
     .filter_slow_down()?
+    .filter_cancelled()?
     .map_err(|err| warn_error_to_status(&err, |e| Status::internal(e.to_string())))?;
     Ok(descent.above)
 }

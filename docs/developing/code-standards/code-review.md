@@ -34,7 +34,8 @@ A review must run in a fresh session: a session or subagent that didn't write th
 8. Flag code that departs from an accepted ADR with no new ADR superseding it in the same change, a decision that is hard to reverse, or that establishes a pattern later code should follow, with no ADR recording it in the change or in a follow-up named in its description, and a superseded ADR whose `status` isn't updated.
 9. Check that every change to shipped behaviour, including server, auth, storage and data-structure changes, adds a note to `docs/release-notes/` with the right `type`, rather than an entry in `docs/release-notes.md`.
 10. In async code, check that a restructured loop, `select!`, or match keeps its error precedence, draining, and channel-close semantics.
-11. Report the findings as [Reporting findings](#reporting-findings) describes.
+11. In server-reachable code, check that a loop sized by the repository, its history or client input checks for cancellation, and that no check follows a write later steps depend on. Follow [Cancellation](async-futures.md#9-cancellation).
+12. Report the findings as [Reporting findings](#reporting-findings) describes.
 
 ## Irreversible changes
 

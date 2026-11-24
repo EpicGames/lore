@@ -22,6 +22,7 @@ use crate::util::serde::u8_as_bool;
 
 #[error_set]
 pub enum InfoError {
+    Cancelled,
     LinkPinsDiverge,
     NotFound,
     AddressNotFound,

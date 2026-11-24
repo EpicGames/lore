@@ -174,21 +174,7 @@ fn stream_tree(
         {
             Ok(walk) => walk,
             Err(err) => {
-                let status = if err.is_slow_down() {
-                    Status::resource_exhausted(err.to_string())
-                } else if err.is_invalid_path() {
-                    Status::invalid_argument(
-                        "Cannot calculate tree for path that is not a directory",
-                    )
-                } else if err.is_node_not_found() {
-                    Status::not_found("A node in the tree could not be found")
-                } else {
-                    warn!(
-                        {REPOSITORY_ID} = %repository.id, {REVISION} = %signature, ?err,
-                        "Failed to walk revision tree",
-                    );
-                    warn_error_to_status(&err, |e| Status::internal(e.to_string()))
-                };
+                let status = tree_error_status(&repository, signature, &err);
                 if let Ok(permit) = tx.reserve().await {
                     permit.send(Err(status));
                 }
@@ -467,4 +453,22 @@ async fn emit_tree_stream<'a, F>(
     }
 
     debug!(emitted_nodes, emitted_revisions, "RevisionTree complete");
+}
+
+fn tree_error_status(repository: &RepositoryContext, signature: Hash, err: &StateError) -> Status {
+    if err.is_cancelled() {
+        Status::cancelled(err.to_string())
+    } else if err.is_slow_down() {
+        Status::resource_exhausted(err.to_string())
+    } else if err.is_invalid_path() {
+        Status::invalid_argument("Cannot calculate tree for path that is not a directory")
+    } else if err.is_node_not_found() {
+        Status::not_found("A node in the tree could not be found")
+    } else {
+        warn!(
+            {REPOSITORY_ID} = %repository.id, {REVISION} = %signature, ?err,
+            "Failed to walk revision tree",
+        );
+        warn_error_to_status(err, |e| Status::internal(e.to_string()))
+    }
 }
