@@ -518,8 +518,8 @@ pub(crate) fn below(batch: &[(u64, Hash)], start: Hash) -> &[(u64, Hash)] {
 /// The local walk stops at a revision whose step gives no number and parent: one the store lacks,
 /// a failed read, or a blob that is not a revision state. Where the remote cannot list that page,
 /// only the revisions the local walk read. The number of a listed revision is read from its state,
-/// as [`verified_line_step`] describes, and the page's states are cached as [`cache_page_states`]
-/// describes. Fails where the page does not continue the line, as [`remote_page`] describes.
+/// as [`line_state`] reads it, and the page's states are cached as [`cache_page_states`] describes.
+/// Fails where the page does not continue the line, as [`remote_page`] describes.
 pub async fn batch_load_history(
     repository: Arc<RepositoryContext>,
     mut revision: Hash,
@@ -988,9 +988,10 @@ fn page_by_number(
             };
             let mut listed = 0;
             for item in line {
-                let Some((item_number, parent)) = verified_line_step(item)
+                let Some((item_number, parent)) = line_state(item, next.unwrap_or(item.signature))
+                    .ok()
+                    .map(|state| (state.revision_number, state.parent[0]))
                     .filter(|&(item_number, _)| item_number < above)
-                    .filter(|_| next.is_none_or(|next| item.signature == next))
                 else {
                     break;
                 };
@@ -1085,21 +1086,11 @@ async fn remote_page(
     let mut page: Option<Listed> = None;
     let mut next = revision;
     for item in line {
-        let Some(state) = verified_state(item) else {
-            return Err(FindError::internal(format!(
-                "the remote listed revision {} without its own state",
-                item.signature
-            )));
+        let state = match line_state(item, next) {
+            Ok(state) => state,
+            Err(LineFault::OffTheLine { .. }) if floor.is_some() => break,
+            Err(fault) => return Err(FindError::internal(fault.to_string())),
         };
-        if item.signature != next {
-            if floor.is_some() {
-                break;
-            }
-            return Err(FindError::internal(format!(
-                "the remote named revision {} where the line holds revision {next}",
-                item.signature
-            )));
-        }
         next = state.parent[0];
         let number = state.revision_number;
         if let Some(history) = history.as_deref_mut() {
@@ -1119,11 +1110,10 @@ async fn remote_page(
         cache_page_states(repository, &line[..listed], 0).await;
         return Ok(page);
     }
-    if !response.next_revision.is_zero() && response.next_revision != next {
-        return Err(FindError::internal(format!(
-            "the remote named revision {} where the line holds revision {next}",
-            response.next_revision
-        )));
+    if !response.next_revision.is_zero()
+        && let Err(fault) = LineFault::check(response.next_revision, next)
+    {
+        return Err(FindError::internal(fault.to_string()));
     }
 
     let metadata_addresses: Vec<Address> = line
@@ -1155,7 +1145,7 @@ pub fn cache_revision_list_states(
 /// they describe are read without a remote fetch. Each of the first `unverified` items is written
 /// where its state is its revision's own, as [`holds_its_state`] checks, so bytes that don't hash
 /// to the item's signature are not stored. Each item after them is one the caller has checked the
-/// same way, as [`verified_line_step`] does, so it is written without hashing it again.
+/// same way, as [`line_state`] does, so it is written without hashing it again.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
@@ -1204,10 +1194,51 @@ pub fn verified_state(item: &lore_transport::RevisionItem) -> Option<StateData> 
         .filter(StateData::has_state_magic)
 }
 
-/// The revision number and first parent in the state `item` carries, as [`verified_state`] reads
-/// it. [`local_line_step`] answers the same for a revision in the local store.
-pub(crate) fn verified_line_step(item: &lore_transport::RevisionItem) -> Option<(u64, Hash)> {
-    verified_state(item).map(|state| (state.revision_number, state.parent[0]))
+/// The state `item` carries, as [`verified_state`] reads it, where `item` is `held`, the revision
+/// a line through first parents holds at the item's place. Otherwise answers how the item breaks
+/// the line, its state checked first.
+pub(crate) fn line_state(
+    item: &lore_transport::RevisionItem,
+    held: Hash,
+) -> Result<StateData, LineFault> {
+    let state = verified_state(item).ok_or(LineFault::WithoutItsState(item.signature))?;
+    LineFault::check(item.signature, held)?;
+    Ok(state)
+}
+
+/// How an item of a remote page, or the page's cursor, breaks a line through first parents.
+pub(crate) enum LineFault {
+    /// The item, named by its hash signature, doesn't carry its own state.
+    WithoutItsState(Hash),
+    /// The page names revision `named` where the line holds revision `held`.
+    OffTheLine { named: Hash, held: Hash },
+}
+
+impl LineFault {
+    /// Fails where `named`, the revision a page names at a place of the line, isn't `held`, the
+    /// revision the line holds there.
+    pub(crate) fn check(named: Hash, held: Hash) -> Result<(), Self> {
+        if named == held {
+            Ok(())
+        } else {
+            Err(Self::OffTheLine { named, held })
+        }
+    }
+}
+
+impl std::fmt::Display for LineFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WithoutItsState(revision) => write!(
+                f,
+                "the remote listed revision {revision} without its own state"
+            ),
+            Self::OffTheLine { named, held } => write!(
+                f,
+                "the remote named revision {named} where the line holds revision {held}"
+            ),
+        }
+    }
 }
 
 /// Data for the event reporting a revision found by a search.

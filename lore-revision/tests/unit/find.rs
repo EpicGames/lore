@@ -1108,6 +1108,41 @@ mod line_pager {
             .await;
     }
 
+    /// A page of the walk's own that lists a revision without its own state below the one asked
+    /// for stores none of the page and stops the pager paging.
+    #[tokio::test]
+    async fn a_page_of_the_walks_own_listing_a_state_not_its_own_stores_nothing() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let line = remote_line(5, Hash::default()).await;
+                let other = remote_revision(4, Hash::default(), Hash::from([0xB0; 32])).await;
+                for (kind, listed) in without_its_own_state(&line[3], &other) {
+                    let stores = client_stores().await;
+                    let held: Vec<RemoteRevision> = line
+                        .iter()
+                        .filter(|revision| revision.signature != line[3].signature)
+                        .cloned()
+                        .chain(listed)
+                        .collect();
+                    let remote = PagedRemote::new(branch(), line[4].signature)
+                        .holding(&held)
+                        .page(signature_of(&line, 5), span(&line, 5, 3), Hash::default());
+                    let client = client_on(&stores, Arc::new(remote));
+                    let mut pager = LinePager::new(client.clone(), permits());
+
+                    pager.page_in(line[4].signature, u64::MAX, 0).await;
+
+                    assert!(!pager.paging(), "{kind}: the pager stops paging");
+                    assert_eq!(
+                        stored_locally(&client, &[line[4].signature]).await,
+                        [false],
+                        "{kind}: the page stores nothing"
+                    );
+                }
+            })
+            .await;
+    }
+
     /// A remote that answers a revision number the line skips with the page holding the line's
     /// nearest revision below it, as Lore Server does, lists the line ahead from there: the walk
     /// reads no page by hash signature below its own two.

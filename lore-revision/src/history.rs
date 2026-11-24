@@ -233,10 +233,9 @@ impl Line {
     /// is set. The local walk adds the revision it stops at, with the number zero, before the line
     /// asks for the page holding it, so the page numbers that revision rather than adding it
     /// again. Each number and first parent is read once from the state the page carries, as
-    /// [`find::verified_line_step`] describes. Fails where the page does not hold the cursor,
-    /// lists a revision without its own state, or lists one that is not the first parent of the
-    /// revision above it, and where `next`, if set, is not the first parent of the page's last
-    /// revision.
+    /// [`find::line_state`] reads it. Fails where the page does not hold the cursor, lists a
+    /// revision without its own state, or lists one that is not the first parent of the revision
+    /// above it, and where `next`, if set, is not the first parent of the page's last revision.
     fn extend(&mut self, listed: &[RevisionItem], next: Hash) -> Result<(), HistoryError> {
         let anchor = self.cursor;
         let Some((first, older)) = listed.split_first() else {
@@ -244,21 +243,18 @@ impl Line {
                 "the remote listed a page without revision {anchor}, which it was asked for"
             )));
         };
-        let (anchor_number, mut parent) =
-            find::verified_line_step(first).ok_or_else(|| unverified(first.signature))?;
+        let (anchor_number, mut parent) = find::line_state(first, anchor)
+            .map(|state| (state.revision_number, state.parent[0]))
+            .map_err(broken_line)?;
         let start = self.history.len();
         for item in older {
-            let (number, item_parent) =
-                find::verified_line_step(item).ok_or_else(|| unverified(item.signature))?;
-            if item.signature != parent {
-                return Err(off_the_line(item.signature, parent));
-            }
-            self.numbers.push(number);
+            let state = find::line_state(item, parent).map_err(broken_line)?;
+            self.numbers.push(state.revision_number);
             self.history.push(item.signature);
-            parent = item_parent;
+            parent = state.parent[0];
         }
-        if !next.is_zero() && next != parent {
-            return Err(off_the_line(next, parent));
+        if !next.is_zero() {
+            find::LineFault::check(next, parent).map_err(broken_line)?;
         }
         if let Some(number) = start
             .checked_sub(1)
@@ -283,19 +279,9 @@ impl Line {
     }
 }
 
-/// The error for a page that lists `revision` without its own state.
-fn unverified(revision: Hash) -> HistoryError {
-    HistoryError::internal(format!(
-        "the remote listed revision {revision} without its own state"
-    ))
-}
-
-/// The error for a page that names `named` where the line holds `parent`, the first parent of
-/// the revision above it.
-fn off_the_line(named: Hash, parent: Hash) -> HistoryError {
-    HistoryError::internal(format!(
-        "the remote named revision {named} where the line holds revision {parent}"
-    ))
+/// The error for a page that breaks the line as `fault` describes.
+fn broken_line(fault: find::LineFault) -> HistoryError {
+    HistoryError::internal(fault.to_string())
 }
 
 /// The first revision of a line from index `from` on whose number is not below that of the
