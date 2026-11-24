@@ -6,7 +6,6 @@ use lore_error_set::prelude::*;
 
 use super::MetadataErrors;
 use crate::errors::FileNotFound;
-use crate::errors::MatchedStateErrors;
 use crate::link::LinkedState;
 use crate::lore::Hash;
 use crate::metadata::Metadata;
@@ -46,15 +45,10 @@ async fn linked_file_node(
     state: Arc<state::State>,
     path: &RelativePath,
 ) -> Result<Option<(NodeID, LinkedState)>, MetadataErrors> {
-    let found = state
-        .find_relative_held(repository.clone(), ROOT_NODE, path.as_str())
+    state
+        .find_relative_held_if_present(repository.clone(), ROOT_NODE, path.as_str())
         .await
-        .try_match("finding node")?;
-    match found {
-        Ok((node_link, linked)) => Ok(node_link.is_valid().then_some((node_link.node, linked))),
-        Err(MatchedStateErrors::NodeNotFound(_)) => Ok(None),
-        Err(other) => Err(other.forward("finding node")),
-    }
+        .forward("finding node")
 }
 
 pub(super) async fn file(

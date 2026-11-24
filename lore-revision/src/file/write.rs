@@ -22,6 +22,7 @@ use crate::lore::Address;
 use crate::lore::Hash;
 use crate::lore::execution_context;
 use crate::node::NodeFileMode;
+use crate::node::ROOT_NODE;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::revision;
@@ -234,25 +235,19 @@ pub(crate) async fn write_file(
         .await
         .forward::<WriteError>("Failed to deserialize state")?;
 
-    let node_link = state
-        .find_node_link(repository.clone(), relative_path.as_str())
+    let Some((node_id, (link_repository, link_state))) = state
+        .find_relative_held_if_present(repository.clone(), ROOT_NODE, relative_path.as_str())
         .await
-        .map_err(|err| {
-            forward_refusal_or(err, "finding the node", |_err| {
-                WriteError::from(FileNotFound {
-                    resource: relative_path.to_string(),
-                })
-            })
-        })?;
-    if !node_link.is_valid() {
+        .forward_any::<WriteError>("finding the node")?
+    else {
         return Err(FileNotFound {
             resource: relative_path.to_string(),
         }
         .into());
-    }
+    };
 
-    let node = state
-        .node(repository.clone(), node_link.node)
+    let node = link_state
+        .node(link_repository.clone(), node_id)
         .await
         .map_err(|err| {
             forward_refusal_or(err, "reading the node", |_err| {
@@ -278,7 +273,7 @@ pub(crate) async fn write_file(
                     .forward_any::<WriteError>("Failed to check the output destination")?,
                 &destination,
             )?;
-            set_file_to_node::<WriteError>(&operation, repository.clone(), &node, tracked)
+            set_file_to_node::<WriteError>(&operation, link_repository.clone(), &node, tracked)
                 .await
                 .map(|_written| ())
         })
@@ -289,7 +284,7 @@ pub(crate) async fn write_file(
         // operation, which writes nothing in a dry run.
         if !execution_context().globals().dry_run() {
             let written_metadata = immutable::read_into_file(
-                repository.clone(),
+                link_repository.clone(),
                 node.address,
                 destination.as_path(),
                 None,

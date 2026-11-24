@@ -5990,6 +5990,26 @@ impl State {
         })
     }
 
+    /// [`Self::find_relative_held`] for the node alone, `None` where the tree does not hold `path`.
+    ///
+    /// Answers [`Self::find_relative_held`]'s future itself, mapped, so the caller's future holds
+    /// no second copy of the arguments.
+    pub(crate) fn find_relative_held_if_present<'a>(
+        self: &'a Arc<Self>,
+        repository: Arc<RepositoryContext>,
+        root: NodeID,
+        path: &'a str,
+    ) -> impl Future<Output = Result<Option<(NodeID, LinkedState)>, StateError>> + Send + 'a {
+        futures::FutureExt::map(
+            self.find_relative_held(repository, root, path),
+            |found| match found {
+                Ok((link, held)) => Ok(link.is_valid().then_some((link.node, held))),
+                Err(err) if err.is_node_not_found() => Ok(None),
+                Err(err) => Err(err),
+            },
+        )
+    }
+
     /// [`Self::find_relative_node_link`], with the linked state holding the node where a link was
     /// crossed to reach it, for a caller that reads the node.
     pub(crate) async fn find_relative(

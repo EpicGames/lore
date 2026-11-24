@@ -15,6 +15,8 @@ from lore import Lore
 
 DEFAULT_LINK_MOUNT = "vendor/lib"
 DEFAULT_PARENT_FILE = "README.txt"
+DEFAULT_LINKED_FILE = f"{DEFAULT_LINK_MOUNT}/linked.txt"
+DEFAULT_LINKED_CONTENT = "linked content\n"
 MAX_LINK_DEPTH = 8
 SHARED_FOLDER = {"shared/a.txt": "a original\n", "shared/b.txt": "b original\n"}
 
@@ -61,7 +63,7 @@ def make_parent_with_link(
     )
     link_repo = make_repo(
         new_lore_repo,
-        link_files or {"linked.txt": "linked content\n"},
+        link_files or {"linked.txt": DEFAULT_LINKED_CONTENT},
         "Initial linked content",
     )
 
@@ -865,3 +867,37 @@ def assert_scan_matches_linked_files_by_time(repo: Lore):
     assert summary["mtimeMatches"] >= len(SAME_SIZE_LINK_FILES), (
         f"the scan must match every linked file by its recorded time, got {summary}"
     )
+
+
+def staged_file_with_owner(new_lore_repo, path: str, owner: str) -> Lore:
+    """A new repository with `path` staged, holding `owner` as its content and owner metadata."""
+    repo: Lore = new_lore_repo()
+    # Content of its own, so a dump of one file cannot pass for the other.
+    with repo.open_file(path, "w") as output_file:
+        output_file.write(f"{owner}\n")
+    repo.stage(path)
+    repo.file_metadata_set(path, ["owner", owner])
+    return repo
+
+
+def file_metadata_values(repo: Lore, path: str) -> dict[str, str]:
+    events = parse_jsonl(repo.file_metadata_get(path, json=True), "metadata")
+    return {event["key"]: event["value"]["data"] for event in events}
+
+
+def dumped_address(repo: Lore, path: str) -> str:
+    output = repo.file_dump(path=path)
+    return next(line for line in output.splitlines() if line.startswith("Address"))
+
+
+def written_content(repo: Lore, path: str, output: str, **file_write_kwargs) -> str:
+    """The text `lore file write --path path --output output` writes, read as the test wrote it."""
+    repo.file_write(path=path, output=output, **file_write_kwargs)
+    with open(output) as written_file:
+        return written_file.read()
+
+
+def file_history_entries(repo: Lore, path: str) -> list[tuple[str, str]]:
+    """(revision, action) of each `lore file history` entry of `path`, newest first."""
+    history = parse_jsonl(repo.file_history(path, json=True), "fileHistory")
+    return [(entry["revision"], entry["action"]) for entry in history]

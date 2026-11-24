@@ -13,6 +13,7 @@ use crate::event::EventError;
 use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
+use crate::link::LinkedState;
 use crate::lore::Address;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
@@ -25,7 +26,7 @@ use crate::node::NodeDelta;
 use crate::node::NodeFileMetadata;
 use crate::node::NodeFileMetadataBlock;
 use crate::node::NodeID;
-use crate::node::NodeLink;
+use crate::node::ROOT_NODE;
 use crate::repository;
 use crate::repository::RepositoryContext;
 use crate::revision;
@@ -317,10 +318,9 @@ async fn history_parent(
     parent: Hash,
     relative_path: &RelativePath,
     options: HistoryOptions,
-) -> Result<NodeLink, FileHistoryError> {
+) -> Result<Option<(NodeID, LinkedState)>, FileHistoryError> {
     let mut depth = if options.depth > 0 { options.depth } else { 10 };
 
-    let mut node_link = NodeLink::invalid();
     let mut state = state.clone();
     let mut parent = parent;
     while depth > 0 && !parent.is_zero() {
@@ -328,23 +328,28 @@ async fn history_parent(
             .await
             .forward::<FileHistoryError>("Failed to deserialize state")?;
 
-        node_link = state_parent
-            .find_node_link(repository.clone(), relative_path.as_str())
+        let found = state_parent
+            .find_relative_held_if_present(repository.clone(), ROOT_NODE, relative_path.as_str())
             .await
-            .unwrap_or_default();
-        if node_link.is_valid() {
+            .forward_any::<FileHistoryError>("finding the path")?;
+        if let Some((node, (_, held))) = &found {
+            // A node a link holds is numbered in the linked repository, so `state`'s delta
+            // cannot say what happened to it.
+            if !Arc::ptr_eq(held, &state_parent) {
+                return Ok(found);
+            }
             // Node exists in 'state_parent' but not in 'state'.
             // What happened to it?
 
             let (nodes, node_id, action) = if state
-                .node_deletion(repository.clone(), node_link.node)
+                .node_deletion(repository.clone(), *node)
                 .await
                 .forward::<FileHistoryError>("Invalid node")?
                 .is_some()
             {
-                (&state_parent, node_link.node, FileAction::Delete as u16)
+                (&state_parent, *node, FileAction::Delete as u16)
             } else if let Some(change) =
-                counterpart_change(&repository, &state_parent, node_link.node, &state).await?
+                counterpart_change(&repository, &state_parent, *node, &state).await?
             {
                 (&state, change.node, change.action)
             } else {
@@ -352,7 +357,7 @@ async fn history_parent(
             };
             history_state(repository.clone(), state.clone(), nodes, node_id, action).await?;
 
-            break;
+            return Ok(found);
         }
 
         state = state_parent;
@@ -360,7 +365,7 @@ async fn history_parent(
         parent = state.parent_self();
     }
 
-    Ok(node_link)
+    Ok(None)
 }
 
 /// The change `state` records for the counterpart in its tree ([`state::find_counterpart_node`]) of
@@ -522,15 +527,23 @@ pub(crate) async fn resolve_revision(
     })
 }
 
+/// Where [`history`] walks the history of a file on from.
+struct HistoryStart {
+    node: NodeID,
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    /// The change to follow past an add marked as merged that [`history_start`] doesn't report,
+    /// with the state of that change's revision ([`merged_add_history`]).
+    next: Option<(HistoryRecord, Arc<State>)>,
+}
+
 /// Reports the change of the revision the history of the file at `path` starts from, and answers
-/// the node the walk goes on from, in the revision it names, invalid where that change is the
-/// file's add, with the change to follow past an add marked as merged that it doesn't report and
-/// the state of that change's revision ([`merged_add_history`]).
+/// where the walk goes on from, `None` where that change is the file's add.
 async fn history_start(
     repository: Arc<RepositoryContext>,
     path: String,
     options: HistoryOptions,
-) -> Result<(NodeLink, Option<(HistoryRecord, Arc<State>)>), FileHistoryError> {
+) -> Result<Option<HistoryStart>, FileHistoryError> {
     let path_for_error = path.clone();
     let relative_path = RelativePath::new_from_user_path(repository.require_path()?, &path)
         .forward::<FileHistoryError>("resolving user path")?;
@@ -545,14 +558,14 @@ async fn history_start(
     // Handle case where history is queried for a file that was deleted in this revision by going to parent
     // revision(s), finding the node and if found, checking the delta block of this revision to see if that node was
     // deleted - if so print the history starting with delete and then going to parent revision(s) and continuing.
-    let mut node_link = state_start
-        .find_node_link(repository.clone(), relative_path.as_str())
+    let mut found = state_start
+        .find_relative_held_if_present(repository.clone(), ROOT_NODE, relative_path.as_str())
         .await
-        .unwrap_or_default();
-    if !node_link.is_valid() {
+        .forward_any::<FileHistoryError>("finding the path")?;
+    if found.is_none() {
         let parent = state_start.parent_self();
 
-        node_link = history_parent(
+        found = history_parent(
             repository.clone(),
             state_start.clone(),
             parent,
@@ -561,10 +574,10 @@ async fn history_start(
         )
         .await?;
     }
-    if !node_link.is_valid() {
+    if found.is_none() {
         let parent = state_start.parent_other();
 
-        node_link = history_parent(
+        found = history_parent(
             repository.clone(),
             state_start.clone(),
             parent,
@@ -573,44 +586,49 @@ async fn history_start(
         )
         .await?;
     }
-    if !node_link.is_valid() {
+    let Some((node, (repository, state))) = found else {
         return Err(FileNotFound {
             resource: path_for_error,
         }
         .into());
-    }
+    };
 
-    let state_node = state::State::deserialize(repository.clone(), node_link.revision)
-        .await
-        .forward::<FileHistoryError>("Failed to deserialize state")?;
-
-    if let Some(node_delta) = state_node
-        .node_change(repository.clone(), node_link.node)
+    if let Some(node_delta) = state
+        .node_change(repository.clone(), node)
         .await
         .forward::<FileHistoryError>("Deserialize delta block failed")?
     {
         if is_merged_add(&node_delta)
-            && let Some(record) =
-                merged_add_history(&repository, &state_node, node_link.node).await?
+            && let Some(record) = merged_add_history(&repository, &state, node).await?
         {
-            return Ok((node_link, Some(record)));
+            return Ok(Some(HistoryStart {
+                node,
+                repository,
+                state,
+                next: Some(record),
+            }));
         }
         history_state(
             repository.clone(),
-            state_node.clone(),
-            &state_node,
-            node_link.node,
+            state.clone(),
+            &state,
+            node,
             node_delta.action,
         )
         .await?;
 
         if node_delta.action == FileAction::Add as u16 {
             // Should not iterate history, added in this revision
-            node_link = NodeLink::invalid();
+            return Ok(None);
         }
     }
 
-    Ok((node_link, None))
+    Ok(Some(HistoryStart {
+        node,
+        repository,
+        state,
+        next: None,
+    }))
 }
 
 /// Reports the history of the file at `path` along the first-parent line, reading and reporting
@@ -631,16 +649,15 @@ pub async fn history(
         100
     };
 
-    let (node_link, mut next) = history_start(repository.clone(), path, options).await?;
-
-    if !node_link.is_valid() {
+    let Some(HistoryStart {
+        node: mut node_id,
+        repository,
+        mut state,
+        mut next,
+    }) = history_start(repository, path, options).await?
+    else {
         return Ok(());
-    }
-
-    let mut node_id = node_link.node;
-    let mut state = state::State::deserialize(repository.clone(), node_link.revision)
-        .await
-        .forward::<FileHistoryError>("Failed to deserialize state")?;
+    };
 
     while limit > 0 {
         let HistoryRecord {
