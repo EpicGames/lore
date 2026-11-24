@@ -214,9 +214,9 @@ async fn a_copy_is_marked_as_its_last_step_before_it_is_placed() {
     assert_eq!(at(MovePhase::Switch), Some((false, true)));
 }
 
-/// A termination while the copy runs stops it and undoes the move: the old root stays, and what
-/// was copied, held once it had copied an entry until it was stopped, is set aside with no marker
-/// and short of the source.
+/// A termination once the copy of the external directory has an entry, where the copy is held
+/// until it is stopped, stops it and undoes the move: the old root stays, and what was copied is
+/// set aside with no marker and short of the source.
 #[tokio::test]
 async fn a_cancel_during_the_copy_undoes_it() {
     let fixture = Fixture::new();
@@ -233,21 +233,14 @@ async fn a_cancel_during_the_copy_undoes_it() {
         .expect("a file");
     }
     let target = fixture.root("target");
-    let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
-    let cancel = Arc::new(Mutex::new(Some(cancel)));
+    let copying = copying_path(&target).join(&name);
 
     let refused = fixture
         .copy_with(
             &target,
-            async {
-                let _ = cancelled.await;
-            },
+            until_it_has_an_entry(&copying),
             |_store| {},
-            move |_copied| {
-                if let Some(cancel) = cancel.lock().expect("lock").take() {
-                    let _ = cancel.send(());
-                }
-            },
+            |_copied| {},
         )
         .await;
 
@@ -277,6 +270,20 @@ async fn a_cancel_during_the_copy_undoes_it() {
         "the copy is stopped short of the source's {} entries: {copied:?}",
         entries(&source)
     );
+}
+
+/// Waits until the directory `directory` has an entry, for at most a minute, as long as a copy is
+/// held.
+async fn until_it_has_an_entry(directory: &Path) {
+    let started = std::time::Instant::now();
+    while !std::fs::read_dir(directory).is_ok_and(|mut entries| entries.next().is_some()) {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "{} has no entry after a minute",
+            directory.display()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
 }
 
 /// Gives the external directory `instance` a read-only file and, on Windows, a file whose access
