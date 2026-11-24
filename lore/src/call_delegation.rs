@@ -583,12 +583,18 @@ pub(crate) fn invoke_locally(
 /// captures stay reserved while the branch's future holds the arguments moved out of them.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
+///
+/// `Fut` is not bound by `Send`. The compiler proves such a bound by walking the handler's whole
+/// future, once in each caller and again for that caller's `impl Future` return type, which more
+/// than doubles the time and memory it takes to type-check this crate.
+/// `InvokableLoreArgs::invoke_local` already requires every handler's future to be `Send`, and
+/// the future returned here is `Send` wherever the handler's is.
 #[lore_macro::test_pub]
 #[allow(clippy::manual_async_fn)]
 pub(crate) fn dispatch_call<
     ArgsType: LoreArgs,
     Handler: Fn(LoreGlobalArgs, ArgsType, LoreEventCallback) -> Fut,
-    Fut: Future<Output = i32> + Send + 'static,
+    Fut: Future<Output = i32> + 'static,
 >(
     globals: LoreGlobalArgs,
     args: ArgsType,
