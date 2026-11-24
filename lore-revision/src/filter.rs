@@ -122,11 +122,7 @@ impl Compare {
     fn of(glob: &str, filename: bool, literal: bool) -> Self {
         if literal {
             Self::Text
-        } else if filename
-            && glob
-                .strip_prefix('*')
-                .is_some_and(|rest| is_literal(rest) && !rest.contains(['{', '}']))
-        {
+        } else if filename && glob.strip_prefix('*').is_some_and(is_text_without_braces) {
             Self::Suffix
         } else {
             Self::Glob
@@ -135,6 +131,30 @@ impl Compare {
 }
 
 impl FilterLine {
+    /// Whether this line is an exclusion matching every path directly below the lowercase
+    /// directory `path`, `depth` components deep, whatever it is named. See
+    /// [`FilterInstance::hides_below`] for the forms it recognizes.
+    fn excludes_every_name_below(&self, path: &str, depth: u32) -> bool {
+        if self.negated || self.directory || u32::from(self.min_depth) > depth + 1 {
+            return false;
+        }
+        if self.filename {
+            return self.glob == "*";
+        }
+        if self.glob == "**" {
+            true
+        } else if let Some(prefix) = self.glob.strip_suffix("/**") {
+            is_text_without_braces(prefix)
+                && path
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        } else if let Some(prefix) = self.glob.strip_suffix("/*") {
+            is_text_without_braces(prefix) && prefix == path
+        } else {
+            false
+        }
+    }
+
     /// Whether the glob matches `path`, or `name` for a name rule, as [`Compare`] decides it.
     fn hits(&self, path: &str, name: &str) -> bool {
         let text = if self.filename { name } else { path };
@@ -549,6 +569,12 @@ fn is_literal(glob: &str) -> bool {
     !glob
         .bytes()
         .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']' | b'\\'))
+}
+
+/// Whether `glob` is plain text ([`is_literal`]) that holds no brace group either, so a matcher
+/// that evaluates brace groups reads it as text too.
+fn is_text_without_braces(glob: &str) -> bool {
+    is_literal(glob) && !glob.contains(['{', '}'])
 }
 
 /// The glob `<text>/**`, with a backslash before every character of `text`
@@ -1823,6 +1849,60 @@ impl FilterInstance {
         !self.reinclude.below(path, state.decided_at, depth)
     }
 
+    /// Whether every path below the directory `path`, whose verdict is `state`, is excluded
+    /// whatever it is named: an exclusion that [`step`](Self::step) reads below `path` matches
+    /// every name there, and no rule after the last such line can re-include anything below it,
+    /// neither a path rule the re-inclusion index finds below `path` nor, where `state` includes
+    /// `path`, a name rule, which applies to its children. `path` is the lowercase form `state`
+    /// was produced for, and `depth` is how many components it has.
+    ///
+    /// Answers `true` only where it is certain, for the forms that match every name: `**`, a
+    /// name rule `*`, and a path rule of literal components ending `/**` at or above `path`, or
+    /// `/*` at `path`. Reads the lines as [`last_exclusion`](Self::last_exclusion) does: through
+    /// the line index where the filter has one, and otherwise all of them.
+    fn hides_below(&self, state: FilterState, path: &str, depth: u32) -> bool {
+        let floor = if state.excluded {
+            state.decided_at as usize
+        } else {
+            0
+        };
+        let hides = |line: &FilterLine| line.excludes_every_name_below(path, depth);
+        let last = match &self.prefixes {
+            None => self
+                .lines
+                .iter()
+                .enumerate()
+                .skip(floor)
+                .rev()
+                .find(|(_, line)| hides(line))
+                .map(|(number, _)| number),
+            Some(prefixes) => prefixes.last(path, floor, |number| hides(&self.lines[number])),
+        };
+        last.is_some_and(|number| {
+            !self.reinclude.below(path, number as u32, depth)
+                && (state.excluded || !self.reincludes_a_name_after(number))
+        })
+    }
+
+    /// Whether a name rule after line `number` re-includes: in a filter with a line index, every
+    /// name rule is listed at its root.
+    fn reincludes_a_name_after(&self, number: usize) -> bool {
+        let name_inclusion = |line: usize| {
+            let line = &self.lines[line];
+            line.negated && line.filename
+        };
+        match &self.prefixes {
+            None => (number + 1..self.lines.len()).any(name_inclusion),
+            Some(prefixes) => {
+                let root = &prefixes.nodes[0].lines;
+                let after = root.partition_point(|&line| line as usize <= number);
+                root[after..]
+                    .iter()
+                    .any(|&line| name_inclusion(line as usize))
+            }
+        }
+    }
+
     /// Whether `state` includes `path` and no rule can exclude anything below
     /// it, so every descendant is included too. `depth` is how many components
     /// `path` has, and `0` for the repository root.
@@ -2619,6 +2699,19 @@ impl Filter {
             || self.ignore.covers_subtree(states.ignore, lowercase, depth))
             && (!mode.contains(FilterMode::View)
                 || self.view.covers_subtree(states.view, lowercase, depth))
+    }
+
+    /// Whether the view excludes everything below the directory `path`, whatever it is named,
+    /// given the verdicts at `path` itself, so a walk can pass over what `path` holds unread. See
+    /// [`FilterInstance::hides_below`] for when it can tell.
+    pub fn view_hides_below(&self, states: FilterStates, path: &impl FilterPath) -> bool {
+        let lowercase = if path.as_str() == "." {
+            ""
+        } else {
+            path.as_lowercase_str()
+        };
+        self.view
+            .hides_below(states.view, lowercase, query_depth(lowercase))
     }
 
     /// Whether the view takes in everything at and below the directory `path`, given the verdicts

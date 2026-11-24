@@ -6921,6 +6921,15 @@ impl State {
         self.serialized_link_list(repository).await
     }
 
+    /// Whether the link registry holds a link, answered from the runtime copy where present and
+    /// from the serialized list's hash otherwise, which is zero for an empty list, without a read.
+    pub(crate) fn registers_link(&self) -> bool {
+        match self.runtime_read().link_list.as_ref() {
+            Some(link_list) => !link_list.is_empty(),
+            None => !self.data_read().hash_link.is_zero(),
+        }
+    }
+
     /// Applies `edit` to the runtime link registry, holding the lock across the whole
     /// read-modify-write.
     ///

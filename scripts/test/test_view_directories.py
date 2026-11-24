@@ -15,6 +15,7 @@ import os
 import shutil
 
 import pytest
+from error_types import NothingStagedError
 from lore_parsers import parse_status_json
 from test_utils import commit_and_push_files, to_posix, view_file, working_tree_files
 
@@ -444,6 +445,183 @@ def test_scan_and_dirty_report_the_deletion_of_a_named_directory(
             to_posix(entry["path"]) for entry in entries if entry["action"] == "delete"
         }
         assert "a" in deleted, f"{what} reported {entries}"
+
+
+# A view naming `a/b` and leaving out everything in it, beside `k.txt` and `o`.
+NAMED_VIEW = ["**", "!/a/b/", "/a/b/*", "!/k.txt", "!/o/"]
+NAMED_FILES = ["a/b/x.txt", "a/b/c/y.txt", "a/h.txt", "h/z.txt", "k.txt", "o/p.txt"]
+# Each directory an instance holds under a view that a test removes, with the view
+# and the files committed: `a`, which holds the named `a/b`, and `src`, which holds
+# `src/x.txt`, which the view keeps, and `src/y.bat`, which `*.bat` leaves out.
+REMOVED = pytest.mark.parametrize(
+    ("rules", "files", "removed"),
+    [
+        (NAMED_VIEW, NAMED_FILES, "a"),
+        (["*.bat"], ["src/x.txt", "src/y.bat", "k.txt"], "src"),
+    ],
+    ids=["named-parent", "holding-hidden"],
+)
+
+
+def under(path: str, directory: str) -> bool:
+    """Whether `path` is `directory` or a path below it."""
+    return path == directory or path.startswith(directory + "/")
+
+
+def listed_deleted(entries: list[dict], directory: str) -> dict | None:
+    """The entry a status lists `directory` by, where it lists the directory
+    deleted and nothing at or below it but deletions."""
+    below = [entry for entry in entries if under(to_posix(entry["path"]), directory)]
+    if any(entry["action"] != "delete" for entry in below):
+        return None
+    return next((e for e in below if to_posix(e["path"]) == directory), None)
+
+
+def removed_under_view(
+    repo: Lore, scratch_dir, rules, files, removed
+) -> tuple[Lore, list[str]]:
+    """An instance of `files` cloned under `rules` whose working tree lacks
+    `removed`, which `status --scan`, then `lore dirty .` and a plain status, list
+    as deleted, and what cloning it created, directories included."""
+    commit_and_push_files(repo, files)
+    instance: Lore = repo.clone(view=view_file(scratch_dir, "view", rules))
+    created = working_tree_files(instance, directories=True)
+    shutil.rmtree(f"{instance.path}/{removed}")
+    scanned = parse_status_json(instance.status(json=True, offline=True, scan=True))
+    assert listed_deleted(scanned, removed), f"status --scan listed {scanned}"
+    instance.dirty(".", offline=True)
+    marked = parse_status_json(instance.status(json=True, offline=True))
+    assert listed_deleted(marked, removed), f"lore dirty . marked {marked}"
+    return instance, created
+
+
+@pytest.mark.smoke
+@REMOVED
+def test_staging_a_removed_directory_deletes_it_with_everything_below_it(
+    new_lore_repo, scratch_dir, rules, files, removed
+):
+    """Once the user removes a directory the instance holds under its view,
+    status lists it as deleted, `lore stage .` stages its deletion, and
+    committing records it: an instance freshly cloned with no view holds nothing at or
+    below the directory, the files the view hides included, and every other file.
+    The view's other paths stay, and status is clean."""
+    repo: Lore = new_lore_repo()
+    instance, created = removed_under_view(repo, scratch_dir, rules, files, removed)
+    kept = [path for path in created if not under(path, removed)]
+
+    instance.stage(".", offline=True)
+    staged = parse_status_json(instance.status(json=True, offline=True))
+    entry = listed_deleted(staged, removed)
+    assert entry and entry["flagStaged"], f"lore stage . left {staged}"
+    instance.commit("Removed", offline=True)
+    instance.push()
+
+    assert working_tree_files(instance, directories=True) == kept
+    assert_nothing_missing(instance, "the committed deletion")
+    fresh: Lore = repo.clone()
+    assert working_tree_files(fresh) == [p for p in files if not under(p, removed)]
+
+
+@pytest.mark.smoke
+@REMOVED
+def test_unstaging_a_removed_directory_takes_back_its_deletion_and_reset_creates_it(
+    new_lore_repo, scratch_dir, rules, files, removed
+):
+    """`lore unstage` of a removed directory whose deletion is staged takes the
+    whole deletion back, so status lists the directory as deleted and not staged,
+    and `lore reset` creates the directory again as cloning did."""
+    repo: Lore = new_lore_repo()
+    instance, created = removed_under_view(repo, scratch_dir, rules, files, removed)
+    instance.stage(".", offline=True)
+
+    instance.unstage(removed, offline=True)
+    unstaged = parse_status_json(instance.status(json=True, offline=True))
+    entry = listed_deleted(unstaged, removed)
+    assert entry and not entry["flagStaged"], f"lore unstage left {unstaged}"
+    assert not any(e["flagStaged"] for e in unstaged), f"lore unstage left {unstaged}"
+
+    instance.reset(removed)
+    assert working_tree_files(instance, directories=True) == created
+    assert_nothing_missing(instance, "the reset directory")
+
+
+@pytest.mark.own_vfs("links a repository, which a virtual instance does not hold")
+@pytest.mark.smoke
+@pytest.mark.parametrize("scan", [False, True], ids=["marked", "scanned"])
+@pytest.mark.parametrize(
+    "rules",
+    [NAMED_VIEW[:3] + ["!/a/b/lib/", "!/a/b/lib/**"], NAMED_VIEW[:3]],
+    ids=["kept-link", "hidden-link"],
+)
+def test_staging_a_removed_directory_keeps_a_link_below_it(
+    new_lore_repo, scratch_dir, rules, scan
+):
+    """In a repository that registers a link, a removed directory the view names
+    that holds the link's mount and a file the view hides stays, whether the view
+    keeps the link or hides it: staging the marks of `lore dirty .`, or
+    `lore stage --scan .`, keeps the link, the directories on its path and what
+    the view hides beside it."""
+    repo: Lore = new_lore_repo()
+    source: Lore = new_lore_repo(repo.name + "_source")
+    commit_and_push_files(source, ["s.txt"])
+    commit_and_push_files(repo, ["a/b/x.txt", "k.txt"])
+    repo.link_add("a/b/lib", source.get_id(), "/")
+    repo.commit("Add link")
+    repo.push()
+    instance: Lore = repo.clone(
+        view=view_file(scratch_dir, "view", rules + ["!/k.txt"])
+    )
+    shutil.rmtree(f"{instance.path}/a")
+
+    if scan:
+        instance.stage(".", scan=True, offline=True)
+    else:
+        instance.dirty(".", offline=True)
+        instance.stage(".", offline=True)
+    try:
+        instance.commit("Removed")
+        instance.push()
+    except NothingStagedError:
+        pass
+
+    fresh: Lore = repo.clone()
+    assert working_tree_files(fresh) == ["a/b/lib/s.txt", "a/b/x.txt", "k.txt"]
+
+
+@pytest.mark.own_vfs("links a repository, which a virtual instance does not hold")
+@pytest.mark.smoke
+@pytest.mark.parametrize("scan", [False, True], ids=["marked", "scanned"])
+def test_an_offline_stage_takes_a_removed_directory_beside_a_link_the_view_leaves_out(
+    new_lore_repo, scratch_dir, scan
+):
+    """In an instance cloned with a view that leaves out `z`, which holds a link
+    at `z/deep/lib`, staging the removed `src` offline, by the marks of
+    `lore dirty .` or by `lore stage --scan .`, stages `src` as deleted without
+    reading what the view leaves out, and committing removes it."""
+    repo: Lore = new_lore_repo()
+    source: Lore = new_lore_repo(repo.name + "_source")
+    commit_and_push_files(source, ["s.txt"])
+    hidden = [f"z/deep/f{index}.txt" for index in range(2000)]
+    commit_and_push_files(repo, ["src/x.txt", "src/y.txt", "k.txt", *hidden])
+    repo.link_add("z/deep/lib", source.get_id(), "/")
+    repo.commit("Add link")
+    repo.push()
+    instance: Lore = repo.clone(view=view_file(scratch_dir, "view", ["/z/"]))
+    shutil.rmtree(f"{instance.path}/src")
+
+    if scan:
+        instance.stage(".", scan=True, offline=True)
+    else:
+        instance.dirty(".", offline=True)
+        instance.stage(".", offline=True)
+    staged = parse_status_json(instance.status(json=True, offline=True))
+    entry = listed_deleted(staged, "src")
+    assert entry and entry["flagStaged"], f"lore stage . left {staged}"
+    instance.commit("Removed")
+    instance.push()
+
+    fresh: Lore = repo.clone()
+    assert not any(under(path, "src") for path in working_tree_files(fresh))
 
 
 @pytest.mark.own_vfs(

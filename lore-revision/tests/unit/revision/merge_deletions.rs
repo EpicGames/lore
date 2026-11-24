@@ -30,6 +30,7 @@ use lore_revision::node::node_to_file_metadata;
 use lore_revision::relay::EventDispatcher;
 use lore_revision::repository::status::StatusOptions;
 use lore_revision::repository::status::status_boxed;
+use lore_revision::state::State;
 
 use super::instance::Edit;
 use super::instance::Instance;
@@ -38,6 +39,7 @@ use super::instance::commit_edits;
 use super::instance::create_branch;
 use super::instance::current;
 use super::instance::named;
+use super::instance::node_at;
 use super::instance::revision_state;
 use super::instance::run;
 use super::instance::stage;
@@ -47,6 +49,7 @@ use super::instance::sync_to;
 use super::instance::working_tree;
 use super::instance::write;
 use crate::helper::test_filter;
+use crate::helper::test_staged_by_intent;
 
 /// The files every fixture starts from, each holding its own path.
 const TREE: [&str; 2] = ["Dir/x.txt", "Top.txt"];
@@ -103,6 +106,11 @@ async fn staged_node(instance: &Instance, path: &str) -> Node {
         .expect("Failed to load the staged revision")
         .expect("A merge left a staged revision");
     let state = revision_state(instance, revision).await;
+    node_in(instance, &state, path).await
+}
+
+/// The node `state` holds at `path`.
+async fn node_in(instance: &Instance, state: &State, path: &str) -> Node {
     let node = state
         .find_node_link(instance.repository.clone(), path)
         .await
@@ -1117,4 +1125,130 @@ async fn marked_dirty(instance: &Instance, path: &str) {
     )
     .await
     .expect("Failed to mark the path dirty");
+}
+
+/// A directory a view names that holds a change a pending merge staged, removed from the working
+/// tree, stays while the merge is pending, whichever [`Route`] stages it: under
+/// `**`, `!/a/b/`, `/a/b/*`, `!/Top.txt`, with the feature branch's change to the hidden
+/// `a/b/y.txt` staged, removing `a` stages no deletion, and the merge revision holds `a/b/x.txt`
+/// and the feature branch's `a/b/y.txt`. A scan then marks `a` deleted, and staging the marks and a
+/// commit remove it with everything below it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_directory_holding_a_merged_change_is_deleted_after_the_merge() {
+    const TREE: [&str; 3] = ["a/b/x.txt", "a/b/y.txt", "Top.txt"];
+    const VIEW: [&str; 4] = ["**", "!/a/b/", "/a/b/*", "!/Top.txt"];
+    for route in [Route::Marked, Route::Scanned, Route::Walked] {
+        run(
+            "a_removed_directory_holding_a_merged_change_is_deleted_after_the_merge",
+            &TREE,
+            move |mut instance| async move {
+                let what = format!("{route:?}");
+                create_branch(&instance, "feature").await;
+                let feature =
+                    commit_edits(&instance, &[Edit::Write("a/b/y.txt", "feature")], "Feature")
+                        .await;
+                let merged = node_at(&instance, feature, "a/b/y.txt").await.address;
+                switch_to(&instance, branch::DEFAULT_DEFAULT_NAME).await;
+                commit_edits(&instance, &[Edit::Write("Top.txt", "main")], "Main").await;
+                for path in ["a/b/x.txt", "a/b/y.txt"] {
+                    std::fs::remove_file(instance.path.join(path)).expect("Failed to delete");
+                }
+                instance.repository = Arc::new(
+                    instance
+                        .repository
+                        .to_filter_context(Arc::new(test_filter(&[], &VIEW))),
+                );
+                start_merge(&instance, "feature", true)
+                    .await
+                    .expect("Failed to merge");
+
+                std::fs::remove_dir_all(instance.path.join("a")).expect("Failed to delete");
+                let node = if matches!(route, Route::Walked) {
+                    let staged = test_staged_by_intent(&instance.repository).await;
+                    node_in(&instance, &staged, "a").await
+                } else {
+                    staged_root(&instance, matches!(route, Route::Scanned)).await;
+                    staged_node(&instance, "a").await
+                };
+                assert!(!node.is_staged_delete(), "{what}: flags {:#x}", node.flags);
+
+                commit(&instance, "Merge")
+                    .await
+                    .unwrap_or_else(|error| panic!("{what}: committing: {error}"));
+                let merge = current(&instance).await;
+                assert_eq!(
+                    node_at(&instance, merge, "a/b/y.txt").await.address,
+                    merged,
+                    "{what}"
+                );
+                node_at(&instance, merge, "a/b/x.txt").await;
+
+                status_boxed(
+                    instance.repository.clone(),
+                    None,
+                    StatusOptions {
+                        staged: true,
+                        scan: true,
+                        check_dirty: false,
+                        reset: false,
+                        sync_point: false,
+                        revision_only: false,
+                        count: false,
+                    },
+                )
+                .await
+                .expect("Failed to scan");
+                let node = staged_node(&instance, "a").await;
+                assert!(node.is_dirty_delete(), "{what}: flags {:#x}", node.flags);
+                staged_root(&instance, false).await;
+                commit(&instance, "Removed")
+                    .await
+                    .expect("The removal commits");
+                let removed = revision_state(&instance, current(&instance).await).await;
+                for (path, held) in [("a", false), ("Top.txt", true)] {
+                    assert_eq!(
+                        removed
+                            .find_node_link(instance.repository.clone(), path)
+                            .await
+                            .is_ok_and(|found| found.is_valid()),
+                        held,
+                        "{what}: {path}"
+                    );
+                }
+            },
+        )
+        .await;
+    }
+}
+
+/// How a test stages: the marks `lore dirty .` sets, by a scan, or by the scan walk that stages,
+/// held in memory.
+#[derive(Clone, Copy, Debug)]
+enum Route {
+    Marked,
+    Scanned,
+    Walked,
+}
+
+/// Stages the whole working tree: by a scan where `scan`, and otherwise the marks `lore dirty .`
+/// sets.
+async fn staged_root(instance: &Instance, scan: bool) {
+    if scan {
+        stage(instance, &instance.path).await;
+        return;
+    }
+    lore_revision::file::dirty::dirty(
+        instance.repository.clone(),
+        LoreArray::from_vec(vec![LoreString::from(instance.path.as_path())]),
+    )
+    .await
+    .expect("Failed to mark the working tree");
+    lore_revision::file::stage::stage(
+        instance.repository.clone(),
+        &instance.write_token,
+        LoreArray::from_vec(vec![LoreString::from(instance.path.as_path())]),
+        lore_revision::stage::StageOptions::default(),
+    )
+    .await
+    .expect("Failed to stage");
 }

@@ -838,3 +838,60 @@ fn a_name_rule_ending_in_literal_text_matches_as_its_glob_does() {
         );
     }
 }
+
+/// The view hides everything below a directory only where a line that applies below it excludes
+/// every name and no later rule can re-include anything there, and every child and grandchild a
+/// walk meets below such a directory is excluded with its subtree.
+#[test]
+fn the_view_hides_everything_below_a_directory_only_where_it_is_certain() {
+    // Rules, directory, hidden below.
+    let cases: &[(&[&str], &str, bool)] = &[
+        (&["**", "!/a/b/", "/a/b/*"], "a/b", true),
+        (&["**", "!/a/b/", "/a/b/**"], "a/b", true),
+        (&["!/a/b/", "/a/**"], "a/b", true),
+        (&["!/a/b/k.txt", "/a/b/*"], "a/b", true),
+        (&["**", "!/a/b/k.txt", "/a/b/*"], "a/b", true),
+        (&["**", "!/a/b/k.txt", "/a/b/*", "!*.bat"], "a/b", true),
+        (&["**"], "a", true),
+        (&["!/a/", "*"], "a", true),
+        (&["**", "!/a/"], "a", false),
+        (&["**", "!/a/b/", "/a/b/*"], "a", false),
+        (&["**", "!/a/b/", "/a/b/*", "!/a/b/k.txt"], "a/b", false),
+        (&["**", "!/a/b/", "/a/b/*", "!*.bat"], "a/b", false),
+        (&["**", "!/a/b/", "/a/b/x*"], "a/b", false),
+        (&["**", "!/a/b/", "/a/b/*/"], "a/b", false),
+        (&["**", "!/a/b/", "/a/*/*"], "a/b", false),
+        (&["*.bat"], "a", false),
+    ];
+    for (rules, directory, hidden) in cases {
+        for (layout, instance) in layouts(|filter| add_rules(filter, rules)) {
+            let mut filter = Filter::default();
+            filter.view = instance;
+            let at = path(directory);
+            let states = filter.exclusion_states(&at);
+            assert_eq!(
+                filter.view_hides_below(states, &at),
+                *hidden,
+                "{rules:?} {layout} hides below {directory}"
+            );
+            if !*hidden {
+                continue;
+            }
+            for name in ["x", "k.txt", "y.bat", "s000"] {
+                for is_directory in [false, true] {
+                    let child = path(&format!("{directory}/{name}"));
+                    let (child_states, excluded) =
+                        filter.child_excludes_tree(states, &child, is_directory, FilterMode::View);
+                    assert!(excluded, "{rules:?} {layout} keeps {child}");
+                    let below = path(&format!("{directory}/{name}/k.txt"));
+                    assert!(
+                        filter
+                            .child_excludes_tree(child_states, &below, false, FilterMode::View)
+                            .1,
+                        "{rules:?} {layout} keeps {below}"
+                    );
+                }
+            }
+        }
+    }
+}

@@ -1650,7 +1650,9 @@ typedef struct lore_file_stage_revision_event_data_t {
   struct lore_hash_t revision;
 } lore_file_stage_revision_event_data_t;
 
-// Data for the event emitted for each file affected by a stage operation.
+// Data for the event emitted for each file affected by a stage operation. For a deleted
+// directory, it is emitted for each file the view shows below it, and for none the view leaves
+// out.
 typedef struct lore_file_stage_file_event_data_t {
   // Previous path of the file, when it was moved, relative to the root of the working tree.
   struct lore_string_t from_path;

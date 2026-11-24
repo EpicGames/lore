@@ -461,6 +461,37 @@ pub async fn test_scan(
     .await
 }
 
+/// The instance's staged tree after a scan walk that stages ([`test_scan_with_intent`]) over it,
+/// held in memory and not stored: the walk `lore stage --scan` does not take.
+#[allow(dead_code)]
+pub async fn test_staged_by_intent(
+    repository: &std::sync::Arc<lore_revision::repository::RepositoryContext>,
+) -> std::sync::Arc<lore_revision::state::State> {
+    let (current, staged, _) =
+        lore_revision::state::State::deserialize_current_and_staged(repository.clone())
+            .await
+            .expect("Failed to deserialize the current and staged states");
+    let staged = match staged {
+        Some(staged) => staged,
+        None => lore_revision::state::State::deserialize(repository.clone(), current.revision())
+            .await
+            .expect("Failed to deserialize the staged state"),
+    };
+    test_scan_with_intent(
+        repository.clone(),
+        staged.clone(),
+        current,
+        lore_revision::fs::filesystem_provider::FilesystemDiffIntent::Stage(
+            lore_revision::fs::filesystem_provider::StageIntent {
+                node_flags: lore_revision::node::NodeFlags::NoFlags,
+                file_id: None,
+            },
+        ),
+    )
+    .await;
+    staged
+}
+
 /// [`test_scan`] under the given intent, for a walk that stages rather than marks.
 #[allow(dead_code)]
 pub async fn test_scan_with_intent(

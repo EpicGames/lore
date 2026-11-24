@@ -51,6 +51,9 @@ use crate::repository::RepositoryContext;
 use crate::repository::TEMP_FILE_EXTENSION;
 use crate::repository::THEIRS_SUFFIX;
 use crate::repository::is_reserved_node_name;
+use crate::stage::Absence;
+use crate::stage::AbsentChildren;
+use crate::stage::holds_pending_merge_change;
 use crate::state::ChangeSender;
 use crate::state::DiffSide;
 use crate::state::diff::NodeMatch;
@@ -1347,6 +1350,7 @@ async fn emit_filesystem_subtree_deletes(
     link_mounts: &[LinkMountInfo],
 ) -> Result<bool, StateError> {
     if intent.stage().is_some() {
+        let links_registered = state.registers_link();
         return Box::pin(stage_absent_subtree(
             state,
             repository,
@@ -1358,9 +1362,10 @@ async fn emit_filesystem_subtree_deletes(
             intent,
             changes,
             link_mounts,
+            links_registered,
         ))
         .await
-        .map(|kept| !kept);
+        .map(|absence| absence == Absence::Deleted);
     }
 
     // Caller guarantees `node` is not filter-excluded.
@@ -1438,12 +1443,18 @@ async fn emit_filesystem_subtree_deletes(
 }
 
 /// Settle the deletion of the absent subtree at `node` for a staging walk, as `stage` stages an
-/// absent directory, answering whether part of it is kept.
+/// absent node ([`Absence`]), answering what it made of the node.
 ///
-/// A child the filter excludes stays, with every directory on its path: the working tree lacks it
-/// because the filter left it out, not because it was deleted. A link stays too, and so does a
-/// directory the filter excludes that holds no children, which nothing materializes. Each node
-/// deleted is marked and reported once its children are settled.
+/// A link stays while its mount is absent, and so does every directory on its path. A node the view
+/// excludes is not on disk, so its absence alone deletes nothing. A directory the working tree
+/// held, one the view creates ([`FilterStates::creates_directory`]) or one holding a node it held,
+/// is deleted with everything below it, what the view excludes included, which committing drops
+/// with it, and one the view creates is deleted at once, without a walk of what it holds. Where
+/// `keeps_partial`, as in a tree that registers a link, and in a directory that may hold a pending
+/// merge's change ([`holds_pending_merge_change`]), a directory stays wherever staging keeps or
+/// leaves out a node below it, as [`AbsentChildren`] says, or a link of `link_mounts` lies below
+/// it, and so does an empty directory the filter excludes. Each node deleted is marked and reported
+/// once its children are settled.
 #[allow(clippy::too_many_arguments)]
 async fn stage_absent_subtree(
     state: Arc<State>,
@@ -1456,49 +1467,95 @@ async fn stage_absent_subtree(
     intent: FilesystemDiffIntent,
     changes: &ChangeSender,
     link_mounts: &[LinkMountInfo],
-) -> Result<bool, StateError> {
+    keeps_partial: bool,
+) -> Result<Absence, StateError> {
     if keeps_absent_link(node, path) {
-        return Ok(true);
+        return Ok(Absence::Kept);
     }
-    if node.is_directory() {
-        let mut kept = LinkMountInfo::any_under(link_mounts, path);
-        let mut had_child = false;
-        let mut children =
-            StateNodeChildrenWithNameIterator::new(state.clone(), repository.clone(), node_id)
-                .await?;
-        while let Some((child_id, child_node, child_name)) = children.next().await? {
-            had_child = true;
-            let child_path = path.push_into_buf(&child_name).freeze();
-            // Release the block read lock before recursing (see NodeNameLock docs).
-            drop(child_name);
-            let (child_states, excluded) = repository.filter.child_excludes_tree(
-                states,
-                &child_path,
-                !child_node.is_file(),
-                filter_mode,
-            );
-            kept |= excluded
-                || Box::pin(stage_absent_subtree(
-                    state.clone(),
-                    repository.clone(),
-                    child_id,
-                    &child_node,
-                    &child_path,
-                    child_states,
-                    filter_mode,
-                    intent,
-                    changes,
-                    link_mounts,
-                ))
-                .await?;
-        }
-        if kept || (!had_child && states.excluded(filter_mode)) {
-            return Ok(true);
+    let keeps_partial = keeps_partial
+        || holds_pending_merge_change(&state, NodeFlags::from_bits_retain(node.flags));
+    if node.is_directory() && (keeps_partial || !states.creates_directory(false)) {
+        match stage_absent_children(
+            &state,
+            &repository,
+            node_id,
+            path,
+            states,
+            filter_mode,
+            intent,
+            changes,
+            link_mounts,
+            keeps_partial,
+        )
+        .await?
+        {
+            Absence::Deleted => {}
+            absence => return Ok(absence),
         }
     }
     mark_settled(&state, &repository, node_id, SettledAction::Delete, intent).await?;
     emit_single_delete(state, repository, node_id, path, changes).await?;
-    Ok(false)
+    Ok(Absence::Deleted)
+}
+
+/// Settles the children of the absent directory `node_id` as [`stage_absent_subtree`] does, and
+/// answers what it makes of the directory ([`AbsentChildren::settle`]).
+#[allow(clippy::too_many_arguments)]
+async fn stage_absent_children(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    node_id: NodeID,
+    path: &RelativePath,
+    states: FilterStates,
+    filter_mode: FilterMode,
+    intent: FilesystemDiffIntent,
+    changes: &ChangeSender,
+    link_mounts: &[LinkMountInfo],
+    keeps_partial: bool,
+) -> Result<Absence, StateError> {
+    let mut settled = AbsentChildren::of(
+        keeps_partial,
+        keeps_partial && LinkMountInfo::any_under(link_mounts, path),
+    );
+    let mut had_child = false;
+    let mut children =
+        StateNodeChildrenWithNameIterator::new(state.clone(), repository.clone(), node_id).await?;
+    while let Some((child_id, child_node, child_name)) = children.next().await? {
+        had_child = true;
+        let child_path = path.push_into_buf(&child_name).freeze();
+        // Release the block read lock before recursing (see NodeNameLock docs).
+        drop(child_name);
+        let (child_states, excluded) = repository.filter.child_excludes_tree(
+            states,
+            &child_path,
+            !child_node.is_file(),
+            filter_mode,
+        );
+        if excluded {
+            settled.add(Absence::NeverHeld);
+            continue;
+        }
+        settled.add(
+            Box::pin(stage_absent_subtree(
+                state.clone(),
+                repository.clone(),
+                child_id,
+                &child_node,
+                &child_path,
+                child_states,
+                filter_mode,
+                intent,
+                changes,
+                link_mounts,
+                keeps_partial,
+            ))
+            .await?,
+        );
+    }
+    if keeps_partial && !had_child && states.excluded(filter_mode) {
+        return Ok(Absence::NeverHeld);
+    }
+    Ok(settled.settle(states.creates_directory(!had_child)))
 }
 
 /// Whether staging leaves the name alone: a scratch file of the client's own making, or the
