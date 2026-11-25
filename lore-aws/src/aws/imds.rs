@@ -7,12 +7,16 @@
 //! (<https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-metadata-v2-how-it-works.html>).
 //! That is a security property, not a convenience: a server-side request forgery through a Lore
 //! endpoint cannot reach the metadata service with a `GET` alone.
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use http::HeaderValue;
 use http::Method;
 use http::StatusCode;
+use lore_base::retry::retry;
+use tokio::sync::OnceCell;
 use url::Url;
 
 use crate::aws::creds::Credentials;
@@ -23,6 +27,7 @@ use crate::aws::error::TransportError;
 use crate::aws::error::shed_by_status;
 use crate::aws::http::HttpClient;
 use crate::aws::http::HttpRequest;
+use crate::aws::resolve_region;
 
 /// The EC2 metadata service.
 const IMDS_BASE: &str = "http://169.254.169.254";
@@ -37,9 +42,27 @@ const EKS_POD_IDENTITY_ADDRESS_V6: std::net::Ipv6Addr =
 
 /// A metadata endpoint is link-local; if it does not answer promptly it is not there.
 const METADATA_TIMEOUT: Duration = Duration::from_secs(2);
+/// Waits between attempts at a region lookup the metadata service shed or did not answer, and the
+/// first and longest wait, in milliseconds: about 100 ms, then 200 ms.
+///
+/// Two waits give three attempts. An attempt is a token request and a read, each bounded by the
+/// metadata timeout, so a service that keeps failing costs a lookup up to about 12 seconds and then
+/// gives no region.
+const REGION_RETRY_LIMIT: usize = 2;
+const REGION_RETRY_START_MILLIS: u64 = 100;
+const REGION_RETRY_MAX_MILLIS: u64 = 200;
 /// How long an `IMDSv2` token stays valid, in seconds. Long enough to cover the fetch it is taken
 /// out for, short enough to be useless if it leaks.
 const TOKEN_TTL_HEADER: HeaderValue = HeaderValue::from_static("60");
+
+/// The region a metadata response names, or `None` for a body that is empty or not text.
+fn parse_region(body: &[u8]) -> Option<String> {
+    std::str::from_utf8(body)
+        .ok()
+        .map(str::trim)
+        .filter(|region| !region.is_empty())
+        .map(str::to_owned)
+}
 
 /// The JSON both endpoints answer with.
 ///
@@ -289,7 +312,7 @@ impl ImdsProvider {
     /// Whether the environment has switched IMDS off. Honoured because a deployment that sets it
     /// means it, and probing anyway wastes two seconds per credential fetch.
     #[lore_macro::test_pub]
-    fn disabled() -> bool {
+    pub(crate) fn disabled() -> bool {
         std::env::var("AWS_EC2_METADATA_DISABLED")
             .is_ok_and(|value| value.eq_ignore_ascii_case("true"))
     }
@@ -374,22 +397,135 @@ impl ImdsProvider {
     }
 
     /// The region this instance is in, for region resolution rather than credentials.
-    pub async fn region(&self) -> Option<String> {
+    ///
+    /// `None` when this host has no metadata service, or the service refuses the request or names
+    /// no region: answers that asking again would not change. Once the service has answered at all,
+    /// the host is on EC2, so a request it sheds or leaves unanswered is retried with a short
+    /// back-off, and is the error when every attempt fails.
+    ///
+    /// `answered` records that the service has answered, and is read and set across calls, so a
+    /// later lookup does not take a slow service for an absent one.
+    pub async fn region(&self, answered: &AtomicBool) -> Result<Option<String>, CredentialsError> {
         if Self::disabled() {
+            return Ok(None);
+        }
+
+        let mut backoff = retry(
+            REGION_RETRY_START_MILLIS,
+            REGION_RETRY_MAX_MILLIS,
+            REGION_RETRY_LIMIT,
+        );
+        loop {
+            let attempt = match self.token().await {
+                Ok(token) => {
+                    answered.store(true, Ordering::Relaxed);
+                    self.get("/latest/meta-data/placement/region", &token)
+                        .await
+                        .map(|body| parse_region(&body))
+                }
+                // Nothing has ever answered at the metadata address: this host is not on EC2.
+                Err(CredentialsError::NotProvided(_)) if !answered.load(Ordering::Relaxed) => {
+                    return Ok(None);
+                }
+                // The service answered an earlier attempt, so this silence is the service being
+                // slow rather than absent.
+                Err(CredentialsError::NotProvided(provider)) => Err(CredentialsError::Transient {
+                    provider,
+                    detail: "token request went unanswered".to_owned(),
+                }),
+                Err(error) => {
+                    if error.is_transient() {
+                        answered.store(true, Ordering::Relaxed);
+                    }
+                    Err(error)
+                }
+            };
+
+            match attempt {
+                Ok(region) => return Ok(region),
+                Err(error) if error.is_transient() => {
+                    if !backoff.wait().await {
+                        return Err(error);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "The instance metadata service refused the region lookup"
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
+/// A region resolution that falls back to the instance metadata service, and keeps what the
+/// service said.
+///
+/// Every client in a process runs on the same instance, so one answer serves every resolution, and
+/// a host off EC2 waits on the metadata address once. A lookup the service kept shedding is not
+/// kept, and resolutions that were waiting on it each run a lookup of their own in turn.
+#[derive(Debug)]
+pub struct InstanceRegion {
+    region: OnceCell<Option<String>>,
+    /// Whether the metadata service has answered any lookup, which makes this host one on EC2.
+    answered: AtomicBool,
+}
+
+impl InstanceRegion {
+    pub const fn new() -> Self {
+        Self {
+            region: OnceCell::const_new(),
+            answered: AtomicBool::new(false),
+        }
+    }
+
+    /// The region to sign for: [`resolve_region`] of `explicit`, then the region the metadata
+    /// service names.
+    ///
+    /// `provider` builds the metadata client, and is called only by a resolution that asks.
+    /// `AWS_EC2_METADATA_DISABLED` is honoured on every call, including after an answer was kept.
+    pub async fn resolve(
+        &self,
+        explicit: Option<&str>,
+        provider: impl FnOnce() -> Result<ImdsProvider, TransportError>,
+    ) -> Option<String> {
+        if let Some(region) = resolve_region(explicit) {
+            return Some(region);
+        }
+
+        if ImdsProvider::disabled() {
             return None;
         }
 
-        let token = self.token().await.ok()?;
-        let body = self
-            .get("/latest/meta-data/placement/region", &token)
-            .await
-            .ok()?;
+        // Boxed because only a deployment that names no region reaches it, and the token and
+        // metadata reads it holds would otherwise sit in every client build's future.
+        let lookup = Box::pin(self.region.get_or_try_init(|| async {
+            // A metadata client that cannot be built now cannot be built later either.
+            let Ok(provider) = provider() else {
+                return Ok(None);
+            };
 
-        std::str::from_utf8(&body)
-            .ok()
-            .map(str::trim)
-            .filter(|region| !region.is_empty())
-            .map(str::to_owned)
+            provider.region(&self.answered).await
+        }));
+
+        match lookup.await {
+            Ok(region) => region.clone(),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "The instance metadata service did not name the region after retrying; a later resolution asks again"
+                );
+                None
+            }
+        }
+    }
+}
+
+impl Default for InstanceRegion {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

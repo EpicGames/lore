@@ -23,7 +23,7 @@ use crate::aws::default_endpoint;
 use crate::aws::dynamodb::DynamoClient;
 use crate::aws::error::TransportError;
 use crate::aws::http::HttpClient;
-use crate::aws::resolve_region;
+use crate::aws::resolve_region_with_imds;
 use crate::aws::s3::S3Client;
 use crate::aws_error::AwsError;
 use crate::dynamodb::DynamoDb;
@@ -290,17 +290,20 @@ impl WantsService {
     /// The pieces every service client shares, resolved once.
     ///
     /// The region is resolved here rather than at first use, so a deployment with no region at all
-    /// fails at startup with something to read instead of on its first request.
-    fn core(&self, service: &'static str) -> Result<Arc<ClientCore>, TransportError> {
+    /// fails when its client is built, with something to read, instead of on its first request.
+    async fn core(&self, service: &'static str) -> Result<Arc<ClientCore>, TransportError> {
         let http = HttpClient::for_service(&self.config.http, service, self.config.store)?;
 
-        let region = resolve_region(self.config.region.as_deref()).ok_or_else(|| {
-            TransportError::Build(
-                "no AWS region is configured: set the region setting, AWS_REGION or \
-                 AWS_DEFAULT_REGION"
-                    .to_owned(),
-            )
-        })?;
+        let region = resolve_region_with_imds(self.config.region.as_deref())
+            .await
+            .ok_or_else(|| {
+                TransportError::Build(
+                    "no AWS region is configured: set the region setting, AWS_REGION or \
+                     AWS_DEFAULT_REGION, or on EC2 leave AWS_EC2_METADATA_DISABLED unset so the \
+                     instance metadata service can name it"
+                        .to_owned(),
+                )
+            })?;
 
         let credentials = match &self.config.credentials {
             Some(provider) => Arc::new(CachedCredentials::new(provider.clone())),
@@ -350,14 +353,8 @@ impl AwsClientBuilder<WantsService> {
     }
 
     pub fn dynamodb(self) -> AwsClientBuilder<WantsTables> {
-        let core = self.0.core("dynamodb");
-        debug!("Using dynamodb core: {core:?}");
-
         AwsClientBuilder(WantsTables {
-            core,
-            slow_operation_threshold: self.0.slow_operation_threshold,
-            metric_labels: self.0.metric_labels,
-            unprocessed_keys_retry: self.0.unprocessed_keys_retry,
+            service: self.0,
             tables: vec![],
         })
     }
@@ -367,23 +364,16 @@ impl AwsClientBuilder<WantsService> {
     }
 
     pub fn s3_with_path_style(self, force_path_style: bool) -> AwsClientBuilder<WantsBuckets> {
-        let core = self.0.core("s3");
-        debug!("Using S3 core: {core:?}, path style: {force_path_style}");
-
         AwsClientBuilder(WantsBuckets {
-            core,
+            service: self.0,
             force_path_style,
-            slow_operation_threshold: self.0.slow_operation_threshold,
             buckets: vec![],
         })
     }
 }
 
 pub struct WantsTables {
-    core: Result<Arc<ClientCore>, TransportError>,
-    slow_operation_threshold: u64,
-    metric_labels: Vec<KeyValue>,
-    unprocessed_keys_retry: RetryPolicy,
+    service: WantsService,
     tables: Vec<String>,
 }
 
@@ -395,16 +385,18 @@ impl AwsClientBuilder<WantsTables> {
     }
 
     pub async fn build(self) -> Result<DynamoDb, AwsClientError<DynamoError>> {
-        let core = self
-            .0
-            .core
+        let service = self.0.service;
+        let core = service
+            .core("dynamodb")
+            .await
             .map_err(|error| AwsClientError::Aws(AwsError::Aws(error.into())))?;
+        debug!(core = ?core, "Using DynamoDB core");
 
         let client = DynamoDb::new(
             DynamoClient::new(core),
-            Duration::from_millis(self.0.slow_operation_threshold),
-            self.0.metric_labels,
-            self.0.unprocessed_keys_retry,
+            Duration::from_millis(service.slow_operation_threshold),
+            service.metric_labels,
+            service.unprocessed_keys_retry,
         );
 
         for table_name in self.0.tables {
@@ -426,9 +418,8 @@ impl AwsClientBuilder<WantsTables> {
 }
 
 pub struct WantsBuckets {
-    core: Result<Arc<ClientCore>, TransportError>,
+    service: WantsService,
     force_path_style: bool,
-    slow_operation_threshold: u64,
     buckets: Vec<String>,
 }
 
@@ -442,12 +433,15 @@ impl AwsClientBuilder<WantsBuckets> {
     pub async fn build(self) -> Result<S3, AwsClientError<S3Error>> {
         let core = self
             .0
-            .core
+            .service
+            .core("s3")
+            .await
             .map_err(|error| AwsClientError::Aws(AwsError::Aws(error.into())))?;
+        debug!(core = ?core, force_path_style = self.0.force_path_style, "Using S3 core");
 
         let client = S3::new(
             S3Client::new(core, self.0.force_path_style),
-            Duration::from_millis(self.0.slow_operation_threshold),
+            Duration::from_millis(self.0.service.slow_operation_threshold),
         );
 
         for bucket in self.0.buckets {

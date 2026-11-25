@@ -5,7 +5,7 @@ authors:
   - mjansson
 status: Draft
 created: 2026-08-12
-updated: 2026-11-19
+updated: 2026-11-25
 discussion: CROWD CR 536
 ---
 
@@ -341,10 +341,14 @@ refresh margin — a short session, or a clock skewed enough to make fresh ones 
 every caller still wanting a refresh, one endpoint call per request. So the cache also spaces refresh
 attempts by a floor that a normal refresh never notices.
 
-The region comes from the store's setting, then `AWS_REGION`, then `AWS_DEFAULT_REGION`, and a store
-client that finds none of them fails to build (see Compatibility). The telemetry resource detector
-uses the same resolution, then falls back to IMDS, because it runs once and only labels telemetry,
-and keeps reporting `cloud.provider` and `cloud.region`.
+The region comes from the store's setting, then `AWS_REGION`, then `AWS_DEFAULT_REGION`, then IMDS's
+`/latest/meta-data/placement/region`, unless `AWS_EC2_METADATA_DISABLED` is `true`. A store client that
+finds none of them fails to build (see Compatibility). IMDS is asked until it answers: its answer,
+or a token request that gets no answer at all, which is how a host off EC2 looks, serves every later
+client and the telemetry resource detector, so a host off EC2 waits on the link-local address once.
+Once the service has answered at all, a request it sheds or leaves unanswered is tried three times,
+with a short back-off, and is not kept if every attempt fails, so a later client asks again. Any
+other refusal is kept as no region.
 
 An endpoint comes from the store's `*_endpoint_url` setting, then `AWS_ENDPOINT_URL_<SERVICE>` and
 `AWS_ENDPOINT_URL`, as the AWS SDKs read them, with `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS` honoured.
@@ -596,12 +600,11 @@ results.
     as written, or the container agent's addresses, where the SDK accepted any host name that
     resolved to loopback.
 - **Region** — Region resolution narrows, and this can stop a deployment starting. A store client
-  takes its region from the setting, then `AWS_REGION`, then `AWS_DEFAULT_REGION`, and fails to build
-  if none of them says. The SDK would also have consulted `~/.aws/config` and IMDS, so an EC2
-  deployment that configures no region and relies on the instance's own now fails at startup, with a
-  message naming the three places to set it. That is deliberate: the alternative is a link-local round
-  trip on the path that builds every client, and a region guessed from the instance rather than from
-  the configuration is how a deployment ends up reading the wrong table.
+  takes its region from the setting, then `AWS_REGION`, then `AWS_DEFAULT_REGION`, then IMDS, and
+  fails to build if none of them says. The SDK would also have consulted `~/.aws/config`, so a
+  deployment that sets its region only there now fails at startup, with a message naming the places
+  to set it. An EC2 deployment that configures no region keeps the instance's own, as it did with the
+  SDK.
 - **Environment variables** — Besides those Credentials and the endpoint resolution name, the client
   reads none of the SDK's configuration variables (`aws-config` 1.13.0, `src/default_provider/`):
   `AWS_CONFIG_FILE`, `AWS_USE_FIPS_ENDPOINT`, `AWS_USE_DUALSTACK_ENDPOINT`, `AWS_MAX_ATTEMPTS`,
@@ -666,7 +669,7 @@ the lock requests the server now refuses.
 
 **Who is affected.**
 
-- An EC2 deployment that sets no region and relies on the instance's own.
+- A deployment that sets its region only in `~/.aws/config`.
 - A person or CI runner authenticating through a `~/.aws/config` profile of the kinds Compatibility
   names.
 - A host with both a shared credentials file and a role, which now signs as the role, and a pod with
@@ -683,13 +686,13 @@ A container or instance deployment using environment credentials or an instance 
 production shape, is unaffected but for the telemetry change.
 
 **Phase 1, pre-flight, before the change lands anywhere.** Each condition above is visible from
-configuration alone: confirm each deployment sets a region in its settings or its environment, that
-no runner depends on such a profile, which identity each host and pod is meant to sign as, which
-endpoints a FIPS deployment names, that network rules and proxies allow the regional DynamoDB
-hostname and STS, and which alerts match the `aws_code` values Telemetry changes. Update those
-alerts to match both the old values and the new ones before the change lands. Each fix — setting the region, exporting credentials, removing a
-stale credentials file, naming the endpoints — works with the SDK too, so it can be made before this
-lands, with no coordination.
+configuration alone: confirm each deployment off EC2 sets a region in its settings or its
+environment, that no runner depends on such a profile, which identity each host and pod is meant to
+sign as, which endpoints a FIPS deployment names, that network rules and proxies allow the regional
+DynamoDB hostname and STS, and which alerts match the `aws_code` values Telemetry changes. Update
+those alerts to match both the old values and the new ones before the change lands. Each fix —
+setting the region, exporting credentials, removing a stale credentials file, naming the endpoints —
+works with the SDK too, so it can be made before this lands, with no coordination.
 
 **Phase 2, a rolling upgrade.** Servers on the SDK and servers on this client can share tables and
 buckets while the fleet upgrades: both read and write the same rows and objects byte for byte, as
@@ -698,7 +701,7 @@ On-disk format states. Every Lore client works with either server, since it batc
 took.
 
 **The failure mode is loud.** A missing region fails at client construction with a message naming the
-three places to set it, rather than starting and reading the wrong table. A change of signing
+places to set it, rather than starting and reading the wrong table. A change of signing
 identity is not loud: a host that signs as a role it was not meant to sees access errors, or succeeds
 with the role's access, which is why the pre-flight checks it.
 

@@ -6,10 +6,11 @@ use opentelemetry_sdk::resource::ResourceDetector;
 use opentelemetry_semantic_conventions::resource::CLOUD_PROVIDER;
 use opentelemetry_semantic_conventions::resource::CLOUD_REGION;
 use tokio::runtime::Handle;
+use tokio::runtime::RuntimeFlavor;
 
-use crate::aws::http::HttpClient;
 use crate::aws::imds::ImdsProvider;
 use crate::aws::resolve_region;
+use crate::aws::resolve_region_with_imds;
 
 /// Resource detector for AWS cloud environment.
 ///
@@ -30,24 +31,22 @@ impl AWSResourceDetector {
 
     /// The region, from the environment or — on EC2, where the environment often says nothing — from
     /// the instance metadata service.
-    ///
-    /// IMDS is worth the round trip here and nowhere else in this client: this runs once while
-    /// telemetry is built, and without it an EC2 deployment that configures no region loses its
-    /// `cloud.region` attribute entirely.
     fn region(&self) -> Option<String> {
         if let Some(region) = resolve_region(None) {
             return Some(region);
         }
 
-        let http = HttpClient::for_metadata().ok()?;
+        // `block_in_place` panics on a current-thread runtime, so there the detector reports only
+        // what the environment names.
+        if ImdsProvider::disabled() || self.handle.runtime_flavor() == RuntimeFlavor::CurrentThread
+        {
+            return None;
+        }
 
         // `ResourceDetector::detect` is a synchronous trait method. It runs once while telemetry
         // is built, before the server serves anything, so no other core is waiting on this one.
         #[allow(clippy::disallowed_methods)]
-        tokio::task::block_in_place(|| {
-            self.handle
-                .block_on(async { ImdsProvider::new(http).region().await })
-        })
+        tokio::task::block_in_place(|| self.handle.block_on(resolve_region_with_imds(None)))
     }
 }
 

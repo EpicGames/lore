@@ -531,12 +531,10 @@ impl HasStatus for HttpStream {
     }
 }
 
-/// The region to sign for, in the order the AWS tooling resolves it.
+/// The region `explicit`, the configured `*_region` setting, or the environment names, in the order
+/// the AWS tooling reads them.
 ///
-/// `explicit` is the configured `*_region` setting. IMDS is not consulted, so resolving a region
-/// never waits on a link-local round trip; a deployment that configures neither gets `None`.
-/// [`crate::aws::imds::ImdsProvider::region`] serves the resource detector, which asks once at
-/// startup.
+/// Reads nothing over the network.
 pub fn resolve_region(explicit: Option<&str>) -> Option<String> {
     if let Some(region) = explicit.filter(|region| !region.is_empty()) {
         return Some(region.to_owned());
@@ -551,6 +549,21 @@ pub fn resolve_region(explicit: Option<&str>) -> Option<String> {
     }
 
     None
+}
+
+/// The region to sign for: [`resolve_region`], then the region of the EC2 instance this process
+/// runs on.
+///
+/// The metadata service is asked until it answers, and its answer, or a host that does not answer
+/// at the metadata address, serves every later resolution in the process.
+pub async fn resolve_region_with_imds(explicit: Option<&str>) -> Option<String> {
+    static INSTANCE_REGION: imds::InstanceRegion = imds::InstanceRegion::new();
+
+    INSTANCE_REGION
+        .resolve(explicit, || {
+            HttpClient::for_metadata().map(imds::ImdsProvider::new)
+        })
+        .await
 }
 
 /// The default endpoint for a service in a region.

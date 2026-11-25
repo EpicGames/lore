@@ -3,8 +3,8 @@ type: breaking
 ---
 
 - `lore-server` (AWS store): a store whose region is not set by its `s3_region` or `dynamodb_region` setting,
-  `AWS_REGION` or `AWS_DEFAULT_REGION` refuses to start. The region is no longer read from `~/.aws/config` or the
-  instance metadata service
+  `AWS_REGION`, `AWS_DEFAULT_REGION` or, on EC2, the instance metadata service refuses to start. The region is no
+  longer read from `~/.aws/config`
 - `lore-server` (AWS store): credentials resolve from, in order, the environment, container credentials (ECS and EKS Pod
   Identity), web identity (EKS IRSA), the EC2 instance metadata service, and static keys in `~/.aws/credentials` or
   `AWS_SHARED_CREDENTIALS_FILE`. `~/.aws/config` is not read, so a profile that takes its credentials from `role_arn`
