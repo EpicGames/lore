@@ -22,7 +22,6 @@ use lore_revision::link;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::execution_context;
 use lore_revision::lore_debug;
-use lore_revision::lore_error;
 use lore_revision::metadata::MetadataInherit;
 use lore_revision::metadata::branch::BranchMetadataError;
 use lore_revision::repository;
@@ -1276,48 +1275,33 @@ fn archive_local(
     )
 }
 
+#[lore_macro::test_pub]
 async fn archive_impl(
     repository: Arc<RepositoryContext>,
     args: LoreBranchArchiveArgs,
 ) -> Result<(), BranchError> {
-    let execution = execution_context();
-
     let branch = branch::resolve(repository.clone(), args.branch.as_str()).await?;
 
     let layer_scope =
         CascadeScope::new(&args.layer, args.include_layers, "layer", "include_layers")?;
     let link_scope = CascadeScope::new(&args.link, args.include_links, "link", "include_links")?;
 
-    let mut local_fail = false;
-
-    // Make sure branch is not current
-    let mut local_current = false;
+    // `branch::delete` refuses the current branch too, but the remote archive and the cascade
+    // would still run after it, so the refusal comes first.
     if let Ok((_revision, current_branch)) =
         lore_revision::instance::load_current_anchor_boxed(&repository).await
         && current_branch == branch.id
     {
-        lore_error!("Cannot archive the current branch");
-        execution
-            .dispatcher
-            .send_error(BranchError::from(lore_base::error::DeleteCurrent {
-                branch: branch.id.to_string(),
-            }));
-        local_fail = true;
-        local_current = true;
+        return Err(BranchError::from(lore_base::error::DeleteCurrent {
+            branch: branch.id.to_string(),
+        }));
     }
 
-    if !local_fail {
-        // Archive branch
-        lore_debug!("Attempt archive of local branch");
-        if let Err(err) = branch::delete(repository.clone(), branch.id).await {
-            execution.dispatcher.send_error(err);
-            local_fail = true;
-        }
-    }
+    lore_debug!("Attempt archive of local branch");
+    // The local failure takes precedence over the remote's, and both over the cascade's.
+    let mut failure = branch::delete(repository.clone(), branch.id).await.err();
 
-    let mut remote_fail = None;
-
-    if !local_current && !execution_context().globals().local() {
+    if !execution_context().globals().local() {
         // Archive remote branch
         lore_debug!("Attempt archive of remote branch");
         let remote_archive = match repository
@@ -1334,26 +1318,23 @@ async fn archive_impl(
             Err(err) if err.is_no_remote() || err.is_branch_not_found() => {
                 lore_debug!("No remote branch to archive: {err}");
             }
-            Err(err) => remote_fail = Some(err),
+            Err(err) => {
+                failure.get_or_insert(err);
+            }
         }
     }
 
     // Runs even when the outer archive failed, so that a repeat of a partially
     // applied archive still converges on the layers and links.
-    if !local_current {
-        archive_layers(repository.clone(), branch.id, layer_scope).await?;
-        archive_links(repository, branch.id, link_scope).await?;
-    }
+    let cascade = match archive_layers(repository.clone(), branch.id, layer_scope).await {
+        Ok(()) => archive_links(repository, branch.id, link_scope).await,
+        Err(err) => Err(err),
+    };
 
-    if local_fail {
-        return Err(BranchError::from(lore_base::error::BranchNotFound {
-            branch: branch.id.to_string(),
-        }));
-    }
-
-    if let Some(err) = remote_fail {
+    if let Some(err) = failure {
         return Err(err);
     }
+    cascade?;
 
     Ok(())
 }

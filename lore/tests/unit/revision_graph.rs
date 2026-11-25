@@ -13,4 +13,4 @@ mod identifier;
 mod locations;
 mod record;
 mod revision_resolve;
-mod support;
+pub(crate) mod support;
