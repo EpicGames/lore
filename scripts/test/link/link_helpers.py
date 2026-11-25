@@ -454,6 +454,18 @@ def parse_revision_diff(output: str) -> list[tuple[str, str]]:
     return entries
 
 
+def revision_delta(
+    repo: Lore, revision: str | None = None
+) -> list[tuple[str, str, bool]]:
+    """The `revision info --delta` entries of `revision` as sorted (path, action, flagModify)."""
+    deltas = parse_jsonl(
+        repo.revision_info(revision, delta=True, json=True), "revisionInfoDelta"
+    )
+    return sorted(
+        (delta["path"], delta["action"], delta["flagModify"]) for delta in deltas
+    )
+
+
 def build_nested_link_repos_at(new_lore_repo, b_mount, c_inner_mount):
     """Build A -> B -> C with configurable mount paths.
 

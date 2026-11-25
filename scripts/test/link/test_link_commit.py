@@ -7,7 +7,17 @@ from pathlib import Path
 
 import pytest
 from error_types import ImproperArgumentsError, NotALinkError, NothingStagedError
-from link_helpers import make_parent_with_link, make_repo
+from link_helpers import (
+    DEFAULT_LINK_MOUNT,
+    DEFAULT_LINKED_FILE,
+    DEFAULT_PARENT_FILE,
+    build_nested_link_repos_at,
+    make_parent_with_link,
+    make_repo,
+    parse_revision_diff,
+    remount,
+    revision_delta,
+)
 from lore_parsers import parse_commit_stats_json, parse_jsonl, parse_status_json
 from service_util import LORE_SERVICE_ENVIRONMENT, SERVICE_UNAVAILABLE
 from test_utils import working_tree_files
@@ -1039,3 +1049,265 @@ def test_commit_keeps_a_removed_directory_holding_a_link_and_the_link(
     assert working_tree_files(fresh) == sorted(
         ["o.txt", "vendor/keep.txt", f"{mount}/linked.txt"]
     ), f"The branch keeps the link mounted, got {working_tree_files(fresh)}"
+
+
+@pytest.mark.smoke
+def test_revision_info_delta_lists_the_files_a_pin_bump_changed(new_lore_repo):
+    """A revision moving a link's pin lists, beside the mount, each file the pin move changed
+    inside the link, as `revision diff` does."""
+    link_repo = make_repo(
+        new_lore_repo, {"a.txt": "v1\n", "sub/b.txt": "b1\n", "old.txt": "old\n"}
+    )
+    pin_v1 = link_repo.branch_info().local_latest
+    link_repo.write_files({"a.txt": "v2\n", "sub/c.txt": "c1\n"})
+    link_repo.remove_file("old.txt")
+    link_repo.stage(scan=True)
+    link_repo.commit("Modify a.txt, add sub/c.txt, delete old.txt")
+    link_repo.push()
+    pin_v2 = link_repo.branch_info().local_latest
+
+    parent = make_repo(new_lore_repo, {"README.txt": "baseline\n"})
+    parent.link_add("libs/shared", link_repo.get_id(), "/", pin=pin_v1)
+    parent.commit("Add link at v1")
+    parent.push()
+    before_bump = parent.branch_info().local_latest
+    parent.link_update("libs/shared", pin=pin_v2)
+    parent.write_files({"README.txt": "touched\n"})
+    parent.stage("README.txt")
+    parent.commit("Bump the link and touch README")
+    parent.push()
+
+    delta = revision_delta(parent)
+    assert delta == [
+        ("README.txt", "keep", True),
+        ("libs", "keep", False),
+        ("libs/shared", "keep", False),
+        ("libs/shared/a.txt", "keep", True),
+        ("libs/shared/old.txt", "delete", False),
+        ("libs/shared/sub/c.txt", "add", False),
+    ], delta
+    diff_paths = {
+        path for _, path in parse_revision_diff(parent.revision_diff(before_bump))
+    }
+    assert {path for path, _, _ in delta} - {"libs"} == diff_paths
+
+
+@pytest.mark.smoke
+def test_revision_info_delta_lists_a_file_committed_through_the_mount(new_lore_repo):
+    """A commit through the mount lists the linked file it changed under the mount."""
+    parent, _ = make_parent_with_link(new_lore_repo)
+    parent.write_files({DEFAULT_LINKED_FILE: "changed through the mount\n"})
+    parent.stage(DEFAULT_LINKED_FILE)
+    parent.commit("Change the linked file")
+
+    assert revision_delta(parent) == [
+        ("vendor", "keep", False),
+        ("vendor/lib", "keep", False),
+        (DEFAULT_LINKED_FILE, "keep", True),
+    ]
+
+
+@pytest.mark.smoke
+def test_revision_info_delta_lists_only_the_mount_when_the_mounted_part_is_unchanged(
+    new_lore_repo,
+):
+    """A pin bump that changes only content outside a subtree mount lists the mount alone."""
+    parent, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_files={"mounted/a.txt": "a\n", "outside/b.txt": "b\n"},
+        source_path="mounted",
+    )
+    link_repo.write_commit_push("Change outside the mount", {"outside/b.txt": "b2\n"})
+    parent.link_update("vendor/lib", pin=link_repo.branch_info().local_latest)
+    parent.commit("Bump the link")
+
+    assert revision_delta(parent) == [
+        ("vendor", "keep", False),
+        ("vendor/lib", "keep", False),
+    ]
+
+
+@pytest.mark.smoke
+def test_revision_info_delta_lists_a_file_changed_inside_a_nested_link(new_lore_repo):
+    """A commit through a nested link lists the inner file under both mounts."""
+    repo_a, _, _, outer, nested = build_nested_link_repos_at(new_lore_repo, "b", "c")
+    inner = f"{nested}/c-data/inner.txt"
+    repo_a.write_files({inner: "changed through both links\n"})
+    repo_a.stage(inner)
+    repo_a.commit("Change the inner file")
+
+    assert revision_delta(repo_a) == [
+        (outer, "keep", False),
+        (inner, "keep", True),
+    ]
+
+
+@pytest.mark.smoke
+def test_revision_info_delta_lists_an_added_link_as_its_mount_alone(new_lore_repo):
+    """A revision adding a link lists the mount alone, as an add."""
+    parent, _ = make_parent_with_link(new_lore_repo)
+
+    assert revision_delta(parent) == [
+        ("vendor", "add", False),
+        ("vendor/lib", "add", False),
+    ]
+
+
+@pytest.mark.smoke
+def test_revision_info_delta_lists_a_removed_link_as_its_mount_alone(new_lore_repo):
+    """A revision removing a link lists the mount alone, as a delete."""
+    parent, _ = make_parent_with_link(new_lore_repo, link_path="lib")
+    parent.link_remove("lib")
+    parent.commit("Remove the link")
+
+    assert revision_delta(parent) == [("lib", "delete", False)]
+
+
+@pytest.mark.smoke
+def test_revision_info_delta_lists_a_move_inside_a_link_with_its_source(new_lore_repo):
+    """A pin bump that moved a file inside the link lists the move with its source path."""
+    parent, link_repo = make_parent_with_link(new_lore_repo)
+    link_repo.move("linked.txt", "moved.txt")
+    link_repo.stage_move("linked.txt", "moved.txt")
+    link_repo.commit("Move linked.txt")
+    link_repo.push()
+    parent.link_update("vendor/lib", pin=link_repo.branch_info().local_latest)
+    parent.commit("Bump the link")
+
+    deltas = parse_jsonl(
+        parent.revision_info(delta=True, json=True), "revisionInfoDelta"
+    )
+    assert sorted(
+        (delta["path"], delta["action"], delta["fromPath"]) for delta in deltas
+    ) == [
+        ("vendor", "keep", ""),
+        ("vendor/lib", "keep", ""),
+        ("vendor/lib/moved.txt", "move", "vendor/lib/linked.txt"),
+    ], deltas
+
+
+@pytest.mark.smoke
+def test_revision_info_delta_lists_a_file_replaced_by_a_directory_inside_a_link(
+    new_lore_repo,
+):
+    """A pin bump that replaced a linked file with a directory lists the file's deletion as a
+    file and the directory's addition."""
+    parent, link_repo = make_parent_with_link(
+        new_lore_repo, link_files={"x": "file\n", "keep.txt": "keep\n"}
+    )
+    link_repo.remove_file("x")
+    link_repo.write_files({"x/inner.txt": "inner\n"})
+    link_repo.stage(scan=True)
+    link_repo.commit("Replace x with a directory")
+    link_repo.push()
+    parent.link_update("vendor/lib", pin=link_repo.branch_info().local_latest)
+    parent.commit("Bump the link")
+
+    deltas = parse_jsonl(
+        parent.revision_info(delta=True, json=True), "revisionInfoDelta"
+    )
+    assert sorted(
+        (delta["path"], delta["action"], delta["flagFile"]) for delta in deltas
+    ) == [
+        ("vendor", "keep", False),
+        ("vendor/lib", "keep", False),
+        ("vendor/lib/x", "add", False),
+        ("vendor/lib/x", "delete", True),
+        ("vendor/lib/x/inner.txt", "add", True),
+    ], deltas
+
+
+@pytest.mark.smoke
+def test_revision_info_delta_lists_a_linked_file_the_view_leaves_out(new_lore_repo):
+    """The changes inside a link are listed whatever the instance's view, as the revision's own
+    are."""
+    parent, link_repo = make_parent_with_link(
+        new_lore_repo, link_files={"sub/a.txt": "a\n", "b.txt": "b\n"}
+    )
+    link_repo.write_commit_push("Change sub/a.txt", {"sub/a.txt": "a2\n"})
+    parent.link_update("vendor/lib", pin=link_repo.branch_info().local_latest)
+    parent.commit("Bump the link")
+    with open(os.path.join(parent.dot_path(), "view"), "w") as view_file:
+        view_file.write("/vendor/lib/sub/*\n")
+
+    assert revision_delta(parent) == [
+        ("vendor", "keep", False),
+        ("vendor/lib", "keep", False),
+        ("vendor/lib/sub/a.txt", "keep", True),
+    ]
+
+
+@pytest.mark.smoke
+def test_revision_info_delta_lists_a_remounted_link_as_its_mount_alone(new_lore_repo):
+    """A revision remounting a link onto another subtree at a new pin lists the mount alone, as
+    the two subtrees don't correspond."""
+    parent, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_files={"a/x.txt": "x\n", "b/y.txt": "y\n"},
+        source_path="a",
+    )
+    link_repo.write_commit_push(
+        "Change both subtrees", {"a/x.txt": "x2\n", "b/y.txt": "y2\n"}
+    )
+    remount(
+        parent,
+        "vendor/lib",
+        link_repo.get_id(),
+        "b",
+        message=None,
+        pin=link_repo.branch_info().local_latest,
+    )
+    parent.commit("Remount the link onto b")
+
+    assert revision_delta(parent) == [
+        ("vendor", "keep", False),
+        ("vendor/lib", "keep", False),
+    ]
+
+
+@pytest.mark.smoke
+def test_revision_info_metadata_reads_a_linked_file_from_its_repository(new_lore_repo):
+    """`revision info --metadata` reports the metadata of a file changed inside a link as the
+    linked repository records it."""
+    parent, link_repo = make_parent_with_link(new_lore_repo)
+    link_repo.write_files({"linked.txt": "changed\n"})
+    link_repo.stage("linked.txt")
+    link_repo.file_metadata_set("linked.txt", ["owner", "linked@example.com"])
+    link_repo.commit("Change linked.txt with metadata")
+    link_repo.push()
+    parent.link_update("vendor/lib", pin=link_repo.branch_info().local_latest)
+    parent.commit("Bump the link")
+
+    metadata = parse_jsonl(parent.revision_info(metadata=True, json=True), "metadata")
+    assert {"key": "owner", "value": "linked@example.com"} in [
+        {"key": entry["key"], "value": entry["value"]["data"]} for entry in metadata
+    ], metadata
+
+
+@pytest.mark.smoke
+def test_revision_info_metadata_reads_each_file_of_a_shared_block_and_revision(
+    new_lore_repo,
+):
+    """`revision info --metadata` reports each file's own metadata where several files share a
+    metadata block, inside the link and in the revision itself, as it reuses the block it read
+    last."""
+    parent, link_repo = make_parent_with_link(
+        new_lore_repo, link_files={"a.txt": "a\n", "b.txt": "b\n"}
+    )
+    link_repo.write_files({"a.txt": "a changed\n", "b.txt": "b changed\n"})
+    link_repo.stage(["a.txt", "b.txt"])
+    link_repo.file_metadata_set("a.txt", ["owner", "a@example.com"])
+    link_repo.file_metadata_set("b.txt", ["owner", "b@example.com"])
+    link_repo.commit("Change both linked files with metadata")
+    link_repo.push()
+    parent.write_files({DEFAULT_PARENT_FILE: "changed\n"})
+    parent.stage(DEFAULT_PARENT_FILE)
+    parent.file_metadata_set(DEFAULT_PARENT_FILE, ["owner", "parent@example.com"])
+    parent.link_update(DEFAULT_LINK_MOUNT, pin=link_repo.branch_info().local_latest)
+    parent.commit("Change the parent file and bump the link")
+
+    metadata = parse_jsonl(parent.revision_info(metadata=True, json=True), "metadata")
+    owners = sorted(
+        entry["value"]["data"] for entry in metadata if entry["key"] == "owner"
+    )
+    assert owners == ["a@example.com", "b@example.com", "parent@example.com"], metadata
