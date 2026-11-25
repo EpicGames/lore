@@ -58,6 +58,7 @@ use quinn::ReadError;
 use quinn::ReadExactError;
 use quinn::RecvStream;
 use quinn::SendStream;
+use quinn::VarInt;
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn_proto::ConnectionIdGenerator;
 use quinn_proto::HashedConnectionIdGenerator;
@@ -129,6 +130,17 @@ async fn serve_and_connect(
     factory: Box<dyn StreamHandlerFactory>,
     protocol: &'static str,
 ) -> Harness {
+    serve_and_connect_with_window(factory, protocol, None).await
+}
+
+/// Serves and connects as the harness does, with the client granting each stream `stream_window`
+/// bytes of credit when set, so that a response larger than it stalls the server's writer until
+/// the client reads.
+async fn serve_and_connect_with_window(
+    factory: Box<dyn StreamHandlerFactory>,
+    protocol: &'static str,
+    stream_window: Option<u32>,
+) -> Harness {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     let server_addr = socket.local_addr().expect("Failed socket setup");
     drop(socket);
@@ -151,9 +163,14 @@ async fn serve_and_connect(
         .with_no_client_auth();
     crypto_config.alpn_protocols = vec![protocol.as_bytes().into()];
 
-    let client_config = ClientConfig::new(Arc::new(
+    let mut client_config = ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(crypto_config).expect("Failed client config"),
     ));
+    if let Some(window) = stream_window {
+        let mut transport = quinn::TransportConfig::default();
+        transport.stream_receive_window(VarInt::from_u32(window));
+        client_config.transport_config(Arc::new(transport));
+    }
 
     let client_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
     let mut endpoint = Endpoint::client(client_addr).expect("Failed to create client endpoint");
@@ -188,6 +205,17 @@ const BLOCKING_HANDLER_SLEEP: Duration = Duration::from_secs(3600);
 /// Time a refusal that involves no waiting is allowed to take, with room for a loaded host.
 const SHED_BUDGET: Duration = Duration::from_secs(1);
 
+/// The byte a [`MockBehaviour::Large`] response repeats.
+const LARGE_BYTE: u8 = 0xCD;
+
+/// How long [`MockBehaviour::Delay`] takes to answer.
+const DELAYED_HANDLER_SLEEP: Duration = Duration::from_millis(100);
+
+/// The command IDs of the [`MockBehaviour::Mark`] requests handled, across every test. Each test
+/// marks random IDs, so tests running at once do not see each other's.
+static HANDLED_MARKS: std::sync::Mutex<std::collections::BTreeSet<u32>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
 #[derive(Debug, thiserror::Error)]
 #[error("mock error")]
 struct MockError;
@@ -202,6 +230,12 @@ enum MockBehaviour {
     Echo,
     /// Answer with more bytes than [`MOCK_MAX_CHUNK`] allows.
     Oversized,
+    /// Answer with [`MOCK_MAX_CHUNK`] bytes of [`LARGE_BYTE`].
+    Large,
+    /// Answer after [`DELAYED_HANDLER_SLEEP`].
+    Delay,
+    /// Record the request's command ID in [`HANDLED_MARKS`], then answer.
+    Mark(u32),
 }
 
 impl MockBehaviour {
@@ -210,6 +244,9 @@ impl MockBehaviour {
             MockBehaviour::Block => 1,
             MockBehaviour::Echo => 2,
             MockBehaviour::Oversized => 3,
+            MockBehaviour::Large => 4,
+            MockBehaviour::Delay => 5,
+            MockBehaviour::Mark(_) => 6,
         }
     }
 
@@ -218,6 +255,9 @@ impl MockBehaviour {
             MockBehaviour::Block,
             MockBehaviour::Echo,
             MockBehaviour::Oversized,
+            MockBehaviour::Large,
+            MockBehaviour::Delay,
+            MockBehaviour::Mark(0),
         ]
         .into_iter()
         .find(|behaviour| behaviour.opcode() == opcode)
@@ -225,6 +265,64 @@ impl MockBehaviour {
 }
 
 struct MockService;
+
+/// The `command_id` fields of the [`MockService`] request spans that have closed, across every
+/// test running at once. A test reading it uses a random command ID, so the fixed IDs other tests
+/// use do not collide with it.
+static CLOSED_REQUEST_SPANS: std::sync::Mutex<std::collections::BTreeSet<u32>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// The subscriber [`MockService`] creates its request spans in, whichever thread builds them.
+static REQUEST_SPANS: std::sync::LazyLock<tracing::Dispatch> = std::sync::LazyLock::new(|| {
+    use tracing_subscriber::layer::SubscriberExt;
+    tracing::Dispatch::new(tracing_subscriber::registry().with(SpanCloseRecorder))
+});
+
+/// Adds a span's command ID to [`CLOSED_REQUEST_SPANS`] when it closes.
+struct SpanCloseRecorder;
+
+/// A request span's `command_id` field.
+struct CommandId(u32);
+
+impl tracing::field::Visit for CommandId {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == "command_id" {
+            self.0 = value as u32;
+        }
+    }
+
+    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+}
+
+impl<S> tracing_subscriber::Layer<S> for SpanCloseRecorder
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut command_id = CommandId(0);
+        attrs.record(&mut command_id);
+        if let Some(span) = ctx.span(id) {
+            span.extensions_mut().insert(command_id);
+        }
+    }
+
+    fn on_close(&self, id: tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let Some(span) = ctx.span(&id) else {
+            return;
+        };
+        if let Some(CommandId(command_id)) = span.extensions().get::<CommandId>() {
+            CLOSED_REQUEST_SPANS
+                .lock()
+                .expect("the closed spans are not poisoned")
+                .insert(*command_id);
+        }
+    }
+}
 
 #[async_trait]
 impl QuicService for MockService {
@@ -241,7 +339,10 @@ impl QuicService for MockService {
         header: &CommandHeader,
         _bytes: Bytes,
     ) -> Result<MockBehaviour, MockError> {
-        MockBehaviour::from_opcode(header.cmd).ok_or(MockError)
+        match MockBehaviour::from_opcode(header.cmd).ok_or(MockError)? {
+            MockBehaviour::Mark(_) => Ok(MockBehaviour::Mark(header.command_id)),
+            behaviour => Ok(behaviour),
+        }
     }
 
     async fn run_request_handler(
@@ -256,6 +357,18 @@ impl QuicService for MockService {
             }
             MockBehaviour::Echo => Ok(vec![Bytes::new()]),
             MockBehaviour::Oversized => Ok(vec![Bytes::from(vec![0xAB; MOCK_MAX_CHUNK + 1])]),
+            MockBehaviour::Large => Ok(vec![Bytes::from(vec![LARGE_BYTE; MOCK_MAX_CHUNK])]),
+            MockBehaviour::Delay => {
+                tokio::time::sleep(DELAYED_HANDLER_SLEEP).await;
+                Ok(vec![Bytes::new()])
+            }
+            MockBehaviour::Mark(command_id) => {
+                HANDLED_MARKS
+                    .lock()
+                    .expect("the marks are not poisoned")
+                    .insert(command_id);
+                Ok(vec![Bytes::new()])
+            }
         }
     }
 
@@ -282,15 +395,13 @@ impl QuicService for MockService {
         _message: &MockBehaviour,
         _context: &Arc<AttributeMap>,
     ) -> tracing::Span {
-        lore_server::quic::storage_service::build_storage_protocol_request_span(
-            header.cmd,
-            lore_server::telemetry::StorageProtocol::StorageV0,
-            lore_server::quic::NO_CONNECTION_ID,
-            lore_server::quic::NO_REPOSITORY_ID,
-            lore_server::quic::NO_CORRELATION_ID,
-            lore_server::quic::NO_USER_ID,
-            lore_server::quic::NO_USER_AGENT,
-        )
+        tracing::dispatcher::with_default(&REQUEST_SPANS, || {
+            tracing::info_span!(
+                parent: None,
+                "MockRequest",
+                command_id = header.command_id
+            )
+        })
     }
 }
 
@@ -963,7 +1074,7 @@ async fn a_request_header_carrying_the_error_bit_closes_the_stream() {
         )
         .await;
 
-        let header = CommandHeader::new(MockBehaviour::Echo as QuicOpCode, 1, 0)
+        let header = CommandHeader::new(MockBehaviour::Echo.opcode(), 1, 0)
             .response_error(QuicServiceError::Failed as u32);
         harness
             .send
@@ -1794,54 +1905,508 @@ async fn the_default_is_16_sockets_or_one_per_processor_if_fewer() {
     .expect("Test task failed");
 }
 
-mod write_timed {
-    use tokio::sync::Mutex;
-    use tokio::sync::oneshot;
+mod write_responses {
+    use super::*;
+
+    /// Below a [`MockBehaviour::Large`] response, so that one stalls the server's writer until the
+    /// client reads.
+    const STALLING_WINDOW: u32 = 1024;
+
+    /// Whether the [`MockBehaviour::Mark`] request `command_id` is handled within `within`.
+    async fn marked_within(command_id: u32, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if HANDLED_MARKS
+                .lock()
+                .expect("the marks are not poisoned")
+                .contains(&command_id)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    /// Reads one response, header and payload.
+    async fn full_response(recv: &mut RecvStream) -> (CommandHeader, Vec<u8>) {
+        let header = response(recv).await;
+        let mut payload = vec![
+            0;
+            if header.error {
+                0
+            } else {
+                header.size_or_status as usize
+            }
+        ];
+        recv.read_exact(&mut payload)
+            .await
+            .expect("Failed to read response payload");
+        (header, payload)
+    }
+
+    /// Sends an unparsable request.
+    async fn unparseable_request(send: &mut SendStream, command_id: u32) {
+        send.write(&CommandHeader::new(0xEE, command_id, 0).to_bytes())
+            .await
+            .expect("Failed to write header");
+    }
+
+    /// Serves [`MockService`] with `limits` to a client that grants each stream only
+    /// [`STALLING_WINDOW`] bytes, and stalls the server's writer on the client's stream with a
+    /// [`MockBehaviour::Large`] response, `stall_id`, that the client does not read. Returns once
+    /// the server has said the stream is blocked on the client's credit.
+    async fn stall_the_writer(limits: AdmissionLimits, stall_id: u32) -> Harness {
+        let mut harness = serve_and_connect_with_window(
+            Box::new(SingleServiceFactory::new(
+                MOCK_PROTOCOL,
+                || MockService,
+                limits,
+            )),
+            MOCK_PROTOCOL,
+            Some(STALLING_WINDOW),
+        )
+        .await;
+        request(&mut harness.send, MockBehaviour::Large, stall_id).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while harness.connection.stats().frame_rx.stream_data_blocked == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the server's writer never blocked on the client's credit"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        harness
+    }
+
+    /// Whether the [`MockService`] request span of `command_id` closes within `within`.
+    async fn span_closed_within(command_id: u32, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if CLOSED_REQUEST_SPANS
+                .lock()
+                .expect("the closed spans are not poisoned")
+                .contains(&command_id)
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    /// A request's span stays open until its response is written, so the response is reported
+    /// in it.
+    #[tokio::test]
+    async fn a_request_span_stays_open_until_its_response_is_written() {
+        let (_immutable_store, _mutable_store, execution) =
+            test_store_create().await.expect("Failed to create store");
+        lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+            let stalled = random::<u32>();
+            let mut harness = stall_the_writer(test_limits(), stalled).await;
+
+            assert!(
+                !span_closed_within(stalled, Duration::from_millis(300)).await,
+                "the span closed before its response was written"
+            );
+
+            full_response(&mut harness.recv).await;
+            assert!(
+                span_closed_within(stalled, Duration::from_secs(5)).await,
+                "the span stayed open after its response was written"
+            );
+        }))
+        .await
+        .expect("Test task failed");
+    }
+
+    /// Responses to many requests on one stream, some larger than the client's credit, each
+    /// arrive whole, every one of them.
+    #[tokio::test]
+    async fn responses_to_many_requests_on_a_stream_each_arrive_whole() {
+        let (_immutable_store, _mutable_store, execution) =
+            test_store_create().await.expect("Failed to create store");
+        lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+            let mut harness = serve_and_connect_with_window(
+                Box::new(SingleServiceFactory::new(
+                    MOCK_PROTOCOL,
+                    || MockService,
+                    test_limits(),
+                )),
+                MOCK_PROTOCOL,
+                Some(STALLING_WINDOW),
+            )
+            .await;
+
+            let requests = 1..=20;
+            for command_id in requests.clone() {
+                let behaviour = if command_id % 2 == 0 {
+                    MockBehaviour::Large
+                } else {
+                    MockBehaviour::Echo
+                };
+                request(&mut harness.send, behaviour, command_id).await;
+            }
+
+            let mut answered = std::collections::BTreeSet::new();
+            for _ in requests.clone() {
+                let (header, payload) = full_response(&mut harness.recv).await;
+                assert!(!header.error, "got: {header:?}");
+                let expected = if header.command_id % 2 == 0 {
+                    vec![LARGE_BYTE; MOCK_MAX_CHUNK]
+                } else {
+                    vec![]
+                };
+                assert_eq!(payload, expected, "response {}", header.command_id);
+                answered.insert(header.command_id);
+            }
+            assert_eq!(answered, requests.collect());
+
+            harness.send.finish().expect("Failed to finish stream");
+        }))
+        .await
+        .expect("Test task failed");
+    }
+
+    /// A request still being handled when the client finishes its side of the stream has its
+    /// response written before the server finishes the stream.
+    #[tokio::test]
+    async fn a_request_handled_after_the_client_finishes_is_answered_before_the_stream_ends() {
+        let (_immutable_store, _mutable_store, execution) =
+            test_store_create().await.expect("Failed to create store");
+        lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+            let mut harness = serve_and_connect(
+                Box::new(SingleServiceFactory::new(
+                    MOCK_PROTOCOL,
+                    || MockService,
+                    test_limits(),
+                )),
+                MOCK_PROTOCOL,
+            )
+            .await;
+
+            request(&mut harness.send, MockBehaviour::Delay, 7).await;
+            harness.send.finish().expect("Failed to finish stream");
+
+            let (header, _) = full_response(&mut harness.recv).await;
+            assert!(!header.error, "got: {header:?}");
+            assert_eq!(header.command_id, 7);
+            let rest = harness
+                .recv
+                .read_to_end(64)
+                .await
+                .expect("the stream ends after the response");
+            assert!(rest.is_empty(), "got {} more bytes", rest.len());
+        }))
+        .await
+        .expect("Test task failed");
+    }
+
+    /// A rejection while the stream's writer waits for the client's credit does not stop the
+    /// server reading the client's next request.
+    #[tokio::test]
+    async fn a_rejection_behind_a_stalled_write_does_not_stop_the_reading() {
+        let (_immutable_store, _mutable_store, execution) =
+            test_store_create().await.expect("Failed to create store");
+        lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+            let mut harness = stall_the_writer(test_limits(), 1).await;
+
+            unparseable_request(&mut harness.send, 2).await;
+            let after = random::<u32>();
+            request(&mut harness.send, MockBehaviour::Mark(0), after).await;
+
+            assert!(
+                marked_within(after, Duration::from_secs(5)).await,
+                "the request after the rejection was never handled"
+            );
+        }))
+        .await
+        .expect("Test task failed");
+    }
+
+    /// Up to [`QUEUED_REJECTIONS_PER_STREAM`] rejections a stalled writer has not written, the
+    /// server keeps reading the stream.
+    #[tokio::test]
+    async fn rejections_up_to_the_queued_limit_do_not_stop_the_reading() {
+        let (_immutable_store, _mutable_store, execution) =
+            test_store_create().await.expect("Failed to create store");
+        lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+            let mut harness = stall_the_writer(test_limits(), 1).await;
+
+            for command_id in 2..2 + QUEUED_REJECTIONS_PER_STREAM as u32 {
+                unparseable_request(&mut harness.send, command_id).await;
+            }
+            let after = random::<u32>();
+            request(&mut harness.send, MockBehaviour::Mark(0), after).await;
+
+            assert!(
+                marked_within(after, Duration::from_secs(5)).await,
+                "the server stopped reading before the rejection limit"
+            );
+        }))
+        .await
+        .expect("Test task failed");
+    }
+
+    /// A response waiting for the client's credit holds its stream permit until it is written, so
+    /// a request that needs the permit is handled only once the client reads.
+    #[tokio::test]
+    async fn a_response_waiting_for_credit_holds_its_stream_permit() {
+        let (_immutable_store, _mutable_store, execution) =
+            test_store_create().await.expect("Failed to create store");
+        lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+            let limits = AdmissionLimits {
+                process_limit: 1,
+                // Longer than the test, so the waiting request is never refused.
+                permit_timeout: Some(Duration::from_secs(3600)),
+                ..test_limits()
+            };
+            let mut harness = stall_the_writer(limits, 1).await;
+
+            let waiting = random::<u32>();
+            request(&mut harness.send, MockBehaviour::Mark(0), waiting).await;
+            assert!(
+                !marked_within(waiting, Duration::from_millis(300)).await,
+                "a request was handled while the stalled response held the stream's permit"
+            );
+
+            let (stalled, payload) = full_response(&mut harness.recv).await;
+            assert_eq!(stalled.command_id, 1);
+            assert_eq!(payload, vec![LARGE_BYTE; MOCK_MAX_CHUNK]);
+            assert!(
+                marked_within(waiting, Duration::from_secs(5)).await,
+                "the request was not handled once the stalled response was written"
+            );
+            let answered = response(&mut harness.recv).await;
+            assert_eq!(answered.command_id, waiting);
+            assert!(!answered.error, "got: {answered:?}");
+        }))
+        .await
+        .expect("Test task failed");
+    }
+
+    /// Past [`QUEUED_REJECTIONS_PER_STREAM`] rejections a stalled writer has not written, the
+    /// server stops reading the stream until the client reads its responses.
+    #[tokio::test]
+    async fn rejections_past_the_queued_limit_wait_for_the_writer() {
+        let (_immutable_store, _mutable_store, execution) =
+            test_store_create().await.expect("Failed to create store");
+        lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+            let mut harness = stall_the_writer(test_limits(), 1).await;
+
+            let rejected = 2..2 + QUEUED_REJECTIONS_PER_STREAM as u32 + 1;
+            for command_id in rejected.clone() {
+                unparseable_request(&mut harness.send, command_id).await;
+            }
+            let after = random::<u32>();
+            request(&mut harness.send, MockBehaviour::Mark(0), after).await;
+
+            assert!(
+                !marked_within(after, Duration::from_millis(300)).await,
+                "the server read past the rejection limit"
+            );
+
+            // The large response, then the rejections.
+            for _ in 0..1 + rejected.len() {
+                full_response(&mut harness.recv).await;
+            }
+            assert!(
+                marked_within(after, Duration::from_secs(5)).await,
+                "the request after the rejections was never handled"
+            );
+        }))
+        .await
+        .expect("Test task failed");
+    }
+
+    /// A write that fails releases the connection admission of every response queued on the
+    /// stream, so the connection serves other streams again.
+    #[tokio::test]
+    async fn a_failed_write_releases_the_admission_of_every_queued_response() {
+        let (_immutable_store, _mutable_store, execution) =
+            test_store_create().await.expect("Failed to create store");
+        lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+            // The three stalled responses take the connection's three admissions.
+            const STALLED: u32 = 3;
+            let limits = AdmissionLimits {
+                inflight_limit: STALLED as usize,
+                ..test_limits()
+            };
+            let mut harness = stall_the_writer(limits, 1).await;
+            // Each handled once it holds its admission, which it keeps while its response waits
+            // behind the stalled one.
+            for _ in 2..=STALLED {
+                let queued = random::<u32>();
+                request(&mut harness.send, MockBehaviour::Mark(0), queued).await;
+                assert!(
+                    marked_within(queued, Duration::from_secs(5)).await,
+                    "a request behind the stalled response was never handled"
+                );
+            }
+
+            let (mut send, mut recv) = harness.open_stream().await;
+            let mut command_id = 100;
+            request(&mut send, MockBehaviour::Echo, command_id).await;
+            let refused = response(&mut recv).await;
+            command_id += 1;
+            assert!(
+                refused.error,
+                "a request was admitted past the stalled responses: {refused:?}"
+            );
+            assert_eq!(refused.size_or_status, QuicServiceError::SlowDown as u32);
+
+            harness
+                .recv
+                .stop(VarInt::from_u32(0))
+                .expect("the stream is open");
+
+            // As many requests at once as there were stalled responses, each holding its
+            // admission while it is handled, are all admitted only once every stalled response
+            // has released its own.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                for _ in 0..STALLED {
+                    request(&mut send, MockBehaviour::Delay, command_id).await;
+                    command_id += 1;
+                }
+                let mut refused = 0;
+                for _ in 0..STALLED {
+                    let answered = response(&mut recv).await;
+                    if answered.error {
+                        assert_eq!(answered.size_or_status, QuicServiceError::SlowDown as u32);
+                        refused += 1;
+                    }
+                }
+                if refused == 0 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the stopped stream's responses still hold {refused} admissions"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }))
+        .await
+        .expect("Test task failed");
+    }
+}
+
+mod handle_stream {
+    use std::future::Future;
+    use std::task::Poll;
+
+    use quinn::crypto::rustls::QuicServerConfig;
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::PrivateKeyDer;
+    use rustls::pki_types::pem::PemObject;
 
     use super::*;
 
-    const BLOCKED_FOR: Duration = Duration::from_millis(40);
+    /// More requests than a task's budget allows it to take in one poll.
+    const REQUESTS: u32 = 1000;
 
-    #[tokio::test(start_paused = true)]
-    async fn a_write_that_blocks_counts_as_write_time() {
-        let stream = Mutex::new(());
+    /// A client connection and the server's side of it, accepted by a bare endpoint rather than
+    /// a server, so that a test runs the stream handler itself. The endpoints keep the
+    /// connection open.
+    async fn bare_connection() -> (quinn::Connection, quinn::Connection, Endpoint, Endpoint) {
+        let certificate = lore_transport::tls::generate_self_signed(vec!["127.0.0.1".to_string()])
+            .expect("self-signed certificate");
+        let chain = vec![
+            CertificateDer::from_pem_slice(certificate.cert_pem.as_bytes()).expect("certificate"),
+        ];
+        let key = PrivateKeyDer::from_pem_slice(certificate.key_pem.as_bytes()).expect("key");
+        let server_tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(chain, key)
+            .expect("server certificate");
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            QuicServerConfig::try_from(server_tls).expect("QUIC server crypto"),
+        ));
+        let loopback: SocketAddr = "127.0.0.1:0".parse().expect("loopback address");
+        let server = Endpoint::server(server_config, loopback).expect("server endpoint");
 
-        let (written, response) = write_timed(&stream, 64, async |_: &mut ()| {
-            tokio::time::sleep(BLOCKED_FOR).await;
-            7
-        })
-        .await;
+        let client_tls = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(insecure_client_auth::SkipServerVerification::new())
+            .with_no_client_auth();
+        let mut client = Endpoint::client(loopback).expect("client endpoint");
+        client.set_default_client_config(ClientConfig::new(Arc::new(
+            QuicClientConfig::try_from(client_tls).expect("QUIC client crypto"),
+        )));
 
-        assert_eq!(written, 7);
-        assert_eq!(response.lock_wait, Duration::ZERO);
-        assert_eq!(response.write, BLOCKED_FOR);
-        assert_eq!(response.bytes, 64);
+        let connecting = client
+            .connect(server.local_addr().expect("server address"), "localhost")
+            .expect("connect");
+        let incoming = server.accept().await.expect("incoming connection");
+        let (client_side, server_side) =
+            tokio::join!(async { connecting.await.expect("client side") }, async {
+                incoming.await.expect("server side")
+            });
+        (client_side, server_side, client, server)
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_writer_queued_behind_a_blocked_write_counts_as_lock_wait() {
-        let stream = Arc::new(Mutex::new(()));
-        let (holding, held) = oneshot::channel();
+    /// Polls `handling` once, in a poll of the test that starts with a full budget, and answers
+    /// whether it gave way.
+    async fn gives_way(mut handling: std::pin::Pin<&mut impl Future>) -> bool {
+        tokio::task::yield_now().await;
+        std::future::poll_fn(|cx| Poll::Ready(handling.as_mut().poll(cx).is_pending())).await
+    }
 
-        let first = lore_spawn!({
-            let stream = stream.clone();
-            async move {
-                write_timed(&stream, 1, async |_: &mut ()| {
-                    let _ = holding.send(());
-                    tokio::time::sleep(BLOCKED_FOR).await;
-                })
-                .await
-                .1
-            }
-        });
-        held.await.expect("the first write holds the stream");
+    /// A stream's read loop whose stream already holds many requests, each taking a permit
+    /// without waiting, gives way to other tasks before it has read them all, so it never holds
+    /// its worker for as long as requests keep arriving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_read_loop_gives_way_while_its_stream_holds_requests() {
+        let (_immutable_store, _mutable_store, execution) =
+            test_store_create().await.expect("Failed to create store");
+        LORE_CONTEXT
+            .scope(execution, async {
+                let (client, server, _client_endpoint, _server_endpoint) = bare_connection().await;
+                let (mut send, mut recv) = client.open_bi().await.expect("open a stream");
+                request(&mut send, MockBehaviour::Echo, 1).await;
+                let (answers, mut requests) = server.accept_bi().await.expect("accept the stream");
+                let process_limit = 2 * REQUESTS as usize;
+                let handler = StreamHandler::new(
+                    Arc::new(MockService),
+                    Arc::new(AttributeMap::default()),
+                    AdmissionLimits {
+                        process_limit,
+                        inflight_limit: process_limit * STREAM_COUNT as usize,
+                        ..test_limits()
+                    },
+                );
+                let mut handling = std::pin::pin!(handler.handle_stream(&mut requests, answers));
+                // The read loop's first read finds only the first request, so quinn has nothing
+                // buffered to merge into fewer chunks when the rest arrive.
+                assert!(gives_way(handling.as_mut()).await);
 
-        let (_, second) = write_timed(&stream, 1, async |_: &mut ()| {}).await;
-        let first = first.await.expect("the first write completes");
+                let rest: Vec<u8> = (2..=REQUESTS)
+                    .flat_map(|command_id| {
+                        CommandHeader::new(MockBehaviour::Echo.opcode(), command_id, 0).to_bytes()
+                    })
+                    .collect();
+                send.write_all(&rest).await.expect("write the requests");
+                send.finish().expect("finish the requests");
+                let stopped = send.stopped().await.expect("the requests acknowledged");
+                assert_eq!(stopped, None);
 
-        assert_eq!(first.lock_wait, Duration::ZERO);
-        assert_eq!(first.write, BLOCKED_FOR);
-        assert_eq!(second.lock_wait, BLOCKED_FOR);
-        assert_eq!(second.write, Duration::ZERO);
+                assert!(
+                    gives_way(handling.as_mut()).await,
+                    "the read loop read every request in one poll"
+                );
+                tokio::time::timeout(Duration::from_secs(10), handling)
+                    .await
+                    .expect("the read loop finished")
+                    .expect("the requests were read");
+                let mut answered = std::collections::BTreeSet::new();
+                for _ in 1..=REQUESTS {
+                    let header = response(&mut recv).await;
+                    assert!(!header.error, "got: {header:?}");
+                    answered.insert(header.command_id);
+                }
+                assert_eq!(answered, (1..=REQUESTS).collect());
+            })
+            .await;
     }
 }

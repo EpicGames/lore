@@ -3,6 +3,7 @@
 pub mod chunking;
 pub mod client;
 pub mod command_header;
+pub mod frame_queue;
 pub mod net_runtime;
 pub mod response_observer;
 #[cfg(not(feature = "test-util"))]

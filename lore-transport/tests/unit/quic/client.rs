@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use lore_transport::quic::client::*;
+use lore_transport::quic::frame_queue::FRAME_CHUNKS;
 use parking_lot::Mutex;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;

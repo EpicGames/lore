@@ -5,7 +5,6 @@ use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use lore_transport::quic::QuicClientError;
-use lore_transport::quic::client::FRAME_CHUNKS;
 use lore_transport::quic::client::QUEUE_FRAMES_KEPT;
 use lore_transport::quic::client::QueuedFrame;
 use lore_transport::quic::client::StreamQueue;
@@ -23,13 +22,19 @@ fn queue_frame(
     command_id: u32,
     payload: &[&[u8]],
 ) -> (Written, Vec<u8>) {
-    let mut chunks: Vec<Bytes> = std::iter::once(Bytes::from(vec![command_id as u8; 4]))
-        .chain(payload.iter().map(|chunk| Bytes::copy_from_slice(chunk)))
+    let header = Bytes::from(vec![command_id as u8; 4]);
+    let mut body: Vec<Bytes> = payload
+        .iter()
+        .map(|chunk| Bytes::copy_from_slice(chunk))
         .collect();
-    let bytes = chunks.iter().flatten().copied().collect();
+    let bytes = std::iter::once(&header)
+        .chain(&body)
+        .flatten()
+        .copied()
+        .collect();
     let (reply, written) = oneshot::channel();
     queue.push(
-        QueuedFrame::new(&mut chunks, command_id, reply, false, None),
+        QueuedFrame::new(header, &mut body, command_id, reply, false, None),
         pending,
         None,
     );
@@ -63,7 +68,7 @@ fn write_all(
         if queue.frames.is_empty() {
             return;
         }
-        write(queue.unwritten(), budget, stream);
+        write(queue.frames.unwritten(), budget, stream);
         queue.pop_written(pending, inflight);
     }
     panic!("the queue was never written in full");
@@ -79,8 +84,8 @@ fn queue_across_the_wrap(
     let mut stream = Vec::new();
     let (first, _) = queue_frame(queue, pending, 1, &[b"first", b"one"]);
     let (second, second_bytes) = queue_frame(queue, pending, 2, &[b"second", b"two"]);
-    let first_len = queue.chunks.range(..3).map(Bytes::len).sum();
-    write(queue.unwritten(), first_len, &mut stream);
+    let first_len = queue.frames.chunks.range(..3).map(Bytes::len).sum();
+    write(queue.frames.unwritten(), first_len, &mut stream);
     queue.pop_written(pending, inflight);
     assert_eq!(
         queue.frames.len(),
@@ -89,9 +94,10 @@ fn queue_across_the_wrap(
     );
     let (third, third_bytes) = queue_frame(queue, pending, 3, &[b"third", b"three"]);
     assert!(
-        !queue.chunks.as_slices().1.is_empty() && queue.chunks.as_slices().0.len() > 3,
+        !queue.frames.chunks.as_slices().1.is_empty()
+            && queue.frames.chunks.as_slices().0.len() > 3,
         "the third frame does not span the end of the buffer: {:?}",
-        queue.chunks.as_slices()
+        queue.frames.chunks.as_slices()
     );
     (
         vec![first, second, third],
@@ -126,10 +132,15 @@ fn a_frame_taken_back_across_the_end_of_the_queue_buffer_has_its_rest_written() 
     let mut queue = StreamQueue::default();
     let (_written, expected_before) = queue_across_the_wrap(&mut queue, &pending, &inflight);
     let (_fourth, fourth_bytes) = queue_frame(&mut queue, &pending, 4, &[b"fourth"]);
-    let second_len = queue.chunks.range(..3).map(Bytes::len).sum::<usize>();
+    let second_len = queue
+        .frames
+        .chunks
+        .range(..3)
+        .map(Bytes::len)
+        .sum::<usize>();
 
     let mut stream = Vec::new();
-    write(queue.unwritten(), second_len + 2, &mut stream);
+    write(queue.frames.unwritten(), second_len + 2, &mut stream);
     queue.pop_written(&pending, &inflight);
     queue.take_back(3, &pending, &inflight);
     assert_eq!(inflight.load(Ordering::Relaxed), 1);
@@ -148,12 +159,12 @@ fn a_frame_taken_back_unwritten_across_the_end_of_the_queue_buffer_is_removed() 
     let mut queue = StreamQueue::default();
     let (mut written, _) = queue_across_the_wrap(&mut queue, &pending, &inflight);
     let (_fourth, fourth_bytes) = queue_frame(&mut queue, &pending, 4, &[b"fourth"]);
-    let second_bytes: Vec<u8> = queue.chunks.range(..3).flatten().copied().collect();
+    let second_bytes: Vec<u8> = queue.frames.chunks.range(..3).flatten().copied().collect();
 
     queue.take_back(3, &pending, &inflight);
 
     assert_eq!(queue.frames.len(), 2);
-    assert_eq!(queue.chunks.len(), 3 + 2);
+    assert_eq!(queue.frames.chunks.len(), 3 + 2);
     assert_eq!(inflight.load(Ordering::Relaxed), 0);
     let mut stream = Vec::new();
     write_all(&mut queue, &pending, 3, &inflight, &mut stream);
@@ -161,24 +172,22 @@ fn a_frame_taken_back_unwritten_across_the_end_of_the_queue_buffer_is_removed() 
     assert!(!matches!(written[2].try_recv(), Ok(Ok(_))));
 }
 
-/// A queue that grew past twice the frames it keeps room for gives back the rest once it empties.
+/// A client stream's queue that grew past twice the frames it keeps room for gives back the rest
+/// once it empties, keeping room for [`QUEUE_FRAMES_KEPT`].
 #[test]
-fn an_emptied_queue_gives_back_its_room_beyond_the_frames_it_keeps() {
+fn an_emptied_queue_keeps_room_for_the_client_frames_kept() {
     let pending = PendingCommands::new(Default::default());
     let inflight = AtomicU64::new(0);
     let mut queue = StreamQueue::default();
-    let payload = [b"payload".as_slice(); FRAME_CHUNKS - 1];
     let _written: Vec<_> = (0..2 * QUEUE_FRAMES_KEPT as u32 + 1)
-        .map(|command_id| queue_frame(&mut queue, &pending, command_id, &payload))
+        .map(|command_id| queue_frame(&mut queue, &pending, command_id, &[b"payload"]))
         .collect();
     assert!(
-        queue.frames.capacity() > 2 * QUEUE_FRAMES_KEPT
-            && queue.chunks.capacity() > 2 * QUEUE_FRAMES_KEPT * FRAME_CHUNKS,
+        queue.frames.frames.capacity() > 2 * QUEUE_FRAMES_KEPT,
         "the queue did not grow past twice its room"
     );
 
     write_all(&mut queue, &pending, usize::MAX, &inflight, &mut Vec::new());
 
-    assert_eq!(queue.frames.capacity(), QUEUE_FRAMES_KEPT);
-    assert_eq!(queue.chunks.capacity(), QUEUE_FRAMES_KEPT * FRAME_CHUNKS);
+    assert_eq!(queue.frames.frames.capacity(), QUEUE_FRAMES_KEPT);
 }

@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::collections::VecDeque;
 use std::future::Future;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
@@ -51,8 +50,10 @@ use super::PACKET_THRESHOLD;
 use super::QuicClientError;
 use super::QuicOpCode;
 use super::TIME_THRESHOLD;
-use super::command_header::COMMAND_HEADER_SIZE_V4;
 use super::command_header::CommandHeader;
+use super::frame_queue::FrameChunks;
+use super::frame_queue::FrameQueue;
+use super::frame_queue::TakenBack;
 use super::response_observer::ResponseObserver;
 use super::response_observer::ResponseObserverSlot;
 use super::response_reader::PendingCommands;
@@ -1612,26 +1613,17 @@ where
     )
 }
 
-/// The most chunks a queued frame holds, its header included. A frame of more has the rest joined
-/// into its last chunk.
-#[lore_macro::test_pub]
-const FRAME_CHUNKS: usize = 6;
-
-/// The frames a stream's empty queue keeps room for. A queue that grew past them in a burst gives
-/// the rest back once it empties.
+/// The frames a stream's queue keeps room for once it empties after a burst.
 #[lore_macro::test_pub]
 const QUEUE_FRAMES_KEPT: usize = 64;
 
 const _: () = assert!(STREAM_COUNT <= u8::MAX as u32 + 1);
-const _: () = assert!(COMMAND_HEADER_SIZE_V4 <= u8::MAX as usize);
 
 /// A command's frame on its way to its stream's writer ([`write_stream`]), with the channel that
 /// completes the command.
 #[lore_macro::test_pub]
 struct QueuedFrame {
-    /// The frame's chunks, its header first, in the first `chunk_count`.
-    chunks: [Bytes; FRAME_CHUNKS],
-    chunk_count: u8,
+    chunks: FrameChunks,
     command_id: u32,
     reply: PendingResultSender,
     /// Whether the command waits for its answer, rather than only for its frame to be written.
@@ -1641,43 +1633,25 @@ struct QueuedFrame {
 }
 
 impl QueuedFrame {
-    /// The frame `chunks` hold, header first, of the command `command_id`, taking the chunks,
-    /// queued at `queued`.
+    /// The frame of `header` and then `body` of the command `command_id`, taking the chunks of
+    /// `body`, queued at `queued`.
     #[lore_macro::test_pub]
     fn new(
-        chunks: &mut [Bytes],
+        header: Bytes,
+        body: &mut [Bytes],
         command_id: u32,
         reply: PendingResultSender,
         await_response: bool,
         queued: Option<Instant>,
     ) -> Self {
-        let mut frame: [Bytes; FRAME_CHUNKS] = Default::default();
-        let chunk_count = chunks.len().min(FRAME_CHUNKS);
-        for (slot, chunk) in frame.iter_mut().zip(chunks.iter_mut()) {
-            *slot = std::mem::take(chunk);
-        }
-        if chunks.len() > FRAME_CHUNKS {
-            frame[FRAME_CHUNKS - 1] =
-                joined(std::iter::once(&frame[FRAME_CHUNKS - 1]).chain(&chunks[FRAME_CHUNKS..]));
-        }
         Self {
-            chunks: frame,
-            chunk_count: chunk_count as u8,
+            chunks: FrameChunks::new(header, body),
             command_id,
             reply,
             await_response,
             queued,
         }
     }
-}
-
-/// A copy of `chunks`, one after another, in one chunk.
-fn joined<'a>(chunks: impl Iterator<Item = &'a Bytes> + Clone) -> Bytes {
-    let mut joined = Vec::with_capacity(chunks.clone().map(Bytes::len).sum());
-    for chunk in chunks {
-        joined.extend_from_slice(chunk);
-    }
-    Bytes::from(joined)
 }
 
 /// What the task that writes a stream ([`write_stream`]) shares with the commands it writes for:
@@ -1688,17 +1662,13 @@ struct StreamShared {
     pending: Arc<PendingCommands>,
 }
 
-/// The frames a stream's writer has taken from its channel and not yet written in full, in the
-/// order it writes them, one after another. The writer holds the lock while it takes frames and
-/// while it writes, never across an await, so a command that takes its frame back under the lock
-/// ([`StreamQueue::take_back`]) finds it either not yet taken, or queued and not being written.
+/// The frames a stream's writer has taken from its channel and not yet written in full. The writer
+/// holds the lock while it takes frames and while it writes, never across an await, so a command
+/// that takes its frame back under the lock ([`StreamQueue::take_back`]) finds it either not yet
+/// taken, or queued and not being written.
 #[lore_macro::test_pub]
-#[derive(Default)]
 struct StreamQueue {
-    /// The chunks of `frames`, one frame's after another's. A write empties or shortens in place
-    /// the chunks it takes.
-    chunks: VecDeque<Bytes>,
-    frames: VecDeque<FrameEntry>,
+    frames: FrameQueue<FrameEntry>,
     /// When the stream is reset if the first frame, whose command was dropped part way through its
     /// write, is not yet written in full.
     finish_by: Option<tokio::time::Instant>,
@@ -1709,20 +1679,28 @@ struct StreamQueue {
     held: bool,
 }
 
-/// A frame in a [`StreamQueue`].
+/// The command of a frame in a [`StreamQueue`].
 #[lore_macro::test_pub]
 struct FrameEntry {
     command_id: u32,
-    chunk_count: u8,
-    /// The length of the frame's header, its first chunk, which keeps that length until a write
-    /// takes some of the frame.
-    header_size: u8,
     /// Completes a command that does not wait for its answer once its frame is written.
     written: Option<PendingResultSender>,
     /// Whether the frame's command was dropped part way through its write. The rest of the frame
     /// counts as a request outstanding on the stream, which [`select_stream`] balances on, until
     /// it is written or fails.
     dropped: bool,
+}
+
+impl Default for StreamQueue {
+    fn default() -> Self {
+        Self {
+            frames: FrameQueue::new(QUEUE_FRAMES_KEPT),
+            finish_by: None,
+            waker: None,
+            #[cfg(feature = "test-util")]
+            held: false,
+        }
+    }
 }
 
 impl StreamQueue {
@@ -1739,7 +1717,6 @@ impl StreamQueue {
     ) {
         let QueuedFrame {
             chunks,
-            chunk_count,
             command_id,
             reply,
             await_response,
@@ -1764,30 +1741,14 @@ impl StreamQueue {
             }
             Some(reply)
         };
-        let header_size = chunks[0].len() as u8;
-        self.chunks
-            .extend(chunks.into_iter().take(chunk_count as usize));
-        self.frames.push_back(FrameEntry {
-            command_id,
-            chunk_count,
-            header_size,
-            written,
-            dropped: false,
-        });
-    }
-
-    /// The chunks for the next write, those written included: the front part of the queue's
-    /// buffer until all of it is written, then the part after it. A frame the buffer holds in both
-    /// parts is written in two writes, which costs less than moving every chunk queued to make the
-    /// buffer one part.
-    #[lore_macro::test_pub]
-    fn unwritten(&mut self) -> &mut [Bytes] {
-        let (front, back) = self.chunks.as_mut_slices();
-        if front.iter().all(Bytes::is_empty) {
-            back
-        } else {
-            front
-        }
+        self.frames.push(
+            chunks,
+            FrameEntry {
+                command_id,
+                written,
+                dropped: false,
+            },
+        );
     }
 
     /// Takes out the frames at the front written in full, recording each as written among the
@@ -1795,45 +1756,23 @@ impl StreamQueue {
     /// rest of a dropped frame off `inflight`, the stream's count of requests outstanding.
     #[lore_macro::test_pub]
     fn pop_written(&mut self, pending: &PendingCommands, inflight: &AtomicU64) {
-        while let Some(frame) = self.frames.front()
-            && self
-                .chunks
-                .range(..frame.chunk_count as usize)
-                .all(Bytes::is_empty)
-        {
-            self.chunks.drain(..frame.chunk_count as usize);
-            let Some(frame) = self.frames.pop_front() else {
-                break;
-            };
+        let finish_by = &mut self.finish_by;
+        self.frames.pop_written(|frame| {
             pending.written(frame.command_id);
             if let Some(written) = frame.written {
                 let _ = written.send(Ok(Bytes::new()));
             }
             if frame.dropped {
                 inflight.fetch_sub(1, Ordering::Relaxed);
-                self.finish_by = None;
+                *finish_by = None;
             }
-        }
-        self.shrink_when_empty();
-    }
-
-    /// Gives back the room of an empty queue beyond [`QUEUE_FRAMES_KEPT`] frames.
-    fn shrink_when_empty(&mut self) {
-        if !self.frames.is_empty() {
-            return;
-        }
-        if self.frames.capacity() > 2 * QUEUE_FRAMES_KEPT {
-            self.frames.shrink_to(QUEUE_FRAMES_KEPT);
-        }
-        if self.chunks.capacity() > 2 * QUEUE_FRAMES_KEPT * FRAME_CHUNKS {
-            self.chunks.shrink_to(QUEUE_FRAMES_KEPT * FRAME_CHUNKS);
-        }
+        });
     }
 
     /// Fails every frame queued with `error`, as no answer will come for a frame the stream did not
     /// take in full, taking the rest of a dropped frame off `inflight`.
     fn fail(&mut self, error: &QuicClientError, pending: &PendingCommands, inflight: &AtomicU64) {
-        for frame in self.frames.drain(..) {
+        self.frames.fail(|frame| {
             pending.fail(frame.command_id, error.clone());
             if let Some(written) = frame.written {
                 let _ = written.send(Err(error.clone()));
@@ -1841,50 +1780,33 @@ impl StreamQueue {
             if frame.dropped {
                 inflight.fetch_sub(1, Ordering::Relaxed);
             }
-        }
-        self.chunks.clear();
+        });
         self.finish_by = None;
-        self.shrink_when_empty();
     }
 
     /// Takes back the frame of the command `command_id`, whose chunks may be memory its caller
     /// lends only until the command is done, when the command ends without its frame known to be
     /// written. A frame none of which is written is taken out, with the command's place among
-    /// those waiting for an answer, as none will come. A frame written in part keeps a copy of its
-    /// rest, which the writer finishes so that the next frame's header does not land inside its
-    /// payload. The rest counts as a request outstanding on `inflight`, the stream's count, until
-    /// it is written, and is given until [`FINISH_FRAME_TIMEOUT`] from now before the stream is
-    /// reset. A frame not in the queue, not yet taken from the channel or written in full, is left
-    /// alone.
+    /// those waiting for an answer, as none will come. A frame written in part is finished from a
+    /// copy of its rest ([`FrameQueue::take_back`]). The rest counts as a request outstanding on
+    /// `inflight`, the stream's count, until it is written, and is given until
+    /// [`FINISH_FRAME_TIMEOUT`] from now before the stream is reset. A frame not in the queue, not
+    /// yet taken from the channel or written in full, is left alone.
     #[lore_macro::test_pub]
     fn take_back(&mut self, command_id: u32, pending: &PendingCommands, inflight: &AtomicU64) {
-        let mut start = 0;
-        let Some(index) = self.frames.iter().position(|frame| {
-            let found = frame.command_id == command_id;
-            if !found {
-                start += frame.chunk_count as usize;
+        match self
+            .frames
+            .take_back(|frame| frame.command_id == command_id)
+        {
+            TakenBack::Absent => {}
+            TakenBack::Removed(_) => pending.remove(command_id),
+            TakenBack::Started(frame) => {
+                frame.dropped = true;
+                inflight.fetch_add(1, Ordering::Relaxed);
+                self.finish_by = Some(tokio::time::Instant::now() + finish_frame_timeout());
+                self.wake();
             }
-            found
-        }) else {
-            return;
-        };
-        let frame = &mut self.frames[index];
-        let end = start + frame.chunk_count as usize;
-        if self.chunks[start].len() == frame.header_size as usize {
-            self.chunks.drain(start..end);
-            self.frames.remove(index);
-            pending.remove(command_id);
-            return;
         }
-        let rest = joined(self.chunks.range(start..end));
-        for chunk in self.chunks.range_mut(start..end) {
-            *chunk = Bytes::new();
-        }
-        self.chunks[start] = rest;
-        frame.dropped = true;
-        inflight.fetch_add(1, Ordering::Relaxed);
-        self.finish_by = Some(tokio::time::Instant::now() + finish_frame_timeout());
-        self.wake();
     }
 
     /// Keeps the waker of `cx`, the writer's, to wake it when the queue changes other than through
@@ -1936,7 +1858,7 @@ impl Drop for QueuedCommand<'_> {
 /// Writes the frames queued on `frames` to `send`, the send half of the stream at `stream_index`,
 /// in the order they are queued, each whole, and every frame queued at once in as few writes as
 /// the stream's flow control allows, and one more where the queue's buffer wraps
-/// ([`StreamQueue::unwritten`]). Runs as a task of its own on the net runtime, without the
+/// ([`FrameQueue::unwritten`]). Runs as a task of its own on the net runtime, without the
 /// context of the command that opens the stream, as it serves every command the stream carries,
 /// until the channel is closed and every frame queued is written or failed.
 ///
@@ -1974,7 +1896,7 @@ async fn write_stream(
             }
         };
         while failed.is_none() && !queue.frames.is_empty() {
-            let written = std::pin::pin!(send.write_chunks(queue.unwritten())).poll(cx);
+            let written = std::pin::pin!(send.write_chunks(queue.frames.unwritten())).poll(cx);
             match written {
                 Poll::Ready(Ok(_)) => queue.pop_written(&stream.pending, inflight),
                 Poll::Ready(Err(err)) => {
@@ -2049,11 +1971,11 @@ fn frame_write_error(err: quinn::WriteError) -> QuicClientError {
 /// future inside the other and grow the send path. A `false` instantiation resolves as soon as the
 /// frame is written, yielding `Bytes::default()`.
 ///
-/// The command takes `chunks`, header slot first, as its frame, and queues it for the stream's
-/// writer ([`write_stream`]), which writes it on the net runtime, after the frames queued before
-/// it, and completes the command. Queuing the frame takes no lock the stream's writer holds. The
-/// command takes that lock only when it ends without its frame known to be written
-/// ([`QueuedCommand`]).
+/// The command takes the chunks of `chunks` after its first, the header's slot, which it leaves
+/// alone, as the body of its frame, and queues the frame for the stream's writer
+/// ([`write_stream`]), which writes it on the net runtime, after the frames queued before it, and
+/// completes the command. Queuing the frame takes no lock the stream's writer holds. The command
+/// takes that lock only when it ends without its frame known to be written ([`QueuedCommand`]).
 ///
 /// A command on a stream whose reader has stopped, that the peer has stopped reading, or that a
 /// dropped frame's finish reset, fails with `Terminated`, as one on a lost connection does, so
@@ -2109,7 +2031,7 @@ pub fn send_command<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>(
                 % connection_lock.reader.len();
             let inflight = StreamInflightGuard::new(&connection.stream_inflight[stream_index]);
 
-            // Skip any previous header in case this is a resend
+            // The first chunk is the header's slot, filled in only in the queued frame.
             let total_size: usize = chunks.iter().skip(1).map(|buffer| buffer.len()).sum();
             if total_size > connection.max_chunk_size {
                 lore_debug!(
@@ -2121,20 +2043,20 @@ pub fn send_command<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>(
 
             let writer = &connection_lock.writer[stream_index];
             let command_id = writer.stream.pending.next_id();
-            if v4 {
+            let header = if v4 {
                 let header =
                     CommandHeader::new_with_session(command, command_id, total_size, session.id);
-                chunks[0] = Bytes::from_owner(header.to_bytes_v4());
+                Bytes::from_owner(header.to_bytes_v4())
             } else {
-                let header = CommandHeader::new(command, command_id, total_size);
-                chunks[0] = Bytes::from_owner(header.to_bytes());
-            }
+                Bytes::from_owner(CommandHeader::new(command, command_id, total_size).to_bytes())
+            };
             let (reply, result) = oneshot::channel();
             let queued = writer.stream.pending.observed().then(Instant::now);
             if writer
                 .frames
                 .send(QueuedFrame::new(
-                    chunks,
+                    header,
+                    chunks.get_mut(1..).unwrap_or_default(),
                     command_id,
                     reply,
                     AWAIT_RESPONSE,

@@ -45,20 +45,20 @@ pub struct MessageHandling {
 /// How long sending one response took.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ResponseWrite {
-    /// Time waiting for the stream, which another response's write may be holding.
-    pub lock_wait: Duration,
-    /// Time handing the response to the transport with the stream held. The transport takes data
-    /// only as the peer's flow-control credit and its own send buffer allow, so this includes
-    /// waiting for both.
+    /// Time from the response being queued for its stream's writer until the writer takes it.
+    pub queue: Duration,
+    /// Time from the writer taking the response until it is written in full, including waiting
+    /// behind the responses queued before it. The transport takes data only as the peer's
+    /// flow-control credit and its own send buffer allow, so this includes waiting for both.
     pub write: Duration,
     /// Bytes of the response, its header included.
     pub bytes: usize,
 }
 
 impl ResponseWrite {
-    /// Whether waiting for the stream or writing took longer than `threshold`.
+    /// Whether waiting for the writer or writing took longer than `threshold`.
     pub fn exceeds(&self, threshold: Duration) -> bool {
-        self.lock_wait.max(self.write) > threshold
+        self.queue.max(self.write) > threshold
     }
 }
 
@@ -173,7 +173,7 @@ impl InstrumentProvider for StreamHandlerInstrumentProvider {
 
 struct StreamHandlerInstruments {
     latency_histogram: Histogram<f64>,
-    response_lock_wait_histogram: Histogram<f64>,
+    response_queue_histogram: Histogram<f64>,
     response_write_histogram: Histogram<f64>,
     peak_pending_chunks_histogram: Histogram<u64>,
     peak_pending_chunk_stall_histogram: Histogram<u64>,
@@ -191,8 +191,8 @@ impl StreamHandlerInstruments {
 
         Self {
             latency_histogram: provider.latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME),
-            response_lock_wait_histogram: provider.latency_histogram_ms_with_boundaries(
-                "response.lock_wait_duration",
+            response_queue_histogram: provider.latency_histogram_ms_with_boundaries(
+                "response.queue_duration",
                 RESPONSE_DURATION_MS_BUCKETS.to_vec(),
             ),
             response_write_histogram: provider.latency_histogram_ms_with_boundaries(
@@ -292,8 +292,8 @@ where
         instruments
             .latency_histogram
             .record(event.elapsed.as_millis() as f64, &labels[..applicable]);
-        instruments.response_lock_wait_histogram.record(
-            event.response.lock_wait.as_secs_f64() * 1_000.,
+        instruments.response_queue_histogram.record(
+            event.response.queue.as_secs_f64() * 1_000.,
             &labels[..applicable],
         );
         instruments.response_write_histogram.record(

@@ -347,7 +347,7 @@ mod exceeds {
     fn exceeds_when_either_part_passes_the_threshold() {
         let threshold = Duration::from_millis(20);
         let waited = ResponseWrite {
-            lock_wait: Duration::from_millis(21),
+            queue: Duration::from_millis(21),
             ..ResponseWrite::default()
         };
         let wrote = ResponseWrite {
@@ -362,7 +362,7 @@ mod exceeds {
     #[test]
     fn does_not_exceed_at_the_threshold() {
         let response = ResponseWrite {
-            lock_wait: Duration::from_millis(20),
+            queue: Duration::from_millis(20),
             write: Duration::from_millis(20),
             bytes: 0,
         };

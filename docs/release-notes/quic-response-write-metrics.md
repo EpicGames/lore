@@ -2,11 +2,12 @@
 type: feature
 ---
 
-- `lore-server`: QUIC responses report how long each waited for its stream and how long it took
-  to write, as `urc.quic.stream_handler.response.lock_wait_duration` and
+- `lore-server`: QUIC responses report how long each waited for its stream's writer and how long
+  it took to write, including waiting behind earlier responses on the stream, as
+  `urc.quic.stream_handler.response.queue_duration` and
   `urc.quic.stream_handler.response.write_duration`. Both are labelled like the handler's
-  operation duration, by opcode and outcome. Writing includes
-  waiting for the client's flow-control credit and the congestion window. A response that waits
+  operation duration, by opcode and outcome. Writing includes waiting for the client's
+  flow-control credit and the congestion window. A response that waits
   or writes for longer than `slow_send_threshold_ms`, set in `[server.quic]` or
   `[server.quic_internal]`, is logged with the connection's congestion window and round-trip
   time, rate limited across the process. Neither endpoint logs any response unless it is set.

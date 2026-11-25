@@ -7,7 +7,6 @@ use ::quinn::ReadError;
 use ::quinn::ReadExactError;
 use ::quinn::RecvStream;
 use ::quinn::SendStream;
-use ::quinn::WriteError;
 use async_trait::async_trait;
 use bytes::Bytes;
 use lore_transport::quic::QuicErrorStatus;
@@ -50,8 +49,6 @@ pub enum StreamHandlerError {
     EndOfStream(usize, usize),
     #[error("Stream operation failed: {0}")]
     UnknownStream(ClosedStream),
-    #[error("Write failed: {0}")]
-    WriteFailed(WriteError),
 }
 
 #[async_trait]

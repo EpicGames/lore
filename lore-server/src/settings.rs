@@ -673,8 +673,8 @@ pub struct QuicSettings {
     /// How long a request may wait for one of the `stream_message_limit` permits before the
     /// server answers `SlowDown`. Defaults to roughly one round trip, 100ms.
     pub permit_timeout_ms: Option<u64>,
-    /// How long a response may wait for its stream, or take to write, before the server logs it
-    /// as slow. Unset, no response is logged. The log is rate limited; the response metrics
+    /// How long a response may wait for its stream's writer, or take to write, before the server
+    /// logs it as slow. Unset, no response is logged. The log is rate limited; the response metrics
     /// record every response either way.
     pub slow_send_threshold_ms: Option<u64>,
 }

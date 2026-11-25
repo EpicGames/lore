@@ -3,6 +3,7 @@
 
 mod chunking;
 mod client;
+mod frame_queue;
 mod net_runtime;
 mod response_observer;
 mod response_reader;

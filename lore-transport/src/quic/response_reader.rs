@@ -79,6 +79,7 @@ impl PendingCommands {
     /// stream's writer at `queued`, in the map, and answers whether it stays there. Once the reader
     /// has stopped, nothing would read the answer, so the command is taken out again and fails with
     /// `Terminated`. A command queued without a time is not observed.
+    #[lore_macro::test_pub]
     pub(crate) fn wait_for(
         &self,
         command_id: u32,
@@ -198,11 +199,13 @@ impl ResponseReader {
 }
 
 /// The connection a stream belongs to and its index there, as its response observer sees them.
+#[lore_macro::test_pub]
 struct StreamIdentity {
     connection: quinn::Connection,
     index: usize,
 }
 
+#[lore_macro::test_pub]
 async fn read_response(
     mut stream: quinn::RecvStream,
     max_chunk_size: usize,
@@ -224,6 +227,11 @@ async fn read_response(
     let mut responses = Vec::new();
 
     loop {
+        // quinn's reads never use tokio's budget, so while the stream keeps data buffered this
+        // loop would not return, holding its net worker and keeping the tasks waiting to run
+        // there, such as the connection's stream writers, from running. Taken before the read, so
+        // a chunk's arrival is timed from when it is read.
+        tokio::task::consume_budget().await;
         let mut next_chunk = match stream.read_chunk(max_chunk_size, false).await {
             Ok(chunk) => chunk,
             Err(err) => {
@@ -303,6 +311,9 @@ async fn read_response(
                 {
                     observer.observe(&observed, &identity.connection);
                 }
+
+                // A chunk can carry thousands of responses.
+                tokio::task::consume_budget().await;
             } else {
                 return Err(QuicClientError::UnexpectedCommand(response.header));
             }

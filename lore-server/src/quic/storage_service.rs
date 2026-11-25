@@ -57,7 +57,6 @@ use crate::telemetry::Transport;
 /// between v0 (`LoreStorageService`) and v4 (`StorageServiceV4`); the caller
 /// passes its `StorageProtocol` so v0 and v4 are distinguishable in traces via
 /// the `protocol` attribute.
-#[lore_macro::test_pub]
 pub(crate) fn build_storage_protocol_request_span(
     cmd: QuicOpCode,
     protocol: StorageProtocol,
