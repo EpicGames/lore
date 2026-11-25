@@ -3,9 +3,9 @@ lep: 2026-11-19-repository-rename
 title: Repository rename
 authors:
   - Hannes Muurinen
-status: Draft
+status: Accepted
 created: 2026-11-19
-updated: 2026-11-19
+updated: 2026-11-25
 ---
 
 # Repository rename
