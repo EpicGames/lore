@@ -9,7 +9,6 @@ name = "lore_revision"
 test = false
 
 [dependencies]
-async-stream = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bitcode = { workspace = true }
@@ -21,35 +20,25 @@ crossbeam-queue = { workspace = true }
 crossbeam-utils = { workspace = true }
 dashmap = { workspace = true }
 diffy = { workspace = true }
-fastcdc = { workspace = true }
 futures = { workspace = true }
 glob-match = { workspace = true }
 governor = { workspace = true }
 hex = { workspace = true }
-http = { workspace = true }
 infer = { workspace = true }
-jsonwebtoken = { workspace = true }
 libc = { workspace = true }
 open = "5.3.2"
 opentelemetry = { workspace = true }
 parking_lot = { workspace = true }
 pin-project = { workspace = true }
-prost-types = { workspace = true }
-quinn = { workspace = true }
 rand = { workspace = true }
 ring = { workspace = true }
 rustls = { workspace = true }
-rustls-native-certs = { workspace = true }
 serde = { workspace = true }
-serde_with = { workspace = true }
 smallvec = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 toml = { workspace = true }
-tonic = { workspace = true }
-tower = { workspace = true }
 url = { workspace = true }
 lore-base = { workspace = true }
 lore-error-set = { workspace = true }

@@ -13,7 +13,6 @@ tonic = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 lore-base = { workspace = true }
-lore-storage = { workspace = true }
 lore-revision = { workspace = true }
 lore-transport = { workspace = true }
 lore-error-set = { workspace = true }

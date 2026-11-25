@@ -11,7 +11,7 @@ use futures::future::BoxFuture;
 use futures::poll;
 use lore_base::error::Disconnected;
 use lore_base::error::NotAuthorized;
-use lore_base::retry::JITTER_CLAMP_MS;
+use lore_base::retry::DEFAULT_JITTER_CLAMP_MS;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_revision::lore::RepositoryId;
 use lore_revision::protocol::RemoteConnections;
@@ -64,7 +64,7 @@ async fn callers_are_handed_a_connection_marked_stale_until_its_back_off_passes(
     let connections = RemoteConnections::with_connect(connecting);
     let repository = RepositoryId::from([7u8; 16]);
     let back_off = Duration::from_millis(RECONNECT_START_DELAY);
-    let jitter = Duration::from_millis(JITTER_CLAMP_MS);
+    let jitter = Duration::from_millis(DEFAULT_JITTER_CLAMP_MS);
 
     let first = handed_to_callers(&connections, repository).await;
     first.stale.store(true, Ordering::Relaxed);
@@ -108,7 +108,7 @@ async fn a_connection_marked_stale_after_its_back_off_is_replaced_at_once() {
     }
     let connections = RemoteConnections::with_connect(connecting);
     let repository = RepositoryId::from([7u8; 16]);
-    let after_back_off = Duration::from_millis(RECONNECT_START_DELAY + JITTER_CLAMP_MS);
+    let after_back_off = Duration::from_millis(RECONNECT_START_DELAY + DEFAULT_JITTER_CLAMP_MS);
 
     let first = handed_to_callers(&connections, repository).await;
     tokio::time::advance(after_back_off).await;
@@ -234,7 +234,7 @@ async fn a_superseded_connect_leaves_its_successor_in_place() {
     }
     let connections = RemoteConnections::with_connect(failing_then_connecting);
     let repository = RepositoryId::from([7u8; 16]);
-    let back_off = Duration::from_millis(RECONNECT_START_DELAY + JITTER_CLAMP_MS);
+    let back_off = Duration::from_millis(RECONNECT_START_DELAY + DEFAULT_JITTER_CLAMP_MS);
 
     let mut superseded = pin!(connections.connection(repository));
     assert!(poll!(superseded.as_mut()).is_pending());
@@ -267,7 +267,7 @@ async fn a_failed_connect_is_retried_once_its_back_off_passes() {
     let connections = RemoteConnections::with_connect(failing);
     let repository = RepositoryId::from([7u8; 16]);
     let back_off = Duration::from_millis(RECONNECT_START_DELAY);
-    let jitter = Duration::from_millis(JITTER_CLAMP_MS);
+    let jitter = Duration::from_millis(DEFAULT_JITTER_CLAMP_MS);
 
     for (wait, attempts) in [
         (Duration::ZERO, 1),

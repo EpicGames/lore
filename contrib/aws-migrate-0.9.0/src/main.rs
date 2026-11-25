@@ -298,7 +298,6 @@ async fn build_s3(args: &Args) -> Result<S3> {
         .maybe_region(args.region.clone())
         .with_timeout_config(operation_timeout(args))
         .build_config()
-        .await
         .with_slow_operation_threshold(slow_operation_threshold(args))
         .s3_with_path_style(args.s3_force_path_style)
         .ensure_bucket(&args.s3_bucket)
@@ -315,7 +314,6 @@ async fn build_dynamodb(args: &Args) -> Result<DynamoDb> {
         .maybe_region(args.region.clone())
         .with_timeout_config(operation_timeout(args))
         .build_config()
-        .await
         .with_slow_operation_threshold(slow_operation_threshold(args))
         .dynamodb()
         .ensure_table(&args.fragments_table)

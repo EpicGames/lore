@@ -3,7 +3,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use lore_base::types::Hash;
 use lore_proto::LockService;
+use lore_proto::lock::Resource;
+use lore_revision::lock::util::LOCK_BATCH_SIZE;
 use lore_revision::lore::RepositoryId;
 use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
@@ -29,6 +32,31 @@ fn lock_service_with(
 
 fn lock_service(lock_store: store::MockMockLockStore) -> LoreLockService {
     lock_service_with(lock_store, Arc::new(AllowAllRepositoryAuthorizer))
+}
+
+/// `count` resources on one branch, each with its own full-length hash.
+fn resources(count: usize) -> Vec<Resource> {
+    (0..count)
+        .map(|index| {
+            let mut hash = [0u8; size_of::<Hash>()];
+            hash[..size_of::<usize>()].copy_from_slice(&index.to_le_bytes());
+            Resource {
+                branch: Default::default(),
+                hash: hash.to_vec().into(),
+                description: format!("/resource/{index}"),
+            }
+        })
+        .collect()
+}
+
+/// `message` addressed to a random repository.
+fn in_repository<T>(message: T) -> Request<T> {
+    let mut request = Request::new(message);
+    request.metadata_mut().insert_bin(
+        REPOSITORY_ID_KEY,
+        tonic::metadata::BinaryMetadataValue::from_bytes(random::<RepositoryId>().data()),
+    );
+    request
 }
 
 pub(super) mod store {
@@ -69,7 +97,16 @@ pub(super) mod store {
                 repository: RepositoryId,
                 resources: &[LockResource],
             ) -> Result<Vec<LockResource>, LockError>;
+
+            fn max_lock_batch(&self) -> Option<usize>;
         }
+    }
+
+    /// A store naming `limit` as the most resources it takes in one request.
+    pub fn with_limit(limit: Option<usize>) -> MockMockLockStore {
+        let mut lock_store = MockMockLockStore::new();
+        lock_store.expect_max_lock_batch().return_const(limit);
+        lock_store
     }
 }
 
@@ -89,7 +126,7 @@ mod lock {
     #[tokio::test]
     async fn locks_in_the_local_store_when_lock_lock_is_not_enabled() {
         let repository = random::<RepositoryId>();
-        let mut lock_store = store::MockMockLockStore::new();
+        let mut lock_store = store::with_limit(None);
         lock_store
             .expect_lock_resources()
             .withf(move |owner, repo, resources| {
@@ -148,7 +185,7 @@ mod lock {
             })))
         });
         let lock_service = lock_service_forwarding(
-            store::MockMockLockStore::new(),
+            store::with_limit(None),
             Arc::new(AllowAllRepositoryAuthorizer),
             every_rpc(),
             client,
@@ -199,10 +236,31 @@ mod lock {
 
         assert!(response.into_inner().locks.is_empty());
     }
+
+    #[tokio::test]
+    async fn a_lock_past_the_store_limit_is_refused_without_forwarding() {
+        let lock_service = lock_service_forwarding(
+            store::with_limit(Some(2)),
+            Arc::new(AllowAllRepositoryAuthorizer),
+            every_rpc(),
+            MockLockClient::new(),
+        );
+
+        let refused = lock_service
+            .lock(from_caller(
+                LockRequest {
+                    resources: resources(3),
+                },
+                random::<RepositoryId>(),
+            ))
+            .await
+            .expect_err("a lock past the store's limit is refused");
+
+        assert_eq!(refused.code(), Code::OutOfRange);
+    }
 }
 
 mod status {
-    use lore_proto::lock::Resource;
     use lore_proto::lock::StatusRequest;
     use lore_proto::lock::StatusResponse;
     use lore_server::grpc::forwarded_requests::CallerContext;
@@ -214,67 +272,109 @@ mod status {
 
     #[tokio::test]
     async fn resource_count_exceeds_limit() {
-        let lock_store = super::store::MockMockLockStore::new();
-
-        let lock_service = super::lock_service(lock_store);
-
-        let resources: Vec<Resource> = (0..101)
-            .map(|_| Resource {
-                branch: Default::default(),
-                hash: Default::default(),
-                description: "".to_string(),
-            })
-            .collect();
-
-        let mut request = Request::new(StatusRequest { resources });
-        let repository = random::<RepositoryId>();
-        request.metadata_mut().insert_bin(
-            REPOSITORY_ID_KEY,
-            tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
-        );
+        let lock_service = super::lock_service(store::with_limit(None));
 
         let error_status = lock_service
-            .status(request)
+            .status(in_repository(StatusRequest {
+                resources: resources(LOCK_BATCH_SIZE + 1),
+            }))
             .await
             .expect_err("Status should fail when resource count exceeds limit");
 
-        assert_eq!(error_status.code(), Code::InvalidArgument);
+        assert_eq!(error_status.code(), Code::OutOfRange);
     }
 
     #[tokio::test]
     async fn resource_count_at_limit() {
-        let mut lock_store = super::store::MockMockLockStore::new();
+        let mut lock_store = store::with_limit(None);
         lock_store
             .expect_check_locks_status()
             .return_once(|_, _| Ok(vec![]));
 
         let lock_service = super::lock_service(lock_store);
 
-        let resources: Vec<Resource> = (0..100)
-            .map(|_| Resource {
-                branch: Default::default(),
-                hash: Default::default(),
-                description: "".to_string(),
-            })
-            .collect();
-
-        let mut request = Request::new(StatusRequest { resources });
-        let repository = random::<RepositoryId>();
-        request.metadata_mut().insert_bin(
-            REPOSITORY_ID_KEY,
-            tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
-        );
-
         let _ = lock_service
-            .status(request)
+            .status(in_repository(StatusRequest {
+                resources: resources(LOCK_BATCH_SIZE),
+            }))
             .await
             .expect("Status should succeed when resource count is at limit");
+    }
+
+    /// A resource is keyed by branch and hash; two entries differing only in description name one
+    /// lock.
+    #[tokio::test]
+    async fn a_resource_named_twice_is_refused() {
+        let lock_service = super::lock_service(store::with_limit(None));
+
+        let mut duplicated = resources(1);
+        duplicated.push(Resource {
+            description: "/another/name.txt".to_owned(),
+            ..duplicated[0].clone()
+        });
+
+        let refused = lock_service
+            .status(in_repository(StatusRequest {
+                resources: duplicated,
+            }))
+            .await
+            .expect_err("a batch naming one key twice is refused");
+
+        assert_eq!(refused.code(), Code::InvalidArgument);
+    }
+
+    /// A hash shorter than a full hash converts to the default hash, so two different short hashes
+    /// name one key.
+    #[tokio::test]
+    async fn short_hashes_naming_one_key_are_refused_as_duplicates() {
+        let lock_service = super::lock_service(store::with_limit(None));
+
+        let short = |byte: u8| Resource {
+            branch: Default::default(),
+            hash: vec![byte].into(),
+            description: format!("/short/{byte}"),
+        };
+
+        let refused = lock_service
+            .status(in_repository(StatusRequest {
+                resources: vec![short(1), short(2)],
+            }))
+            .await
+            .expect_err("two hashes the store reads as one key are refused");
+
+        assert_eq!(refused.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn the_limit_follows_what_the_store_reports() {
+        let mut lock_store = store::with_limit(Some(2));
+        lock_store
+            .expect_check_locks_status()
+            .return_once(|_, _| Ok(vec![]));
+
+        let lock_service = super::lock_service(lock_store);
+
+        lock_service
+            .status(in_repository(StatusRequest {
+                resources: resources(2),
+            }))
+            .await
+            .expect("the store's own limit is accepted");
+
+        let refused = lock_service
+            .status(in_repository(StatusRequest {
+                resources: resources(3),
+            }))
+            .await
+            .expect_err("one past the store's limit is refused");
+
+        assert_eq!(refused.code(), Code::OutOfRange);
     }
 
     #[tokio::test]
     async fn reads_the_local_store_when_lock_status_is_not_enabled() {
         let repository = random::<RepositoryId>();
-        let mut lock_store = store::MockMockLockStore::new();
+        let mut lock_store = store::with_limit(None);
         lock_store
             .expect_check_locks_status()
             .withf(move |repo, resources| *repo == repository && resources.len() == 1)
@@ -311,7 +411,7 @@ mod status {
             Ok(Ok(Response::new(StatusResponse { locks: vec![] })))
         });
         let lock_service = lock_service_forwarding(
-            store::MockMockLockStore::new(),
+            store::with_limit(None),
             Arc::new(AllowAllRepositoryAuthorizer),
             every_rpc(),
             client,
@@ -339,7 +439,7 @@ mod status {
     async fn resource_count_over_the_limit_is_refused_without_forwarding() {
         let repository = random::<RepositoryId>();
         let lock_service = lock_service_forwarding(
-            store::MockMockLockStore::new(),
+            store::with_limit(None),
             Arc::new(AllowAllRepositoryAuthorizer),
             every_rpc(),
             MockLockClient::new(),
@@ -351,7 +451,7 @@ mod status {
             .await
             .expect_err("status over the resource limit should fail");
 
-        assert_eq!(err.code(), Code::InvalidArgument);
+        assert_eq!(err.code(), Code::OutOfRange);
     }
 
     #[tokio::test]
@@ -375,6 +475,131 @@ mod status {
     }
 }
 
+/// Lock, unlock and admin lock refuse an oversized request and a repeated key before asking the
+/// store to apply it.
+mod resource_checks {
+    use lore_proto::lock::AdminLockRequest;
+    use lore_proto::lock::LockRequest;
+    use lore_proto::lock::UnlockRequest;
+
+    use super::*;
+
+    /// Two resources naming one key under different descriptions.
+    fn duplicated() -> Vec<Resource> {
+        let mut repeated = resources(2);
+        repeated[1].hash = repeated[0].hash.clone();
+        repeated
+    }
+
+    /// An admin lock of `resources` from a caller granted `migrate`, which the service checks
+    /// before it looks at the resources.
+    fn migrating_admin_lock(resources: Vec<Resource>) -> Request<AdminLockRequest> {
+        let repository = random::<RepositoryId>();
+        actions::request_with_token(
+            AdminLockRequest {
+                resources,
+                owner: "someone".to_string(),
+            },
+            repository,
+            Some(actions::token_granting(repository, &["migrate"])),
+        )
+    }
+
+    #[tokio::test]
+    async fn lock_past_the_store_limit_is_out_of_range() {
+        let lock_service = super::lock_service(store::with_limit(Some(2)));
+
+        let refused = lock_service
+            .lock(in_repository(LockRequest {
+                resources: resources(3),
+            }))
+            .await
+            .expect_err("a lock request past the store's limit is refused");
+
+        assert_eq!(refused.code(), Code::OutOfRange);
+    }
+
+    #[tokio::test]
+    async fn lock_past_the_default_limit_is_out_of_range() {
+        let lock_service = super::lock_service(store::with_limit(None));
+
+        let refused = lock_service
+            .lock(in_repository(LockRequest {
+                resources: resources(LOCK_BATCH_SIZE + 1),
+            }))
+            .await
+            .expect_err("a lock request past the default limit is refused");
+
+        assert_eq!(refused.code(), Code::OutOfRange);
+    }
+
+    #[tokio::test]
+    async fn lock_naming_one_key_twice_is_refused() {
+        let lock_service = super::lock_service(store::with_limit(None));
+
+        let refused = lock_service
+            .lock(in_repository(LockRequest {
+                resources: duplicated(),
+            }))
+            .await
+            .expect_err("a lock request naming one key twice is refused");
+
+        assert_eq!(refused.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn unlock_past_the_store_limit_is_out_of_range() {
+        let lock_service = super::lock_service(store::with_limit(Some(2)));
+
+        let refused = lock_service
+            .unlock(in_repository(UnlockRequest {
+                resources: resources(3),
+            }))
+            .await
+            .expect_err("an unlock request past the store's limit is refused");
+
+        assert_eq!(refused.code(), Code::OutOfRange);
+    }
+
+    #[tokio::test]
+    async fn unlock_naming_one_key_twice_is_refused() {
+        let lock_service = super::lock_service(store::with_limit(None));
+
+        let refused = lock_service
+            .unlock(in_repository(UnlockRequest {
+                resources: duplicated(),
+            }))
+            .await
+            .expect_err("an unlock request naming one key twice is refused");
+
+        assert_eq!(refused.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn admin_lock_past_the_store_limit_is_out_of_range() {
+        let lock_service = lock_service_with(store::with_limit(Some(2)), actions::tier1());
+
+        let refused = lock_service
+            .admin_lock(migrating_admin_lock(resources(3)))
+            .await
+            .expect_err("an admin lock request past the store's limit is refused");
+
+        assert_eq!(refused.code(), Code::OutOfRange);
+    }
+
+    #[tokio::test]
+    async fn admin_lock_naming_one_key_twice_is_refused() {
+        let lock_service = lock_service_with(store::with_limit(None), actions::tier1());
+
+        let refused = lock_service
+            .admin_lock(migrating_admin_lock(duplicated()))
+            .await
+            .expect_err("an admin lock request naming one key twice is refused");
+
+        assert_eq!(refused.code(), Code::InvalidArgument);
+    }
+}
+
 mod unlock {
     use lore_proto::lock::AdminLockRequest;
     use lore_proto::lock::ForwardedUnlockRequest;
@@ -392,7 +617,7 @@ mod unlock {
 
     #[tokio::test]
     async fn lock_zero_resources() {
-        let lock_store = super::store::MockMockLockStore::new();
+        let lock_store = store::with_limit(None);
 
         let lock_service = super::lock_service(lock_store);
 
@@ -411,7 +636,7 @@ mod unlock {
 
     #[tokio::test]
     async fn unlock_zero_resources() {
-        let lock_store = super::store::MockMockLockStore::new();
+        let lock_store = store::with_limit(None);
 
         let lock_service = super::lock_service(lock_store);
 
@@ -430,7 +655,7 @@ mod unlock {
 
     #[tokio::test]
     async fn status_zero_resources() {
-        let lock_store = super::store::MockMockLockStore::new();
+        let lock_store = store::with_limit(None);
 
         let lock_service = super::lock_service(lock_store);
 
@@ -451,7 +676,7 @@ mod unlock {
     /// empty admin lock is refused without the action like any other.
     #[tokio::test]
     async fn admin_lock_checks_migrate_before_the_empty_short_circuit() {
-        let lock_store = super::store::MockMockLockStore::new();
+        let lock_store = store::with_limit(None);
 
         let lock_service = super::lock_service(lock_store);
 
@@ -474,7 +699,7 @@ mod unlock {
 
     #[tokio::test]
     async fn unlock_fails_for_other_owner() {
-        let mut lock_store = super::store::MockMockLockStore::new();
+        let mut lock_store = store::with_limit(None);
         lock_store
             .expect_unlock_resources()
             .return_once(|_, _, _, _| Err(lore_base::error::LockNotOwned.into()));
@@ -505,7 +730,7 @@ mod unlock {
     #[tokio::test]
     async fn unlocks_in_the_local_store_when_lock_unlock_is_not_enabled() {
         let repository = random::<RepositoryId>();
-        let mut lock_store = store::MockMockLockStore::new();
+        let mut lock_store = store::with_limit(None);
         lock_store
             .expect_unlock_resources()
             .withf(move |owner, validate_user, repo, resources| {
@@ -546,7 +771,7 @@ mod unlock {
             })))
         });
         let lock_service = lock_service_forwarding(
-            store::MockMockLockStore::new(),
+            store::with_limit(None),
             Arc::new(AllowAllRepositoryAuthorizer),
             every_rpc(),
             client,
@@ -590,6 +815,28 @@ mod unlock {
 
         assert!(response.into_inner().resources.is_empty());
     }
+
+    #[tokio::test]
+    async fn an_unlock_past_the_store_limit_is_refused_without_forwarding() {
+        let lock_service = lock_service_forwarding(
+            store::with_limit(Some(2)),
+            Arc::new(AllowAllRepositoryAuthorizer),
+            every_rpc(),
+            MockLockClient::new(),
+        );
+
+        let refused = lock_service
+            .unlock(from_caller(
+                UnlockRequest {
+                    resources: resources(3),
+                },
+                random::<RepositoryId>(),
+            ))
+            .await
+            .expect_err("an unlock past the store's limit is refused");
+
+        assert_eq!(refused.code(), Code::OutOfRange);
+    }
 }
 
 mod cancelled_request {
@@ -624,11 +871,11 @@ mod cancelled_request {
         cancellation
     }
 
-    /// A cancelled lock answers CANCELLED without reaching the lock store, which the mock
+    /// A cancelled lock answers CANCELLED without asking the lock store for a lock, which the mock
     /// refuses.
     #[tokio::test]
     async fn a_cancelled_lock_takes_no_lock() {
-        let lock_service = super::lock_service(super::store::MockMockLockStore::new());
+        let lock_service = super::lock_service(super::store::with_limit(None));
 
         let status = with_request_cancellation(
             cancelled(),
@@ -641,11 +888,11 @@ mod cancelled_request {
         assert_eq!(status.code(), Code::Cancelled, "{status:?}");
     }
 
-    /// A cancelled unlock answers CANCELLED without reaching the lock store, which the mock
+    /// A cancelled unlock answers CANCELLED without asking the lock store to unlock, which the mock
     /// refuses.
     #[tokio::test]
     async fn a_cancelled_unlock_releases_no_lock() {
-        let lock_service = super::lock_service(super::store::MockMockLockStore::new());
+        let lock_service = super::lock_service(super::store::with_limit(None));
 
         let status = with_request_cancellation(
             cancelled(),
@@ -676,7 +923,7 @@ mod actions {
     use super::*;
 
     /// Tier 1, reading the actions from a dotted global claim.
-    fn tier1() -> Arc<dyn RepositoryAuthorizer> {
+    pub(super) fn tier1() -> Arc<dyn RepositoryAuthorizer> {
         Arc::new(GlobalGrantsAuthorizer::new(
             Some("realm_access.roles".to_string()),
             vec![Action::Read, Action::Write],
@@ -697,7 +944,7 @@ mod actions {
 
     /// A token granting `actions` in the shape both tiers read: globally
     /// under `realm_access.roles`, and per-repository under `resources`.
-    fn token_granting(repository: RepositoryId, actions: &[&str]) -> AuthorizationToken {
+    pub(super) fn token_granting(repository: RepositoryId, actions: &[&str]) -> AuthorizationToken {
         let serde_json::Value::Object(extra) = json!({ "realm_access": { "roles": actions } })
         else {
             unreachable!()
@@ -713,7 +960,7 @@ mod actions {
         }
     }
 
-    fn request_with_token<T>(
+    pub(super) fn request_with_token<T>(
         message: T,
         repository: RepositoryId,
         token: Option<AuthorizationToken>,
@@ -733,7 +980,7 @@ mod actions {
     /// The store records the `validate_user` flag it was called with,
     /// which is what elevation waives.
     fn store_expecting_validate_user(validate: bool) -> store::MockMockLockStore {
-        let mut lock_store = store::MockMockLockStore::new();
+        let mut lock_store = store::with_limit(None);
         lock_store
             .expect_unlock_resources()
             .withf(move |_, validate_user, _, _| *validate_user == validate)
@@ -813,7 +1060,7 @@ mod actions {
                     })))
                 });
             let lock_service = super::forwarding::lock_service_forwarding(
-                store::MockMockLockStore::new(),
+                store::with_limit(None),
                 tier2(),
                 super::forwarding::every_rpc(),
                 client,
@@ -873,7 +1120,7 @@ mod actions {
     async fn admin_lock_requires_migrate_on_both_tiers() {
         for tier in [tier1(), tier2()] {
             let repository = random::<RepositoryId>();
-            let mut lock_store = store::MockMockLockStore::new();
+            let mut lock_store = store::with_limit(None);
             lock_store
                 .expect_lock_resources()
                 .return_once(|_, _, _| Ok(vec![]));
@@ -938,7 +1185,7 @@ mod actions {
             .await
             .unwrap();
 
-        let lock_service = super::lock_service(store::MockMockLockStore::new());
+        let lock_service = super::lock_service(store::with_limit(None));
         let denied = lock_service
             .admin_lock(request_with_token(
                 AdminLockRequest {

@@ -1,9 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use aws_config::BehaviorVersion;
-use aws_smithy_http_client::Builder as HttpClientBuilder;
-use aws_smithy_http_client::tls;
-use aws_smithy_http_client::tls::rustls_provider::CryptoMode;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::resource::Resource;
 use opentelemetry_sdk::resource::ResourceDetector;
@@ -11,12 +7,14 @@ use opentelemetry_semantic_conventions::resource::CLOUD_PROVIDER;
 use opentelemetry_semantic_conventions::resource::CLOUD_REGION;
 use tokio::runtime::Handle;
 
-use crate::net_http_client::NetHttpClient;
+use crate::aws::http::HttpClient;
+use crate::aws::imds::ImdsProvider;
+use crate::aws::resolve_region;
 
 /// Resource detector for AWS cloud environment.
 ///
-/// Detects AWS-specific resource attributes like cloud provider and region
-/// by loading AWS configuration from the environment.
+/// Reports the cloud provider and region, reading the region from the environment variables and,
+/// when they name none, from the instance metadata service.
 pub struct AWSResourceDetector {
     handle: Handle,
 }
@@ -24,86 +22,46 @@ pub struct AWSResourceDetector {
 impl AWSResourceDetector {
     /// Creates a new AWS resource detector with the given tokio runtime handle.
     ///
-    /// The handle is used to execute async AWS SDK calls within the synchronous
-    /// `detect()` method.
+    /// The handle is used to execute the async IMDS lookup within the synchronous `detect()` method,
+    /// which is the fallback when the environment names no region.
     pub fn new(handle: Handle) -> Self {
         Self { handle }
+    }
+
+    /// The region, from the environment or — on EC2, where the environment often says nothing — from
+    /// the instance metadata service.
+    ///
+    /// IMDS is worth the round trip here and nowhere else in this client: this runs once while
+    /// telemetry is built, and without it an EC2 deployment that configures no region loses its
+    /// `cloud.region` attribute entirely.
+    fn region(&self) -> Option<String> {
+        if let Some(region) = resolve_region(None) {
+            return Some(region);
+        }
+
+        let http = HttpClient::for_metadata().ok()?;
+
+        // `ResourceDetector::detect` is a synchronous trait method. It runs once while telemetry
+        // is built, before the server serves anything, so no other core is waiting on this one.
+        #[allow(clippy::disallowed_methods)]
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(async { ImdsProvider::new(http).region().await })
+        })
     }
 }
 
 impl ResourceDetector for AWSResourceDetector {
     fn detect(&self) -> Resource {
-        let http_client = HttpClientBuilder::new()
-            .tls_provider(tls::Provider::Rustls(CryptoMode::Ring))
-            .build_https();
-        // `ResourceDetector::detect` is a synchronous trait method. It runs once while telemetry
-        // is built, before the server serves anything, so no other core is waiting on this one.
-        #[allow(clippy::disallowed_methods)]
-        let config = tokio::task::block_in_place(|| {
-            self.handle.block_on(
-                aws_config::defaults(BehaviorVersion::latest())
-                    .http_client(NetHttpClient::new(http_client))
-                    .load(),
-            )
-        });
-
         let mut attributes = vec![];
 
-        if let Some(region) = config.region() {
+        if let Some(region) = self.region() {
             attributes.push(KeyValue::new(CLOUD_PROVIDER, "aws"));
-            attributes.push(KeyValue::new(CLOUD_REGION, region.to_string()));
+            attributes.push(KeyValue::new(CLOUD_REGION, region));
         }
 
         Resource::builder_empty()
             .with_attributes(attributes)
             .build()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use opentelemetry::Key;
-    use opentelemetry::Value;
-    use serial_test::serial;
-
-    use super::*;
-
-    #[serial]
-    fn test_aws_resource_detector_with_env_vars() {
-        temp_env::with_vars([("AWS_REGION", Some("us-east-2"))], || {
-            let detector = AWSResourceDetector::new(Handle::current());
-            let resource = detector.detect();
-
-            assert_eq!(
-                resource.get(&Key::from_static_str(CLOUD_PROVIDER)),
-                Some(Value::from("aws"))
-            );
-            assert_eq!(
-                resource.get(&Key::from_static_str(CLOUD_REGION)),
-                Some(Value::from("us-east-2"))
-            );
-        });
-    }
-
-    #[serial]
-    fn test_aws_resource_detector_with_missing_env_vars() {
-        // Unset all AWS-related env vars and point config files to non-existent paths
-        temp_env::with_vars(
-            [
-                ("AWS_REGION", None),
-                ("AWS_DEFAULT_REGION", None),
-                ("AWS_CONFIG_FILE", Some("/dev/null")),
-                ("AWS_SHARED_CREDENTIALS_FILE", Some("/dev/null")),
-            ],
-            || {
-                let detector = AWSResourceDetector::new(Handle::current());
-                let resource = detector.detect();
-
-                assert!(
-                    resource.is_empty(),
-                    "AWS resource is not empty: {resource:?}"
-                );
-            },
-        );
     }
 }

@@ -48,3 +48,42 @@ fn fold_batch_results_reports_no_error_without_batches() {
     assert_eq!(num_success, 0);
     assert!(first_error.is_none());
 }
+
+fn environment_with_lock_batch(max_lock_batch: Option<usize>) -> lore_transport::EnvironmentConfig {
+    lore_transport::EnvironmentConfig {
+        config: Some(lore_transport::types::EnvironmentServerConfig {
+            max_lock_batch,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn lock_batch_size_is_the_default_without_an_advertised_limit() {
+    assert_eq!(
+        lock_batch_size(&lore_transport::EnvironmentConfig::default()),
+        LOCK_BATCH_SIZE
+    );
+    assert_eq!(
+        lock_batch_size(&environment_with_lock_batch(None)),
+        LOCK_BATCH_SIZE
+    );
+}
+
+#[test]
+fn lock_batch_size_reads_zero_as_no_advertised_limit() {
+    assert_eq!(
+        lock_batch_size(&environment_with_lock_batch(Some(0))),
+        LOCK_BATCH_SIZE
+    );
+}
+
+#[test]
+fn lock_batch_size_is_the_advertised_limit() {
+    assert_eq!(lock_batch_size(&environment_with_lock_batch(Some(25))), 25);
+    assert_eq!(
+        lock_batch_size(&environment_with_lock_batch(Some(LOCK_BATCH_SIZE * 2))),
+        LOCK_BATCH_SIZE * 2
+    );
+}

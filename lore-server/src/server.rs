@@ -33,6 +33,7 @@ use lore_base::version::LORE_LIBRARY_VERSION;
 use lore_revision::cluster::topology::Topology;
 use lore_revision::environment::EnvironmentConfig;
 use lore_revision::lock::LockStore;
+use lore_revision::lock::util::store_lock_batch_size;
 use lore_revision::notification::NotificationSender;
 use lore_revision::runtime::execution_context;
 use lore_revision::store::composite::CompositeStore;
@@ -462,6 +463,47 @@ pub fn compiled_features() -> Vec<String> {
     features
 }
 
+/// Narrow a configured batch limit to what the store behind it will actually take.
+///
+/// Whatever configuration asked for, a store that applies a request atomically only up to some size
+/// cannot be handed more than that. `0` is what the wire uses for "unset", so it reads as no
+/// configured limit rather than as a limit of nothing.
+fn narrow_to_store_limit(configured: &mut Option<usize>, limit: usize) {
+    let previous = configured.unwrap_or_default();
+
+    *configured = Some(if previous == 0 {
+        limit
+    } else {
+        limit.min(previous)
+    });
+}
+
+/// Narrow the batch limits `environment` advertises to what its stores take.
+///
+/// `query_limit`, when given, narrows the query limit. A lock store narrows the lock limit to
+/// [`store_lock_batch_size`] for it, including when the store names no limit of its own.
+#[lore_macro::test_pub]
+fn narrow_environment_to_stores(
+    environment: &mut EnvironmentConfig,
+    query_limit: Option<usize>,
+    lock_store: Option<&dyn LockStore>,
+) {
+    let lock_limit = lock_store.map(store_lock_batch_size);
+
+    if query_limit.is_none() && lock_limit.is_none() {
+        return;
+    }
+
+    let config = environment.config.get_or_insert_default();
+
+    if let Some(limit) = query_limit {
+        narrow_to_store_limit(&mut config.max_query_batch, limit);
+    }
+    if let Some(limit) = lock_limit {
+        narrow_to_store_limit(&mut config.max_lock_batch, limit);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn launch_grpc_server(
     immutable_store: Arc<dyn ImmutableStore>,
@@ -519,17 +561,11 @@ async fn launch_grpc_server(
     let mut environment = settings.environment.clone().unwrap_or_default();
     let feature = settings.feature.clone().unwrap_or_default();
 
-    // Enforce store limits
-    if let Some(limit) = immutable_store.max_query_batch() {
-        let mut config = environment.config.unwrap_or_default();
-        let previous_limit = config.max_query_batch.unwrap_or_default();
-        config.max_query_batch = Some(if previous_limit == 0 || limit < previous_limit {
-            limit
-        } else {
-            previous_limit
-        });
-        environment.config = Some(config);
-    }
+    narrow_environment_to_stores(
+        &mut environment,
+        immutable_store.max_query_batch(),
+        lock_store.as_deref(),
+    );
 
     GrpcServerBuilder::new()
         .with_environment(environment)

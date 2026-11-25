@@ -87,3 +87,27 @@ fn an_advertised_identity_claim_is_ignored() {
         })
     );
 }
+
+fn environment_advertising(config: proto::Config) -> EnvironmentConfig {
+    proto::Environment {
+        endpoint: None,
+        config: Some(config),
+        oidc: None,
+    }
+    .into()
+}
+
+#[test]
+fn an_advertised_lock_batch_limit_maps_to_some() {
+    let environment = environment_advertising(proto::Config {
+        max_lock_batch: 42,
+        ..Default::default()
+    });
+    assert_eq!(environment.max_lock_batch(), Some(42));
+}
+
+#[test]
+fn a_zero_lock_batch_limit_maps_to_none() {
+    let environment = environment_advertising(proto::Config::default());
+    assert_eq!(environment.max_lock_batch(), None);
+}

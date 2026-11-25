@@ -122,9 +122,10 @@ mod lock_handler {
     use lore_proto::lock::LockRequest;
     use lore_server::grpc::forwarded_lock_service::lock_handler;
     use rand::random;
+    use tonic::Code;
 
     use super::*;
-    use crate::grpc::lock_service::store::MockMockLockStore;
+    use crate::grpc::lock_service::store::with_limit;
     use crate::notification::testing::MockNotificationSender;
 
     /// The peer locks as the forwarded caller, in the forwarded repository,
@@ -132,7 +133,7 @@ mod lock_handler {
     #[tokio::test]
     async fn locks_for_the_forwarded_caller_and_announces_the_locks() {
         let repository = random::<RepositoryId>();
-        let mut lock_store = MockMockLockStore::new();
+        let mut lock_store = with_limit(None);
         lock_store
             .expect_lock_resources()
             .withf(move |owner, repo, resources| {
@@ -175,6 +176,22 @@ mod lock_handler {
             .collect();
         assert_eq!(owners, vec!["alice".to_string()]);
     }
+
+    /// The peer refuses a lock its own store cannot take, whatever the forwarding server checked.
+    #[tokio::test]
+    async fn a_lock_past_the_store_limit_is_refused() {
+        let resources = (0..3).flat_map(|_| one_resource()).collect();
+
+        let err = lock_handler(
+            forwarded(random::<RepositoryId>(), LockRequest { resources }),
+            &with_limit(Some(2)),
+            &MockNotificationSender::new(),
+        )
+        .await
+        .expect_err("a lock past the store's limit should fail");
+
+        assert_eq!(err.code(), Code::OutOfRange);
+    }
 }
 
 mod status_handler {
@@ -185,7 +202,7 @@ mod status_handler {
     use tonic::Code;
 
     use super::*;
-    use crate::grpc::lock_service::store::MockMockLockStore;
+    use crate::grpc::lock_service::store::with_limit;
 
     /// The peer bounds the resources it reads itself, whatever the
     /// forwarding server checked.
@@ -196,18 +213,18 @@ mod status_handler {
 
         let err = status_handler(
             forwarded(repository, StatusRequest { resources }),
-            &MockMockLockStore::new(),
+            &with_limit(None),
         )
         .await
         .expect_err("status over the resource limit should fail");
 
-        assert_eq!(err.code(), Code::InvalidArgument);
+        assert_eq!(err.code(), Code::OutOfRange);
     }
 
     #[tokio::test]
     async fn answers_from_the_store_for_the_forwarded_repository() {
         let repository = random::<RepositoryId>();
-        let mut lock_store = MockMockLockStore::new();
+        let mut lock_store = with_limit(None);
         lock_store
             .expect_check_locks_status()
             .withf(move |repo, resources| *repo == repository && resources.len() == 1)
@@ -245,9 +262,10 @@ mod unlock_handler {
     use lore_proto::lock::ForwardedUnlockRequest;
     use lore_server::grpc::forwarded_lock_service::unlock_handler;
     use rand::random;
+    use tonic::Code;
 
     use super::*;
-    use crate::grpc::lock_service::store::MockMockLockStore;
+    use crate::grpc::lock_service::store::with_limit;
     use crate::notification::testing::MockNotificationSender;
 
     /// Unless the origin marked the caller elevated, the store checks that
@@ -256,7 +274,7 @@ mod unlock_handler {
     async fn checks_ownership_unless_the_caller_is_elevated() {
         for (elevated_caller, validate) in [(false, true), (true, false)] {
             let repository = random::<RepositoryId>();
-            let mut lock_store = MockMockLockStore::new();
+            let mut lock_store = with_limit(None);
             lock_store
                 .expect_unlock_resources()
                 .withf(move |owner, validate_user, repo, _| {
@@ -284,7 +302,7 @@ mod unlock_handler {
     #[tokio::test]
     async fn announces_the_released_resources() {
         let repository = random::<RepositoryId>();
-        let mut lock_store = MockMockLockStore::new();
+        let mut lock_store = with_limit(None);
         lock_store
             .expect_unlock_resources()
             .return_once(|_, _, _, resources| Ok(resources.to_vec()));
@@ -312,5 +330,28 @@ mod unlock_handler {
         .expect("forwarded unlock should succeed");
 
         assert_eq!(response.into_inner().resources, one_resource());
+    }
+
+    /// The peer refuses an unlock its own store cannot take, whatever the forwarding server
+    /// checked.
+    #[tokio::test]
+    async fn an_unlock_past_the_store_limit_is_refused() {
+        let resources = (0..3).flat_map(|_| one_resource()).collect();
+
+        let err = unlock_handler(
+            forwarded(
+                random::<RepositoryId>(),
+                ForwardedUnlockRequest {
+                    resources,
+                    elevated_caller: false,
+                },
+            ),
+            &with_limit(Some(2)),
+            &MockNotificationSender::new(),
+        )
+        .await
+        .expect_err("an unlock past the store's limit should fail");
+
+        assert_eq!(err.code(), Code::OutOfRange);
     }
 }

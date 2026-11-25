@@ -36,7 +36,7 @@ aws ecs describe-services --cluster lore-cluster --services lore lore-edge \
 - The current stable Rust, as for Lore itself. Nothing in the tree uses a nightly feature and no toolchain is pinned.
 - An instance of this repository: the crate depends on `../../lore-aws`, `../../vendor/quinn-proto` and `../../vendor/glob-match` by path.
 - Network access for the first build, or a warm cargo cache and `--offline`.
-- AWS credentials from the standard chain.
+- AWS credentials from the environment, the ECS or EKS Pod Identity container endpoint, EKS IRSA web identity, the EC2 instance profile, or static keys in `~/.aws/credentials`, tried in that order. A profile that chains roles, runs a `credential_process` or signs in through SSO is not resolved: export its credentials into the shell first, with `eval "$(aws configure export-credentials --profile <name> --format env)"`.
 
 ## Build
 

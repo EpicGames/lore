@@ -50,6 +50,10 @@ pub struct Config {
     /// has no opinion; the client's local configuration wins.
     #[prost(enumeration = "CompressionMode", optional, tag = "2")]
     pub compression_mode: ::core::option::Option<i32>,
+    /// Maximum number of resources the server accepts in a single lock, unlock or
+    /// lock-status request. `0` or absent means no advertised limit.
+    #[prost(uint32, tag = "3")]
+    pub max_lock_batch: u32,
 }
 impl ::prost::Name for Config {
     const NAME: &'static str = "Config";

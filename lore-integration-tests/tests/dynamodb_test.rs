@@ -7,16 +7,17 @@ mod dynamo_tests {
     use std::error::Error;
     use std::sync::Arc;
 
-    use aws_sdk_dynamodb::types::AttributeValue;
-    use aws_sdk_dynamodb::types::Put;
-    use aws_sdk_dynamodb::types::ReturnValuesOnConditionCheckFailure;
-    use aws_sdk_dynamodb::types::Select;
-    use aws_sdk_dynamodb::types::TransactWriteItem;
-    use aws_sdk_s3::primitives::Blob;
     use bytes::Bytes;
+    use lore_aws::aws::item::AttributeValue;
+    use lore_aws::aws::item::ByteStr;
+    use lore_aws::aws::item::Item;
     use lore_aws::dynamodb::DynamoDbQuery;
+    use lore_aws::dynamodb::ExprNames;
+    use lore_aws::dynamodb::ExprValues;
+    use lore_aws::dynamodb::Select;
+    use lore_aws::dynamodb::TransactPut;
+    use lore_aws::dynamodb::TransactWriteItem;
     use lore_aws::store::immutable_store::FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE;
-    use lore_aws::store::immutable_store::FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE;
     use lore_aws::store::lock_store::HASH_KEY;
     use lore_aws::store::lock_store::LockEntry;
     use lore_aws::store::lock_store::REPO_BRANCH_KEY;
@@ -30,9 +31,11 @@ mod dynamo_tests {
     use tracing::warn;
     use zerocopy::IntoBytes;
 
+    use crate::common::aws_common::DYNAMODB_ENDPOINT;
     use crate::common::aws_common::FRAGMENTS_TABLE_NAME;
     use crate::common::aws_common::LOCKS_TABLE_NAME;
     use crate::common::aws_common::dynamodb_client;
+    use crate::common::aws_common::fragments_item;
     use crate::setup_execution;
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -42,11 +45,7 @@ mod dynamo_tests {
         let execution = setup_execution("test".to_string());
         let dynamo = LORE_CONTEXT
             .scope(execution.clone(), async move {
-                dynamodb_client(
-                    "http://127.0.0.1:9090".to_string(),
-                    vec![FRAGMENTS_TABLE_NAME],
-                )
-                .await
+                dynamodb_client(DYNAMODB_ENDPOINT.to_string(), vec![FRAGMENTS_TABLE_NAME]).await
             })
             .await?;
 
@@ -61,16 +60,7 @@ mod dynamo_tests {
             repository_context[..size_of::<Context>()].copy_from_slice(repository.data());
             repository_context[size_of::<Context>()..].copy_from_slice(address.context.data());
 
-            let item = HashMap::from([
-                (
-                    FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
-                    AttributeValue::B(Blob::from(address.hash.as_bytes())),
-                ),
-                (
-                    FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE.to_string(),
-                    AttributeValue::B(Blob::from(repository_context.to_vec())),
-                ),
-            ]);
+            let item = fragments_item(address.hash.as_bytes(), &repository_context);
 
             dynamo
                 .put_item(&Arc::from(FRAGMENTS_TABLE_NAME), item.clone())
@@ -106,18 +96,12 @@ mod dynamo_tests {
             "#pk = :hash"
         }
 
-        fn expression_attribute_names(&self) -> HashMap<String, String> {
-            HashMap::from([(
-                "#pk".to_string(),
-                FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
-            )])
+        fn expression_attribute_names(&self) -> ExprNames {
+            ExprNames::from_slice(&[("#pk", FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE)])
         }
 
-        fn expression_attribute_values(&self) -> HashMap<String, AttributeValue> {
-            HashMap::from([(
-                ":hash".to_string(),
-                AttributeValue::B(Blob::new(self.0.data())),
-            )])
+        fn expression_attribute_values(&self) -> ExprValues {
+            smallvec::smallvec![(":hash", AttributeValue::blob(self.0.data()))]
         }
 
         fn select(&self) -> Option<Select> {
@@ -130,11 +114,7 @@ mod dynamo_tests {
         let execution = setup_execution("test".to_string());
         let dynamo = LORE_CONTEXT
             .scope(execution.clone(), async move {
-                dynamodb_client(
-                    "http://127.0.0.1:9090".to_string(),
-                    vec![FRAGMENTS_TABLE_NAME],
-                )
-                .await
+                dynamodb_client(DYNAMODB_ENDPOINT.to_string(), vec![FRAGMENTS_TABLE_NAME]).await
             })
             .await?;
 
@@ -150,16 +130,7 @@ mod dynamo_tests {
             repository_context[..size_of::<Context>()].copy_from_slice(repository.data());
             repository_context[size_of::<Context>()..].copy_from_slice(address.context.data());
 
-            let item = HashMap::from([
-                (
-                    FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
-                    AttributeValue::B(Blob::from(address.hash.as_bytes())),
-                ),
-                (
-                    FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE.to_string(),
-                    AttributeValue::B(Blob::from(repository_context.to_vec())),
-                ),
-            ]);
+            let item = fragments_item(address.hash.as_bytes(), &repository_context);
 
             dynamo
                 .put_item(&Arc::from(FRAGMENTS_TABLE_NAME), item.clone())
@@ -185,18 +156,12 @@ mod dynamo_tests {
             "#pk = :hash"
         }
 
-        fn expression_attribute_names(&self) -> HashMap<String, String> {
-            HashMap::from([(
-                "#pk".to_string(),
-                FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
-            )])
+        fn expression_attribute_names(&self) -> ExprNames {
+            ExprNames::from_slice(&[("#pk", FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE)])
         }
 
-        fn expression_attribute_values(&self) -> HashMap<String, AttributeValue> {
-            HashMap::from([(
-                ":hash".to_string(),
-                AttributeValue::B(Blob::new(self.0.data())),
-            )])
+        fn expression_attribute_values(&self) -> ExprValues {
+            smallvec::smallvec![(":hash", AttributeValue::blob(self.0.data()))]
         }
 
         fn select(&self) -> Option<Select> {
@@ -213,11 +178,7 @@ mod dynamo_tests {
         let execution = setup_execution("test".to_string());
         let dynamo = LORE_CONTEXT
             .scope(execution.clone(), async move {
-                dynamodb_client(
-                    "http://127.0.0.1:9090".to_string(),
-                    vec![FRAGMENTS_TABLE_NAME],
-                )
-                .await
+                dynamodb_client(DYNAMODB_ENDPOINT.to_string(), vec![FRAGMENTS_TABLE_NAME]).await
             })
             .await?;
 
@@ -232,16 +193,7 @@ mod dynamo_tests {
             repository_context[..size_of::<Context>()].copy_from_slice(repository.data());
             repository_context[size_of::<Context>()..].copy_from_slice(address.context.data());
 
-            let item = HashMap::from([
-                (
-                    FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
-                    AttributeValue::B(Blob::from(address.hash.as_bytes())),
-                ),
-                (
-                    FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE.to_string(),
-                    AttributeValue::B(Blob::from(repository_context.to_vec())),
-                ),
-            ]);
+            let item = fragments_item(address.hash.as_bytes(), &repository_context);
 
             dynamo
                 .put_item(&Arc::from(FRAGMENTS_TABLE_NAME), item.clone())
@@ -268,18 +220,12 @@ mod dynamo_tests {
             "#pk = :hash"
         }
 
-        fn expression_attribute_names(&self) -> HashMap<String, String> {
-            HashMap::from([(
-                "#pk".to_string(),
-                FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
-            )])
+        fn expression_attribute_names(&self) -> ExprNames {
+            ExprNames::from_slice(&[("#pk", FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE)])
         }
 
-        fn expression_attribute_values(&self) -> HashMap<String, AttributeValue> {
-            HashMap::from([(
-                ":hash".to_string(),
-                AttributeValue::B(Blob::new(self.0.data())),
-            )])
+        fn expression_attribute_values(&self) -> ExprValues {
+            smallvec::smallvec![(":hash", AttributeValue::blob(self.0.data()))]
         }
 
         fn limit(&self) -> Option<i32> {
@@ -292,11 +238,7 @@ mod dynamo_tests {
         let execution = setup_execution("test".to_string());
         let dynamo = LORE_CONTEXT
             .scope(execution.clone(), async move {
-                dynamodb_client(
-                    "http://127.0.0.1:9090".to_string(),
-                    vec![FRAGMENTS_TABLE_NAME],
-                )
-                .await
+                dynamodb_client(DYNAMODB_ENDPOINT.to_string(), vec![FRAGMENTS_TABLE_NAME]).await
             })
             .await?;
 
@@ -316,16 +258,7 @@ mod dynamo_tests {
             repository_context[..size_of::<Context>()].copy_from_slice(repository.data());
             repository_context[size_of::<Context>()..].copy_from_slice(address.context.data());
 
-            let item = HashMap::from([
-                (
-                    FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
-                    AttributeValue::B(Blob::from(address.hash.as_bytes())),
-                ),
-                (
-                    FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE.to_string(),
-                    AttributeValue::B(Blob::from(repository_context.to_vec())),
-                ),
-            ]);
+            let item = fragments_item(address.hash.as_bytes(), &repository_context);
 
             dynamo
                 .put_item(&Arc::from(FRAGMENTS_TABLE_NAME), item.clone())
@@ -347,7 +280,7 @@ mod dynamo_tests {
         let execution = setup_execution("test".to_string());
         let dynamo = LORE_CONTEXT
             .scope(execution.clone(), async move {
-                dynamodb_client("http://127.0.0.1:9090".to_string(), vec![LOCKS_TABLE_NAME]).await
+                dynamodb_client(DYNAMODB_ENDPOINT.to_string(), vec![LOCKS_TABLE_NAME]).await
             })
             .await?;
 
@@ -379,48 +312,36 @@ mod dynamo_tests {
                 timestamp: "some-timestamp".to_owned(),
             };
 
-            let item = serde_dynamo::to_item(&lock_entry).map_err(|e| {
+            let item = lore_aws::aws::item::to_item(&lock_entry).map_err(|e| {
                 warn!("Error converting LockEntry to DDB item: {e} - {lock_entry:?}");
                 LockError::internal("failed to convert lock entry to DDB item")
             })?;
 
-            let put_item = Put::builder()
-                .table_name(LOCKS_TABLE_NAME)
-                .set_item(Some(item))
+            let put_item = TransactPut::new(Arc::from(LOCKS_TABLE_NAME), item)
                 // Since PutItem will pull up an existing PK + SK combo to begin with,
                 // only checking for existence of the PK attr is necessary
-                .condition_expression("attribute_not_exists(#pk)")
-                .expression_attribute_names("#pk", HASH_KEY)
-                .return_values_on_condition_check_failure(
-                    ReturnValuesOnConditionCheckFailure::AllOld,
-                )
-                .build()
-                .map_err(|e| {
-                    warn!("Error creating Put request: {e} - {lock_entry:?}");
-                    LockError::internal("failed to create put request")
-                })?;
+                .condition("attribute_not_exists(#pk)")
+                .name("#pk", HASH_KEY)
+                .returning_old_on_failure();
 
-            items.push(TransactWriteItem::builder().put(put_item).build());
+            items.push(TransactWriteItem::Put(put_item));
         }
 
         dynamo
-            .transact_write_items(&Arc::from(LOCKS_TABLE_NAME), items)
+            .transact_write_items(&Arc::from(LOCKS_TABLE_NAME), items, uuid::Uuid::new_v4())
             .await?;
 
         // Try and fetch all of the items back to ensure they were written
-        let keys: Vec<HashMap<String, AttributeValue>> = hashes
+        let keys: Vec<Item> = hashes
             .iter()
             .map(|h| {
-                let mut avmap = HashMap::new();
-                avmap.insert(
-                    HASH_KEY.to_owned(),
-                    AttributeValue::B(Blob::new(h.0.clone())),
+                let mut key = Item::new();
+                key.insert(ByteStr::from_static(HASH_KEY), AttributeValue::blob(&h.0));
+                key.insert(
+                    ByteStr::from_static(REPO_BRANCH_KEY),
+                    AttributeValue::blob(&h.1),
                 );
-                avmap.insert(
-                    REPO_BRANCH_KEY.to_owned(),
-                    AttributeValue::B(Blob::new(h.1.clone())),
-                );
-                avmap
+                key
             })
             .collect();
 
@@ -430,12 +351,8 @@ mod dynamo_tests {
             .iter()
             .map(|av| {
                 av.get(HASH_KEY)
-                    .unwrap()
-                    .as_b()
-                    .unwrap()
-                    .clone()
-                    .into_inner()
-                    .as_slice()
+                    .and_then(AttributeValue::as_blob)
+                    .expect("every lock row carries its hash")
                     .into()
             })
             .collect::<HashSet<Hash>>();
@@ -457,11 +374,7 @@ mod dynamo_tests {
         let execution = setup_execution("test".to_string());
         let dynamo = LORE_CONTEXT
             .scope(execution.clone(), async {
-                dynamodb_client(
-                    "http://127.0.0.1:9090".to_string(),
-                    vec![FRAGMENTS_TABLE_NAME],
-                )
-                .await
+                dynamodb_client(DYNAMODB_ENDPOINT.to_string(), vec![FRAGMENTS_TABLE_NAME]).await
             })
             .await?;
 
@@ -469,16 +382,7 @@ mod dynamo_tests {
         let hashes: Vec<Hash> = (0..12).map(|_| random::<Hash>()).collect();
         for hash in &hashes {
             let repo_ctx: [u8; 64] = random();
-            let item = HashMap::from([
-                (
-                    FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
-                    AttributeValue::B(Blob::from(hash.as_bytes())),
-                ),
-                (
-                    FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE.to_string(),
-                    AttributeValue::B(Blob::from(repo_ctx.to_vec())),
-                ),
-            ]);
+            let item = fragments_item(hash.as_bytes(), &repo_ctx);
             dynamo
                 .put_item(&Arc::from(FRAGMENTS_TABLE_NAME), item)
                 .await?;
@@ -493,10 +397,11 @@ mod dynamo_tests {
                 .scan_page(&table, start_key, &ScanConfig::segment(0, 1))
                 .await?;
             for item in page.items {
-                if let Some(AttributeValue::B(b)) =
-                    item.get(FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE)
+                if let Some(hash) = item
+                    .get(FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE)
+                    .and_then(AttributeValue::as_blob)
                 {
-                    found_hashes.insert(b.as_ref().to_vec());
+                    found_hashes.insert(hash.to_vec());
                 }
             }
             match page.last_evaluated_key {
@@ -521,11 +426,7 @@ mod dynamo_tests {
         let execution = setup_execution("test".to_string());
         let dynamo = LORE_CONTEXT
             .scope(execution.clone(), async {
-                dynamodb_client(
-                    "http://127.0.0.1:9090".to_string(),
-                    vec![FRAGMENTS_TABLE_NAME],
-                )
-                .await
+                dynamodb_client(DYNAMODB_ENDPOINT.to_string(), vec![FRAGMENTS_TABLE_NAME]).await
             })
             .await?;
 
@@ -533,16 +434,7 @@ mod dynamo_tests {
         let hashes: Vec<Hash> = (0..20).map(|_| random::<Hash>()).collect();
         for hash in &hashes {
             let repo_ctx: [u8; 64] = random();
-            let item = HashMap::from([
-                (
-                    FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
-                    AttributeValue::B(Blob::from(hash.as_bytes())),
-                ),
-                (
-                    FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE.to_string(),
-                    AttributeValue::B(Blob::from(repo_ctx.to_vec())),
-                ),
-            ]);
+            let item = fragments_item(hash.as_bytes(), &repo_ctx);
             dynamo
                 .put_item(&Arc::from(FRAGMENTS_TABLE_NAME), item)
                 .await?;
@@ -558,10 +450,11 @@ mod dynamo_tests {
                     .scan_page(&table, start_key, &ScanConfig::segment(seg, total_segments))
                     .await?;
                 for item in page.items {
-                    if let Some(AttributeValue::B(b)) =
-                        item.get(FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE)
+                    if let Some(hash) = item
+                        .get(FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE)
+                        .and_then(AttributeValue::as_blob)
                     {
-                        *seen.entry(b.as_ref().to_vec()).or_insert(0) += 1;
+                        *seen.entry(hash.to_vec()).or_insert(0) += 1;
                     }
                 }
                 match page.last_evaluated_key {
@@ -581,39 +474,39 @@ mod dynamo_tests {
     /// `BatchGetItem` against `DynamoDB` Local, on a table whose items together exceed the 16 MB
     /// response limit, so the service itself leaves keys unprocessed.
     mod batch_get_item_unprocessed_keys {
-        use std::collections::HashMap;
         use std::sync::Arc;
         use std::time::Duration;
         use std::time::Instant;
 
-        use aws_sdk_dynamodb::types::AttributeDefinition;
-        use aws_sdk_dynamodb::types::AttributeValue;
-        use aws_sdk_dynamodb::types::BillingMode;
-        use aws_sdk_dynamodb::types::KeySchemaElement;
-        use aws_sdk_dynamodb::types::KeyType;
-        use aws_sdk_dynamodb::types::KeysAndAttributes;
-        use aws_sdk_dynamodb::types::ScalarAttributeType;
+        use lore_aws::aws::dynamodb::DynamoClient;
+        use lore_aws::aws::item::AttributeValue;
+        use lore_aws::aws::item::ByteStr;
+        use lore_aws::aws::item::Item;
         use lore_aws::aws_error::AwsError;
         use lore_aws::dynamodb::DynamoDb;
         use lore_base::runtime::LORE_CONTEXT;
         use lore_revision::util::time::RetryPolicy;
 
         use super::TestResult;
+        use crate::common::aws_common::DYNAMODB_ENDPOINT;
+        use crate::common::aws_common::client_core;
+        use crate::common::aws_common::create_hash_keyed_table;
+        use crate::common::aws_common::delete_table;
         use crate::common::aws_common::dynamodb_client_with_unprocessed_keys_retry;
         use crate::setup_execution;
 
-        const KEY_ATTRIBUTE: &str = "id";
+        const KEY_ATTRIBUTE: &str = "hash";
         const ITEMS: usize = 100;
         const ITEM_BYTES: usize = 350_000;
         const WAIT_MS: u64 = 300;
 
-        type Item = HashMap<String, AttributeValue>;
-
         fn key(index: usize) -> Item {
-            HashMap::from([(
-                KEY_ATTRIBUTE.to_owned(),
-                AttributeValue::S(format!("k{index}")),
-            )])
+            let mut key = Item::new();
+            key.insert(
+                ByteStr::from_static(KEY_ATTRIBUTE),
+                AttributeValue::blob(index.to_be_bytes()),
+            );
+            key
         }
 
         fn keys() -> Vec<Item> {
@@ -629,7 +522,7 @@ mod dynamo_tests {
             LORE_CONTEXT
                 .scope(setup_execution("test".to_string()), async move {
                     dynamodb_client_with_unprocessed_keys_retry(
-                        "http://127.0.0.1:9090".to_string(),
+                        DYNAMODB_ENDPOINT.to_string(),
                         vec![],
                         Some(retry),
                     )
@@ -644,68 +537,32 @@ mod dynamo_tests {
             dynamo: &DynamoDb,
         ) -> Result<Arc<str>, Box<dyn std::error::Error>> {
             let table = format!("unprocessed-keys-{}", uuid::Uuid::new_v4());
-            let client = dynamo.sdk_client();
-            client
-                .create_table()
-                .table_name(&table)
-                .billing_mode(BillingMode::PayPerRequest)
-                .attribute_definitions(
-                    AttributeDefinition::builder()
-                        .attribute_name(KEY_ATTRIBUTE)
-                        .attribute_type(ScalarAttributeType::S)
-                        .build()?,
-                )
-                .key_schema(
-                    KeySchemaElement::builder()
-                        .attribute_name(KEY_ATTRIBUTE)
-                        .key_type(KeyType::Hash)
-                        .build()?,
-                )
-                .send()
-                .await?;
+            let core = client_core(DYNAMODB_ENDPOINT, false)?;
+            create_hash_keyed_table(&core, &table).await?;
+            let table: Arc<str> = table.into();
 
-            let payload = "x".repeat(ITEM_BYTES);
+            let payload = AttributeValue::blob(vec![b'x'; ITEM_BYTES]);
             for index in 0..ITEMS {
                 let mut item = key(index);
-                item.insert("payload".to_owned(), AttributeValue::S(payload.clone()));
-                client
-                    .put_item()
-                    .table_name(&table)
-                    .set_item(Some(item))
-                    .send()
-                    .await?;
+                item.insert(ByteStr::from_static("payload"), payload.clone());
+                dynamo.put_item(&table, item).await?;
             }
-            Ok(table.into())
+            Ok(table)
         }
 
         /// The resends needed to retrieve every item when each response's unprocessed keys are
         /// resubmitted at once.
-        async fn resends_needed(
-            dynamo: &DynamoDb,
-            table: &str,
-        ) -> Result<usize, Box<dyn std::error::Error>> {
-            let mut request = HashMap::from([(
-                table.to_owned(),
-                KeysAndAttributes::builder()
-                    .set_keys(Some(keys()))
-                    .consistent_read(true)
-                    .build()?,
-            )]);
+        async fn resends_needed(table: &str) -> Result<usize, Box<dyn std::error::Error>> {
+            let client = DynamoClient::new(client_core(DYNAMODB_ENDPOINT, false)?);
+            let mut keys = keys();
             let mut resends = 0;
             loop {
-                let response = dynamo
-                    .sdk_client()
-                    .batch_get_item()
-                    .set_request_items(Some(request))
-                    .send()
-                    .await?;
-                match response.unprocessed_keys {
-                    Some(unprocessed) if !unprocessed.is_empty() => {
-                        request = unprocessed;
-                        resends += 1;
-                    }
-                    _ => return Ok(resends),
+                let output = client.batch_get_item(table, &keys, true).await?;
+                if output.unprocessed_keys.is_empty() {
+                    return Ok(resends);
                 }
+                keys = output.unprocessed_keys;
+                resends += 1;
             }
         }
 
@@ -713,7 +570,7 @@ mod dynamo_tests {
         async fn returns_every_item_within_its_resends() -> TestResult {
             let setup = client(0).await?;
             let table = create_large_table(&setup).await?;
-            let resends = resends_needed(&setup, &table).await?;
+            let resends = resends_needed(&table).await?;
             assert!(
                 resends > 0,
                 "the service returned every item in one response"
@@ -732,20 +589,15 @@ mod dynamo_tests {
                 elapsed >= waits,
                 "read took {elapsed:?}, under its {waits:?} of waits"
             );
-            setup
-                .sdk_client()
-                .delete_table()
-                .table_name(&*table)
-                .send()
-                .await?;
-            Ok(())
+            let core = client_core(DYNAMODB_ENDPOINT, false)?;
+            delete_table(&core, &table).await
         }
 
         #[tokio::test]
         async fn fails_when_keys_stay_unprocessed_after_its_resends() -> TestResult {
             let setup = client(0).await?;
             let table = create_large_table(&setup).await?;
-            let resends = resends_needed(&setup, &table).await?;
+            let resends = resends_needed(&table).await?;
             assert!(
                 resends > 0,
                 "the service returned every item in one response"
@@ -761,13 +613,8 @@ mod dynamo_tests {
                 matches!(error, AwsError::UnprocessedKeys { remaining } if remaining > 0),
                 "expected unprocessed keys, got {error:?}"
             );
-            setup
-                .sdk_client()
-                .delete_table()
-                .table_name(&*table)
-                .send()
-                .await?;
-            Ok(())
+            let core = client_core(DYNAMODB_ENDPOINT, false)?;
+            delete_table(&core, &table).await
         }
     }
 }

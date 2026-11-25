@@ -24,19 +24,16 @@ mode = "aws"
 # ---------------------------------------------------------------------
 [plugins.aws]
 
-# HTTP client settings for AWS SDKs
-[plugins.aws.http]
-# Connection pool settings (optional)
-# pool_idle_timeout_secs = 60
-# pool_max_idle_per_host = 10
-
 # Immutable store settings (S3 + DynamoDB)
 [plugins.aws.immutable_store]
 s3_bucket = "lore-fragments"
 # s3_endpoint_url = "http://localhost:4566"
 # s3_region = "us-east-1"
+# Path-style addressing, for S3-compatible stores behind non-AWS hostnames such as MinIO
+# s3_force_path_style = false
 s3_slow_operation_threshold_millis = 5000
-s3_timeout_millis = 30000
+# Time each operation gets, retries included, on both S3 and DynamoDB
+timeout_millis = 30000
 
 dynamodb_fragments_table = "lore-fragments"
 # Holds fragment state; a row's presence means the hash exists. Its own table, distinct from the
@@ -49,7 +46,6 @@ dynamodb_fragment_state_table = "lore-fragment-state"
 # dynamodb_endpoint_url = "http://localhost:4566"
 # dynamodb_region = "us-east-1"
 dynamodb_slow_operation_threshold_millis = 2000
-dynamodb_timeout_millis = 15000
 # Backoff for resending the keys a batch read leaves unprocessed. max_attempts counts resends.
 # initial_backoff_ms, max_backoff_ms and max_attempts are required; jitter is optional.
 # dynamodb_unprocessed_keys_retry = { initial_backoff_ms = 50, max_backoff_ms = 1000, max_attempts = 6 }
@@ -57,12 +53,20 @@ dynamodb_timeout_millis = 15000
 # Force write mode for debugging/profiling purposes, always overwrites data already present
 # force_write = false
 
+# HTTP client settings for this store's S3 and DynamoDB clients (optional); the mutable and lock
+# stores take the same table
+[plugins.aws.immutable_store.http]
+# pool_idle_timeout_seconds = 30
+# nodelay = false
+# The most connections each of the store's clients has in use at once; unset for no limit
+# max_connections = 1000
+
 # Mutable store settings (DynamoDB)
 [plugins.aws.mutable_store]
 dynamodb_table = "lore-mutable"
 # dynamodb_endpoint_url = "http://localhost:4566"
 # dynamodb_region = "us-east-1"
-slow_operation_threshold_millis = 2000
+dynamodb_slow_operation_threshold_millis = 2000
 timeout_millis = 15000
 
 # Lock store settings (DynamoDB)
@@ -71,5 +75,6 @@ dynamodb_table = "lore-locks"
 # dynamodb_endpoint_url = "http://localhost:4566"
 # dynamodb_region = "us-east-1"
 dynamodb_slow_operation_threshold_millis = 1000
+timeout_millis = 15000
 # As for the immutable store.
 # dynamodb_unprocessed_keys_retry = { initial_backoff_ms = 50, max_backoff_ms = 1000, max_attempts = 6 }

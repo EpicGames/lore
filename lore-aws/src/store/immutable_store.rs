@@ -4,20 +4,14 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fmt::Formatter;
-use std::mem::size_of;
-use std::string::ToString;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::Once;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aws_sdk_dynamodb::operation::put_item::PutItemError;
-use aws_sdk_dynamodb::primitives::Blob;
-use aws_sdk_dynamodb::types::AttributeValue;
-use aws_sdk_s3::operation::get_object::GetObjectError;
-use aws_sdk_s3::operation::head_object::HeadObjectError;
-use aws_sdk_s3::operation::head_object::HeadObjectOutput;
-use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use bytes::Bytes;
 use bytes::BytesMut;
 use lore_base::error::AddressNotFound;
@@ -40,8 +34,6 @@ use lore_storage::StoreMatch;
 use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
 use lore_storage::immutable_store::CopyBehavior;
-#[cfg(test)]
-use lore_storage::immutable_store::query_one;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::LabelArray;
@@ -64,19 +56,30 @@ use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
+use crate::aws::error::AwsCallError;
+use crate::aws::error::ErrorPayload;
+use crate::aws::error::S3ErrorCode;
+use crate::aws::item::AttributeValue;
+use crate::aws::item::from_item;
+use crate::aws::item::to_item;
+use crate::aws::s3::HeadObjectOutput;
 use crate::aws_error::AwsError;
 use crate::default_aws_timeout_millis;
 use crate::dynamodb::ConditionParts;
 use crate::dynamodb::DynamoDb;
 use crate::dynamodb::DynamoDbCondition;
 use crate::dynamodb::DynamoDbQuery;
-use crate::dynamodb::error::SdkError as DynamoDbSdkError;
+use crate::dynamodb::ExprNames;
+use crate::dynamodb::ExprValues;
 use crate::s3::S3;
+use crate::s3::S3Error;
 use crate::store::object_metadata::ObjectMetadataError;
 use crate::store::object_metadata::from_object_metadata;
 use crate::store::object_metadata::to_object_metadata;
 use crate::store::single_flight::Role;
 use crate::store::single_flight::SingleFlight;
+use crate::store::store_failure;
+use crate::store::with_backoff;
 
 pub mod metadata_migrator;
 
@@ -85,6 +88,7 @@ enum QueryResultSource {
     State,
 }
 
+#[lore_macro::test_pub]
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct FragmentsEntry {
     pub(crate) hash: Hash,
@@ -113,6 +117,7 @@ impl Debug for FragmentsEntry {
 }
 
 impl FragmentsEntry {
+    #[lore_macro::test_pub]
     pub(crate) fn new(partition: Partition, address: Address) -> Self {
         let mut partition_context = [0u8; size_of::<Context>() * 2];
         partition_context[..size_of::<Context>()].copy_from_slice(partition.data());
@@ -131,6 +136,7 @@ impl FragmentsEntry {
 /// compression, its sizes — lives on the S3 object itself and is never duplicated here, so the two
 /// cannot disagree. What `DynamoDB` adds is the ability to answer "does this hash exist, and may it
 /// be read" without an S3 request, which is the only reason the row exists at all.
+#[lore_macro::test_pub]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FragmentState {
     /// The payload is stored and readable.
@@ -172,6 +178,7 @@ impl FragmentState {
 /// The `state` field is what distinguishes a row written under this model from one written when
 /// fragments were stored in `DynamoDB`: those carry flattened `flags`/`size_payload`/`size_content`
 /// instead. A migration can tell the two apart by shape alone.
+#[lore_macro::test_pub]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct FragmentStateEntry {
     hash: Hash,
@@ -182,7 +189,8 @@ pub(crate) struct FragmentStateEntry {
 /// A row in the shape written before fragments moved onto the S3 object: the whole fragment,
 /// flattened alongside the hash.
 ///
-/// Deserialization only. Nothing writes this shape any more.
+/// Deserialization only: nothing writes this shape.
+#[lore_macro::test_pub]
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct FragmentMetadataEntry {
     pub(crate) hash: Hash,
@@ -191,10 +199,13 @@ pub(crate) struct FragmentMetadataEntry {
 }
 
 impl FragmentStateEntry {
+    /// The key-only shape, with no state attribute.
+    #[lore_macro::test_pub]
     fn key(hash: Hash) -> Self {
         Self { hash, state: None }
     }
 
+    #[lore_macro::test_pub]
     pub(crate) fn new(hash: Hash, state: FragmentState) -> Self {
         Self {
             hash,
@@ -202,6 +213,7 @@ impl FragmentStateEntry {
         }
     }
 
+    #[lore_macro::test_pub]
     pub(crate) fn state(&self) -> FragmentState {
         FragmentState::from_bits(self.state.unwrap_or_default())
     }
@@ -247,9 +259,9 @@ pub struct DynamoDbImmutableStoreSettings {
     /// object turns out to carry no metadata of its own.
     ///
     /// Set this on a deployment that has stored objects the old way — normally to the same table as
-    /// `fragment_state_table_name`, since both row shapes share it and are told apart by shape. Leaving it
-    /// unset declares that no such object exists, which makes an object carrying no metadata what it
-    /// then is: damaged, rather than merely old.
+    /// `fragment_state_table_name`, since both row shapes share it and are told apart by shape.
+    /// Leaving it unset declares that no such object exists, which makes an object carrying no
+    /// metadata what it then is: damaged, rather than merely old.
     #[serde(default)]
     pub fragment_metadata_table_name: Option<String>,
     pub endpoint_url: Option<String>,
@@ -322,6 +334,7 @@ pub const FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE: &str = "repository_context";
 /// paginated to be true — `query_single` issues one `Query` and never follows `last_evaluated_key`,
 /// so a `Select::Count` here would report only what one page scanned and stop silently at
 /// `DynamoDB`'s 1 MB limit.
+#[lore_macro::test_pub]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FragmentsQuery(pub(crate) Hash);
 
@@ -330,18 +343,12 @@ impl DynamoDbQuery for FragmentsQuery {
         "#pk = :hash"
     }
 
-    fn expression_attribute_names(&self) -> HashMap<String, String> {
-        HashMap::from([(
-            "#pk".to_string(),
-            FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
-        )])
+    fn expression_attribute_names(&self) -> ExprNames {
+        ExprNames::from_slice(&[("#pk", FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE)])
     }
 
-    fn expression_attribute_values(&self) -> HashMap<String, AttributeValue> {
-        HashMap::from([(
-            ":hash".to_string(),
-            AttributeValue::B(Blob::new(self.0.data())),
-        )])
+    fn expression_attribute_values(&self) -> ExprValues {
+        smallvec::smallvec![(":hash", AttributeValue::blob(self.0.data()))]
     }
 
     /// One row answers the question, so the read stops there rather than scanning a hash partition
@@ -365,6 +372,7 @@ impl DynamoDbQuery for FragmentsQuery {
 ///
 /// A copy asks this only when its source names no context, and pays a `Query` for it where an exact
 /// source costs a keyed read. One row settles it, for the reason on [`FragmentsQuery`].
+#[lore_macro::test_pub]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PartitionAssociationQuery(pub(crate) Hash, pub(crate) Partition);
 
@@ -373,30 +381,18 @@ impl DynamoDbQuery for PartitionAssociationQuery {
         "#pk = :hash AND begins_with(#sk, :partition)"
     }
 
-    fn expression_attribute_names(&self) -> HashMap<String, String> {
-        HashMap::from([
-            (
-                "#pk".to_string(),
-                FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
-            ),
-            (
-                "#sk".to_string(),
-                FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE.to_string(),
-            ),
+    fn expression_attribute_names(&self) -> ExprNames {
+        ExprNames::from_slice(&[
+            ("#pk", FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE),
+            ("#sk", FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE),
         ])
     }
 
-    fn expression_attribute_values(&self) -> HashMap<String, AttributeValue> {
-        HashMap::from([
-            (
-                ":hash".to_string(),
-                AttributeValue::B(Blob::new(self.0.data())),
-            ),
-            (
-                ":partition".to_string(),
-                AttributeValue::B(Blob::new(self.1.data())),
-            ),
-        ])
+    fn expression_attribute_values(&self) -> ExprValues {
+        smallvec::smallvec![
+            (":hash", AttributeValue::blob(self.0.data())),
+            (":partition", AttributeValue::blob(self.1.data())),
+        ]
     }
 
     fn limit(&self) -> Option<i32> {
@@ -414,15 +410,16 @@ impl DynamoDbQuery for PartitionAssociationQuery {
 ///
 /// Publishing a payload uses this so that a concurrent obliteration's mark cannot be erased by a
 /// racing writer: the writer's create loses, it re-reads the row, and it sees the mark.
+#[lore_macro::test_pub]
 #[derive(Debug, PartialEq)]
 pub(crate) struct RowAbsent;
 
 impl DynamoDbCondition for RowAbsent {
     fn into_parts(self) -> ConditionParts {
         ConditionParts {
-            condition_expression: "attribute_not_exists(#hash)".to_string(),
-            expression_names: HashMap::from([("#hash".to_string(), "hash".to_string())]),
-            expression_values: HashMap::new(),
+            condition_expression: "attribute_not_exists(#hash)",
+            expression_names: ExprNames::from_slice(&[("#hash", "hash")]),
+            expression_values: ExprValues::new(),
         }
     }
 }
@@ -431,18 +428,19 @@ impl DynamoDbCondition for RowAbsent {
 ///
 /// Obliteration advances the row through its states with this, so two obliterations racing for the
 /// same hash cannot both believe they hold the mark.
+#[lore_macro::test_pub]
 #[derive(Debug, PartialEq)]
 pub(crate) struct StateUnchanged(pub(crate) FragmentState);
 
 impl DynamoDbCondition for StateUnchanged {
     fn into_parts(self) -> ConditionParts {
         ConditionParts {
-            condition_expression: "#state = :state".to_string(),
-            expression_names: HashMap::from([("#state".to_string(), "state".to_string())]),
-            expression_values: HashMap::from([(
-                ":state".to_string(),
-                AttributeValue::N(self.0.bits().to_string()),
-            )]),
+            condition_expression: "#state = :state",
+            expression_names: ExprNames::from_slice(&[("#state", "state")]),
+            expression_values: smallvec::smallvec![(
+                ":state",
+                AttributeValue::number(self.0.bits())
+            )],
         }
     }
 }
@@ -478,48 +476,6 @@ const METRICS_SHARED_READS_METRIC_NAME: &str = "shared_reads";
 /// Lower bound on the obliteration drain, regardless of how the `DynamoDB` timeout is configured.
 const MIN_OBLITERATION_DRAIN_MILLIS: u64 = 100;
 
-/// Whether a `DynamoDB` failure indicates overload rather than another kind of failure. Overload
-/// means the store did not obtain a complete answer and the caller should ask again, however it
-/// was reported.
-///
-/// Getting this wrong is not cosmetic. Reporting a failed read as not-found tells a caller the
-/// content is absent when we merely failed to look, and a not-found on a referenced hash is what
-/// [`AwsImmutableStore::report_missing_payload`] treats as lost data — so a throttle could be
-/// recorded as data loss and clear a state row.
-fn is_dynamodb_overloaded<E>(error: &AwsError<DynamoDbSdkError<E>>) -> bool
-where
-    E: ProvideErrorMetadata,
-{
-    let sdk_error = match error {
-        AwsError::AwsSdkError(sdk_error) => sdk_error,
-        // Keys still unprocessed after every resend mean the table couldn't serve the whole read,
-        // so the caller can ask again.
-        AwsError::UnprocessedKeys { .. } => return true,
-        _ => return false,
-    };
-
-    match &**sdk_error {
-        DynamoDbSdkError::TimeoutError(_) | DynamoDbSdkError::DispatchFailure(_) => true,
-        DynamoDbSdkError::ServiceError(err) => {
-            let status = err.raw().status().as_u16();
-
-            status == 429
-                || status >= 500
-                || matches!(
-                    err.err().code(),
-                    Some(
-                        "ThrottlingException"
-                            | "ProvisionedThroughputExceededException"
-                            | "RequestLimitExceeded"
-                            | "InternalServerError"
-                            | "ServiceUnavailable"
-                    )
-                )
-        }
-        _ => false,
-    }
-}
-
 /// Mark a fragment as durably stored.
 ///
 /// Durability is a fact about this store, not about the payload, so it is derived on read rather
@@ -530,46 +486,134 @@ fn stored_durable(mut fragment: Fragment) -> Fragment {
     fragment
 }
 
+/// Refuse an object larger than any fragment this store can legitimately hold.
+///
+/// Reported from both the declared length and the bytes actually read, because a chunked reply
+/// declares no length and only the second bound covers it.
+fn oversized_object(hash: Hash, size: usize, max: usize) -> StoreError {
+    warn!(
+        %hash,
+        size,
+        max,
+        "S3 object exceeds maximum allowed size; treating as malicious"
+    );
+
+    StoreError::from(Oversized {
+        context: format!("S3 object size {size} for {hash} exceeds maximum {max}"),
+    })
+}
+
+/// Whether S3 answered that the requested object does not exist, with a code `absent` accepts.
+fn names_no_object(error: &S3Error, absent: fn(&S3ErrorCode) -> bool) -> bool {
+    matches!(error, AwsError::Aws(AwsCallError::Service(service)) if absent(&service.code))
+}
+
 static STORE_ATTRIBUTES: LazyLock<[KeyValue; 1]> =
     LazyLock::new(|| [KeyValue::new("store", "aws")]);
 
-/// The labels one operation records its shared reads under.
-struct SharedReadLabels {
-    association_leader: LabelArray,
-    association_follower: LabelArray,
-    state_leader: LabelArray,
-    state_follower: LabelArray,
+/// The operation a shared read was made for, which the `shared_reads` counter names in `context`.
+#[lore_macro::test_pub]
+#[derive(Clone, Copy)]
+enum SharedReadContext {
+    Get,
+    Put,
+    Copy,
+    GetMetadata,
 }
 
-impl SharedReadLabels {
-    fn new(provider: &impl InstrumentProvider, context: &'static str) -> Self {
-        let labels = |read: &'static str, role: &'static str| {
-            let mut labels = provider.get_labels_for_operation_context(context);
-            labels.push(KeyValue::new("read", read));
-            labels.push(KeyValue::new("role", role));
-            labels
-        };
+impl SharedReadContext {
+    const ALL: [Self; 4] = [Self::Get, Self::Put, Self::Copy, Self::GetMetadata];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::Put => "put",
+            Self::Copy => "copy",
+            Self::GetMetadata => "get_metadata",
+        }
+    }
+
+    fn reads(self) -> &'static SharedReads {
+        &SHARED_READS[self as usize]
+    }
+}
+
+/// One operation's shared reads: association reads, which the counter names `exists` in `read`,
+/// and state reads, which it names `state`.
+struct SharedReads {
+    association: RoleCounts,
+    state: RoleCounts,
+}
+
+impl SharedReads {
+    const fn new() -> Self {
         Self {
-            association_leader: labels("exists", "leader"),
-            association_follower: labels("exists", "follower"),
-            state_leader: labels("state", "leader"),
-            state_follower: labels("state", "follower"),
+            association: RoleCounts::new(),
+            state: RoleCounts::new(),
+        }
+    }
+}
+
+/// Reads by the [`Role`] their caller played.
+struct RoleCounts {
+    leader: AtomicU64,
+    follower: AtomicU64,
+}
+
+impl RoleCounts {
+    const fn new() -> Self {
+        Self {
+            leader: AtomicU64::new(0),
+            follower: AtomicU64::new(0),
         }
     }
 
-    fn association(&self, role: Role) -> &[KeyValue] {
-        match role {
-            Role::Leader => &self.association_leader,
-            Role::Follower => &self.association_follower,
-        }
+    fn add(&self, role: Role) {
+        let count = match role {
+            Role::Leader => &self.leader,
+            Role::Follower => &self.follower,
+        };
+        count.fetch_add(1, Ordering::Relaxed);
     }
+}
 
-    fn state(&self, role: Role) -> &[KeyValue] {
-        match role {
-            Role::Leader => &self.state_leader,
-            Role::Follower => &self.state_follower,
+/// Every store's shared reads, indexed by [`SharedReadContext`]. Counting a read is a relaxed
+/// increment that neither hashes labels nor takes the meter's lock, as adding to a counter
+/// instrument does; the `shared_reads` counter reads these when the meter collects. They are
+/// process-wide because the counter's series are: stores record into the same series, and an
+/// observation replaces a series' value rather than adding to it.
+static SHARED_READS: [SharedReads; 4] = [const { SharedReads::new() }; 4];
+
+/// Registers the `shared_reads` counter to report [`SHARED_READS`], once per process. A series is
+/// reported from its first read on, as a counter instrument's is.
+fn report_shared_reads(provider: &AwsImmutableStoreInstrumentProvider) {
+    static REPORTED: Once = Once::new();
+    REPORTED.call_once(|| {
+        let mut series: Vec<(&'static AtomicU64, LabelArray)> = Vec::with_capacity(16);
+        for context in SharedReadContext::ALL {
+            let reads = context.reads();
+            for (read, counts) in [("exists", &reads.association), ("state", &reads.state)] {
+                for (role, count) in [("leader", &counts.leader), ("follower", &counts.follower)] {
+                    let mut labels = provider.get_labels_for_operation_context(context.name());
+                    labels.push(KeyValue::new("read", read));
+                    labels.push(KeyValue::new("role", role));
+                    series.push((count, labels));
+                }
+            }
         }
-    }
+        provider
+            .meter()
+            .u64_observable_counter(provider.scope_name(METRICS_SHARED_READS_METRIC_NAME))
+            .with_callback(move |observer| {
+                for (count, labels) in &series {
+                    let count = count.load(Ordering::Relaxed);
+                    if count > 0 {
+                        observer.observe(count, labels);
+                    }
+                }
+            })
+            .build();
+    });
 }
 
 struct GetS3objectContentsOutput {
@@ -585,8 +629,7 @@ pub struct AwsImmutableStore {
     dynamodb: DynamoDb,
     bucket: String,
     fragments_table_name: Arc<str>,
-    /// Table of [`FragmentStateEntry`] rows. Named "metadata" for historical reasons; it holds
-    /// lifecycle state only, never a fragment.
+    /// Table of [`FragmentStateEntry`] rows: lifecycle state only, never a fragment.
     fragment_state_table_name: Arc<str>,
     /// Set only where objects predating the move onto the S3 object may still exist. `None` is a
     /// deployment that has never written one, and reads accordingly refuse to guess.
@@ -609,11 +652,6 @@ pub struct AwsImmutableStore {
     association_without_state_counter: Counter<u64>,
     association_reads: SingleFlight<(Partition, Address), Result<bool, StoreError>>,
     state_reads: SingleFlight<Hash, Result<Option<FragmentState>, StoreError>>,
-    shared_reads_counter: Counter<u64>,
-    shared_labels_get: SharedReadLabels,
-    shared_labels_put: SharedReadLabels,
-    shared_labels_copy: SharedReadLabels,
-    shared_labels_get_metadata: SharedReadLabels,
 }
 
 impl AwsImmutableStore {
@@ -631,11 +669,7 @@ impl AwsImmutableStore {
         let missing_payload_counter = provider.counter(METRICS_MISSING_PAYLOAD_METRIC_NAME);
         let association_without_state_counter =
             provider.counter(METRICS_ASSOCIATION_WITHOUT_STATE_METRIC_NAME);
-        let shared_reads_counter = provider.counter(METRICS_SHARED_READS_METRIC_NAME);
-        let shared_labels_get = SharedReadLabels::new(&provider, "get");
-        let shared_labels_put = SharedReadLabels::new(&provider, "put");
-        let shared_labels_copy = SharedReadLabels::new(&provider, "copy");
-        let shared_labels_get_metadata = SharedReadLabels::new(&provider, "get_metadata");
+        report_shared_reads(&provider);
         Self {
             s3,
             dynamodb,
@@ -667,21 +701,17 @@ impl AwsImmutableStore {
             association_without_state_counter,
             association_reads: SingleFlight::default(),
             state_reads: SingleFlight::default(),
-            shared_reads_counter,
-            shared_labels_get,
-            shared_labels_put,
-            shared_labels_copy,
-            shared_labels_get_metadata,
         }
     }
 
     /// Checks whether this partition holds the association for this address. Concurrent callers
-    /// checking the same address share the read. `labels` belong to the calling operation.
+    /// checking the same address share the read, which is counted for `context`.
+    #[lore_macro::test_pub]
     async fn exists(
         &self,
         partition: Partition,
         address: Address,
-        labels: &SharedReadLabels,
+        context: SharedReadContext,
     ) -> Result<bool, StoreError> {
         let (exists, role) = self
             .association_reads
@@ -689,7 +719,7 @@ impl AwsImmutableStore {
                 self.read_association(partition, address)
             })
             .await;
-        self.shared_reads_counter.add(1, labels.association(role));
+        context.reads().association.add(role);
         exists
     }
 
@@ -697,15 +727,16 @@ impl AwsImmutableStore {
     /// same hash. The shared read can begin before the caller's request. It always begins after
     /// any state write by this store that completed before the request began. A caller must
     /// tolerate a read racing an obliteration's mark. A step that needs a read issued after its
-    /// own request began, such as taking or releasing that mark, must read unshared. `labels`
-    /// belong to the calling operation.
+    /// own request began, such as taking or releasing that mark, must read unshared. The read is
+    /// counted for `context`.
+    #[lore_macro::test_pub]
     async fn load_state_shared(
         &self,
         hash: Hash,
-        labels: &SharedReadLabels,
+        context: SharedReadContext,
     ) -> Result<Option<FragmentState>, StoreError> {
         let (state, role) = self.state_reads.run(hash, || self.load_state(hash)).await;
-        self.shared_reads_counter.add(1, labels.state(role));
+        context.reads().state.add(role);
         state
     }
 
@@ -718,7 +749,7 @@ impl AwsImmutableStore {
         address: Address,
     ) -> Result<bool, StoreError> {
         let entry = FragmentsEntry::new(partition, address);
-        let item = serde_dynamo::to_item(&entry).map_err(|e| {
+        let item = to_item(&entry).map_err(|e| {
             warn!(
                 "Failed to convert fragment entry: {entry:?} to dynamo attribute value map: {e:?}",
             );
@@ -728,24 +759,14 @@ impl AwsImmutableStore {
             )
         })?;
 
-        let output = self
-            .dynamodb
-            .get_item(
+        self.dynamodb
+            .item_exists(
                 &self.fragments_table_name,
                 item,
                 true, /* consistent read */
             )
             .await
-            .map_err(|e| {
-                warn!({PARTITION_ID} = %partition, {ADDRESS} = %address, error = ?e, "DynamoDb lookup for fragment entry failed");
-                if matches!(&e, AwsError::AwsSdkError(_)) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(e, "DynamoDB fragment lookup failed")
-                }
-            })?;
-
-        Ok(output.item.is_some())
+            .map_err(|e| store_failure(e, "DynamoDB fragment lookup failed"))
     }
 
     /// The addresses among `addresses` that this partition holds an association for.
@@ -766,7 +787,7 @@ impl AwsImmutableStore {
         let mut items = Vec::with_capacity(distinct.len());
         for address in &distinct {
             let entry = FragmentsEntry::new(partition, *address);
-            items.push(serde_dynamo::to_item(&entry).map_err(|e| {
+            items.push(to_item(&entry).map_err(|e| {
                 warn!("Failed to serialize fragment entry {entry:?} for resolve: {e:?}");
                 StoreError::internal_with_context(e, "Failed to serialize fragment entry")
             })?);
@@ -776,18 +797,11 @@ impl AwsImmutableStore {
             .dynamodb
             .batch_get_item(&self.fragments_table_name, items, true)
             .await
-            .map_err(|e| {
-                warn!({PARTITION_ID} = %partition, error = ?e, "DynamoDb association resolve failed");
-                if is_dynamodb_overloaded(&e) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(e, "DynamoDB batch get items failed")
-                }
-            })?;
+            .map_err(|e| store_failure(e, "DynamoDB fragment association batch read failed"))?;
 
         let mut present = HashSet::with_capacity(output.len());
         for item in output {
-            match serde_dynamo::from_item::<HashMap<String, AttributeValue>, FragmentsEntry>(item) {
+            match from_item::<FragmentsEntry>(item) {
                 Ok(entry) => {
                     present.insert((&entry).into());
                 }
@@ -798,30 +812,29 @@ impl AwsImmutableStore {
         Ok(present)
     }
 
-    /// A full match or nothing. This store reads no wider than the exact association, so there is
-    /// no weaker level for a miss to fall back to.
-    /// Resolve an address to the fragment stored for it, without transferring the payload.
+    /// Resolve whether this partition may read an address, from `DynamoDB` alone.
     ///
-    /// An obliterated hash needs no special case: obliteration deletes the object, so the head
-    /// returns not-found and the query reports a miss. Between an obliteration taking its mark and
-    /// deleting the association there is a window where a partition that still holds a reference
-    /// sees the fragment — which is accurate, since the payload survives for as long as any
-    /// reference to it does.
+    /// A full match or nothing: this store reads no wider than the exact association, so there is
+    /// no weaker level for a miss to fall back to. A match needs the association and a `Stored`
+    /// state; a hash under obliteration, or obliterated, is a miss. A match on the state table
+    /// carries `Fragment::default()` marked durable, since the representation lives on the object.
+    /// A hash with no state row resolves from the legacy metadata table when one is configured, and
+    /// a match there carries the fragment its row holds.
     ///
     /// `labels` is the calling operation's label array for counting associations without state.
     /// Its `context` names the operation rather than the condition. The caller supplies these
-    /// labels because the condition doesn't identify which read noticed it. `shared_labels` are the
-    /// same operation's labels for the shared reads it makes.
+    /// labels because the condition doesn't identify which read noticed it. The shared reads it
+    /// makes are counted for `context`, the same operation.
     async fn do_query(
         &self,
         partition: Partition,
         address: Address,
         labels: &[KeyValue],
-        shared_labels: &SharedReadLabels,
+        context: SharedReadContext,
     ) -> Result<(QueryResultSource, StoreGetData), StoreError> {
         let (associated, state) = tokio::join!(
-            self.exists(partition, address, shared_labels),
-            self.load_state_shared(address.hash, shared_labels)
+            self.exists(partition, address, context),
+            self.load_state_shared(address.hash, context)
         );
 
         let miss = Ok((QueryResultSource::State, StoreGetData::default()));
@@ -952,9 +965,10 @@ impl AwsImmutableStore {
     /// ordinary outcome for content that is already stored — the row carries no representation, so
     /// there is nothing to reconcile and the existing row is already correct. The state it carries
     /// is returned so the caller can tell "already published" from "an obliteration holds this".
+    #[lore_macro::test_pub]
     async fn publish_state(&self, hash: Hash) -> Result<FragmentState, StoreError> {
         let entry = FragmentStateEntry::new(hash, FragmentState::Stored);
-        let item = serde_dynamo::to_item(&entry).map_err(|e| {
+        let item = to_item(&entry).map_err(|e| {
             warn!("Failed to serialize fragment state entry for {hash}: {e:?}");
             StoreError::internal_with_context(e, "Failed to serialize fragment state for DynamoDB")
         })?;
@@ -968,39 +982,20 @@ impl AwsImmutableStore {
             .await
         {
             Ok(_) => Ok(FragmentState::Stored),
-            Err(AwsError::AwsSdkError(sdk_error))
-                if sdk_error
-                    .as_service_error()
-                    .is_some_and(|e| e.is_conditional_check_failed_exception()) =>
+            Err(AwsError::Aws(AwsCallError::Service(service)))
+                if service.code.is_conditional_check_failed_exception() =>
             {
-                let Some(PutItemError::ConditionalCheckFailedException(failure)) =
-                    sdk_error.as_service_error()
-                else {
-                    unreachable!()
+                let ErrorPayload::Item(item) = service.payload else {
+                    return Ok(FragmentState::Stored);
                 };
 
-                Ok(failure
-                    .item()
-                    .and_then(|item| {
-                        serde_dynamo::from_item::<_, FragmentStateEntry>(item.to_owned())
-                            .inspect_err(|e| {
-                                warn!("Failed to parse fragment state from item {item:?}: {e}");
-                            })
-                            .ok()
+                Ok(from_item::<FragmentStateEntry>(*item)
+                    .inspect_err(|e| {
+                        warn!(%hash, "Failed to parse the fragment state a create lost against: {e}");
                     })
                     .map_or(FragmentState::Stored, |entry| entry.state()))
             }
-            Err(e) => {
-                warn!(%hash, error = ?e, "Failed to publish fragment state");
-                if matches!(&e, AwsError::AwsSdkError(_)) {
-                    Err(StoreError::from(SlowDown))
-                } else {
-                    Err(StoreError::internal_with_context(
-                        e,
-                        "DynamoDB fragment state write failed",
-                    ))
-                }
-            }
+            Err(e) => Err(store_failure(e, "DynamoDB fragment state write failed")),
         }
     }
 
@@ -1046,8 +1041,9 @@ impl AwsImmutableStore {
     ///
     /// Only called for a payload S3 has lost. An obliteration holding the mark is left alone by the
     /// caller, since removing a mark mid-obliteration would let a put republish underneath it.
+    #[lore_macro::test_pub]
     async fn clear_state(&self, hash: Hash) -> Result<(), StoreError> {
-        let item = serde_dynamo::to_item(FragmentStateEntry::key(hash)).map_err(|e| {
+        let item = to_item(FragmentStateEntry::key(hash)).map_err(|e| {
             warn!("Failed to serialize fragment state key for {hash}: {e:?}");
             StoreError::internal_with_context(e, "Failed to serialize fragment state for delete")
         })?;
@@ -1058,13 +1054,7 @@ impl AwsImmutableStore {
                     .delete_item(&self.fragment_state_table_name, item)
             })
             .await
-            .map_err(|e| {
-                if matches!(&e, AwsError::AwsSdkError(_)) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(e, "DynamoDB fragment state delete failed")
-                }
-            })?;
+            .map_err(|e| store_failure(e, "DynamoDB fragment state delete failed"))?;
 
         Ok(())
     }
@@ -1074,16 +1064,16 @@ impl AwsImmutableStore {
     /// Losing this race is not a failure. Another writer reviving the same tombstone produced
     /// exactly the state this one wanted, and this one's bytes are already uploaded, so there is
     /// nothing left to disagree about. Only finding the hash back under an obliteration is a reason
-    /// to stop, and that is a back-off rather than an error because the mark is transient.
+    /// to stop, and that is a back-off rather than an error because the mark is transient. A write
+    /// that fails, rather than losing the race, is reported as it failed.
     ///
-    /// This tolerance belongs here rather than in [`AwsImmutableStore::advance_state`], which is
-    /// also how an obliteration takes its mark — treating "already in the target state" as success
-    /// there would let two obliterations both believe they hold it.
+    /// [`AwsImmutableStore::take_mark`] has no such tolerance: treating "already in the target
+    /// state" as success there would let two obliterations both believe they hold the mark.
+    #[lore_macro::test_pub]
     async fn revive_state(&self, hash: Hash) -> Result<(), StoreError> {
         if self
-            .advance_state(hash, FragmentState::Obliterated, FragmentState::Stored)
-            .await
-            .is_ok()
+            .compare_and_set_state(hash, FragmentState::Obliterated, FragmentState::Stored)
+            .await?
         {
             return Ok(());
         }
@@ -1100,19 +1090,89 @@ impl AwsImmutableStore {
         }
     }
 
-    /// Move the state row from one state to another, failing if it has moved underneath us.
+    /// Take the obliteration mark on `hash`, failing if its row is no longer `Stored`.
     ///
-    /// Obliteration uses this to take and release the mark. Because the row holds nothing but the
-    /// state, this compare-and-set is over a single attribute and two writers racing for the mark
-    /// cannot both win.
-    async fn advance_state(
+    /// Because the row holds nothing but the state, this compare-and-set is over a single attribute
+    /// and two obliterations racing for the mark cannot both win. A lost race is terminal: the row
+    /// says the work is not ours to do, and asking again will not change that.
+    #[lore_macro::test_pub]
+    async fn take_mark(&self, hash: Hash) -> Result<(), StoreError> {
+        if self
+            .compare_and_set_state(hash, FragmentState::Stored, FragmentState::Obliterating)
+            .await?
+        {
+            return Ok(());
+        }
+
+        warn!("Fragment state for {hash} was not Stored when taking the obliteration mark");
+        Err(StoreError::internal(
+            "Failed to update fragment state due to conflict",
+        ))
+    }
+
+    /// Move a marked `hash` into `target`: `Stored` releases the mark, `Obliterated` finalizes it.
+    ///
+    /// Only the mark's holder moves a row out of `Obliterating`, so a row already in `target` is
+    /// this obliteration's own earlier attempt, applied although its answer was lost, and counts as
+    /// done. A row in any other state is a conflict.
+    #[lore_macro::test_pub]
+    async fn clear_mark(&self, hash: Hash, target: FragmentState) -> Result<(), StoreError> {
+        if self
+            .compare_and_set_state(hash, FragmentState::Obliterating, target)
+            .await?
+        {
+            return Ok(());
+        }
+
+        match self.load_state(hash).await? {
+            Some(state) if state == target => {
+                debug!(%hash, ?target, "An earlier attempt already cleared the obliteration mark");
+                Ok(())
+            }
+            state => {
+                warn!(%hash, ?state, ?target, "Fragment state moved under a held obliteration mark");
+                Err(StoreError::internal(
+                    "Failed to update fragment state due to conflict",
+                ))
+            }
+        }
+    }
+
+    /// Run one step of an obliteration, from taking its mark onwards, retrying it on the store
+    /// ladder while it is shed.
+    ///
+    /// Every such step is safe to repeat. One still shed when the ladder runs out is reported as an
+    /// internal error rather than a back-off: a caller retrying the obliteration would find the mark
+    /// held and return early, reporting work left undone as complete.
+    async fn marked_step<T, F, Fut>(step: F) -> Result<T, StoreError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, StoreError>>,
+    {
+        with_backoff(StoreError::is_slow_down, step)
+            .await
+            .map_err(|error| {
+                if error.is_slow_down() {
+                    StoreError::internal_with_context(
+                        error,
+                        "Obliteration step still shed after the store ladder",
+                    )
+                } else {
+                    error
+                }
+            })
+    }
+
+    /// Move the state row from `expected` to `updated`, answering `false` when the row was not in
+    /// `expected` and so was left alone.
+    async fn compare_and_set_state(
         &self,
         hash: Hash,
         expected: FragmentState,
         updated: FragmentState,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let entry = FragmentStateEntry::new(hash, updated);
-        let item = serde_dynamo::to_item(&entry).map_err(|e| {
+        let item = to_item(&entry).map_err(|e| {
             warn!("Failed to serialize fragment state entry for {hash}: {e:?}");
             StoreError::internal_with_context(e, "Failed to serialize fragment state for DynamoDB")
         })?;
@@ -1128,24 +1188,16 @@ impl AwsImmutableStore {
             })
             .await
         {
-            Ok(_) => Ok(()),
-            Err(AwsError::AwsSdkError(sdk_error))
-                if sdk_error
-                    .as_service_error()
-                    .is_some_and(|e| e.is_conditional_check_failed_exception()) =>
+            Ok(_) => Ok(true),
+            Err(AwsError::Aws(AwsCallError::Service(ref service)))
+                if service.code.is_conditional_check_failed_exception() =>
             {
-                warn!(%hash, ?expected, ?updated, "Fragment state was not the expected state when updating it");
-                Err(StoreError::internal(
-                    "Failed to update fragment state due to conflict",
-                ))
+                Ok(false)
             }
-            Err(e) => {
-                warn!(%hash, error = ?e, "DynamoDB conditional put failed while updating fragment state");
-                Err(StoreError::internal_with_context(
-                    e,
-                    "DynamoDB conditional fragment state update failed",
-                ))
-            }
+            Err(e) => Err(store_failure(
+                e,
+                "DynamoDB conditional fragment state update failed",
+            )),
         }
     }
 
@@ -1156,7 +1208,7 @@ impl AwsImmutableStore {
     ) -> Result<(), StoreError> {
         let entry = FragmentsEntry::new(partition, address);
 
-        let item = serde_dynamo::to_item(&entry).map_err(|e| {
+        let item = to_item(&entry).map_err(|e| {
             warn!("Failed to convert fragment entry: {entry:?} to dynamo attribute value map: {e}");
             StoreError::internal_with_context(
                 e,
@@ -1165,19 +1217,11 @@ impl AwsImmutableStore {
         })?;
 
         self.association_reads
-            .write(
-                (partition, address),
-                || self.dynamodb.put_item(&self.fragments_table_name, item),
-            )
+            .write((partition, address), || {
+                self.dynamodb.put_item(&self.fragments_table_name, item)
+            })
             .await
-            .map_err(|e| {
-                warn!({PARTITION_ID} = %partition, {ADDRESS} = %address, error = ?e, "Failed to put item while storing fragment association");
-                if matches!(&e, AwsError::AwsSdkError(_)) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(e, "DynamoDB fragment association write failed")
-                }
-            })?;
+            .map_err(|e| store_failure(e, "DynamoDB fragment association write failed"))?;
 
         Ok(())
     }
@@ -1197,32 +1241,21 @@ impl AwsImmutableStore {
 
         let mut items = Vec::with_capacity(distinct.len());
         for hash in &distinct {
-            items.push(
-                serde_dynamo::to_item(FragmentStateEntry::key(*hash)).map_err(|e| {
-                    warn!("Failed to serialize fragment state entry for {hash}: {e:?}");
-                    StoreError::internal_with_context(e, "Failed to serialize fragment state entry")
-                })?,
-            );
+            items.push(to_item(FragmentStateEntry::key(*hash)).map_err(|e| {
+                warn!("Failed to serialize fragment state entry for {hash}: {e:?}");
+                StoreError::internal_with_context(e, "Failed to serialize fragment state entry")
+            })?);
         }
 
         let output = self
             .dynamodb
             .batch_get_item(&self.fragment_state_table_name, items, true)
             .await
-            .map_err(|e| {
-                warn!(error = ?e, "DynamoDb fragment state resolve failed");
-                if is_dynamodb_overloaded(&e) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(e, "DynamoDB batch get items failed")
-                }
-            })?;
+            .map_err(|e| store_failure(e, "DynamoDB fragment state batch read failed"))?;
 
         let mut states = HashMap::with_capacity(output.len());
         for item in output {
-            match serde_dynamo::from_item::<HashMap<String, AttributeValue>, FragmentStateEntry>(
-                item,
-            ) {
+            match from_item::<FragmentStateEntry>(item) {
                 Ok(entry) => {
                     states.insert(entry.hash, entry.state());
                 }
@@ -1237,9 +1270,9 @@ impl AwsImmutableStore {
     /// request rather than one per hash.
     ///
     /// A fragment written before the state table existed has no state row, and its lifecycle lives
-    /// in the flags of its metadata row instead. Without this an address stored in that era resolves
-    /// to absence, and a push would ask a client to upload content it does not have and the store
-    /// already holds.
+    /// in the flags of its metadata row instead. Without this an address stored in that era
+    /// resolves to absence, and a push would ask a client to upload content it does not have and
+    /// the store already holds.
     async fn legacy_states_for(
         &self,
         hashes: &[Hash],
@@ -1257,35 +1290,24 @@ impl AwsImmutableStore {
 
         let mut items = Vec::with_capacity(distinct.len());
         for hash in &distinct {
-            items.push(
-                serde_dynamo::to_item(FragmentStateEntry::key(*hash)).map_err(|e| {
-                    warn!("Failed to serialize legacy fragment key for {hash}: {e:?}");
-                    StoreError::internal_with_context(
-                        e,
-                        "Failed to serialize fragment entry for legacy metadata load",
-                    )
-                })?,
-            );
+            items.push(to_item(FragmentStateEntry::key(*hash)).map_err(|e| {
+                warn!("Failed to serialize legacy fragment key for {hash}: {e:?}");
+                StoreError::internal_with_context(
+                    e,
+                    "Failed to serialize fragment entry for legacy metadata load",
+                )
+            })?);
         }
 
         let output = self
             .dynamodb
             .batch_get_item(table_name, items, true /* consistent read */)
             .await
-            .map_err(|e| {
-                warn!(error = ?e, "DynamoDb legacy fragment metadata batch read failed");
-                if is_dynamodb_overloaded(&e) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(e, "DynamoDB batch get items failed")
-                }
-            })?;
+            .map_err(|e| store_failure(e, "DynamoDB legacy fragment metadata batch read failed"))?;
 
         let mut states = HashMap::with_capacity(output.len());
         for item in output {
-            match serde_dynamo::from_item::<HashMap<String, AttributeValue>, FragmentMetadataEntry>(
-                item,
-            ) {
+            match from_item::<FragmentMetadataEntry>(item) {
                 Ok(entry) => {
                     if let Some(fragment) = entry.fragment {
                         states.insert(entry.hash, FragmentState::from_bits(fragment.flags));
@@ -1311,22 +1333,7 @@ impl AwsImmutableStore {
             )
             .await
             .map(|output| output.count > 0)
-            .map_err(|e| {
-                if is_dynamodb_overloaded(&e) {
-                    StoreError::from(SlowDown)
-                } else {
-                    warn!(
-                        {PARTITION_ID} = %partition,
-                        hash = %hash,
-                        error = ?e,
-                        "DynamoDb query for a partition association failed"
-                    );
-                    StoreError::internal_with_context(
-                        e,
-                        "DynamoDB partition association query failed",
-                    )
-                }
-            })
+            .map_err(|e| store_failure(e, "DynamoDB partition association query failed"))
     }
 
     async fn has_associations(&self, hash: Hash) -> Result<bool, StoreError> {
@@ -1334,19 +1341,10 @@ impl AwsImmutableStore {
             .query_single(&self.fragments_table_name, FragmentsQuery(hash))
             .await
             .map(|output| output.count > 0)
-            .map_err(|e| {
-                warn!(%hash, error = ?e, "DynamoDb query for fragment association count failed");
-                if matches!(&e, AwsError::AwsSdkError(_)) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(
-                        e,
-                        "DynamoDB fragment association count query failed",
-                    )
-                }
-            })
+            .map_err(|e| store_failure(e, "DynamoDB fragment association query failed"))
     }
 
+    #[lore_macro::test_pub]
     async fn delete_association(
         &self,
         partition: Partition,
@@ -1354,7 +1352,7 @@ impl AwsImmutableStore {
     ) -> Result<(), StoreError> {
         let entry = FragmentsEntry::new(partition, address);
 
-        let item = serde_dynamo::to_item(&entry).map_err(|e| {
+        let item = to_item(&entry).map_err(|e| {
             warn!("Failed to convert fragment entry: {entry:?} to dynamo attribute value map: {e}");
             StoreError::internal_with_context(
                 e,
@@ -1363,19 +1361,11 @@ impl AwsImmutableStore {
         })?;
 
         self.association_reads
-            .write(
-                (partition, address),
-                || self.dynamodb.delete_item(&self.fragments_table_name, item),
-            )
+            .write((partition, address), || {
+                self.dynamodb.delete_item(&self.fragments_table_name, item)
+            })
             .await
-            .map_err(|e| {
-                warn!({PARTITION_ID} = %partition, {ADDRESS} = %address, error = ?e, "Failed to delete fragment association");
-                if matches!(&e, AwsError::AwsSdkError(_)) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(e, "DynamoDB fragment association delete failed")
-                }
-            })?;
+            .map_err(|e| store_failure(e, "DynamoDB fragment association delete failed"))?;
 
         Ok(())
     }
@@ -1411,14 +1401,7 @@ impl AwsImmutableStore {
                 )
                 .await
                 .map(|_| ())
-                .map_err(|error| {
-                    warn!(?error, %hash, %s3_key, "Failed to write payload for hash");
-                    if matches!(&error, AwsError::AwsSdkError(_)) {
-                        StoreError::from(SlowDown)
-                    } else {
-                        StoreError::internal_with_context(error, "S3 put object failed")
-                    }
-                })?;
+                .map_err(|e| store_failure(e, "S3 put object failed"))?;
         }
 
         match self.publish_state(hash).await? {
@@ -1440,58 +1423,59 @@ impl AwsImmutableStore {
         Ok(())
     }
 
-    /// Permanently delete a payload from S3 by removing *ALL* versions from the bucket.
+    /// Permanently delete a payload from S3 by removing every stored version of its object.
+    ///
+    /// Delete markers are left in place. When the listing names no stored version, the unversioned
+    /// delete is sent instead.
     async fn delete_payload(&self, hash: Hash) -> Result<(), StoreError> {
         let mut dst = [0u8; 64];
-        let hash = lore_revision::util::to_hex_str(hash.data(), &mut dst);
+        let key = lore_revision::util::to_hex_str(hash.data(), &mut dst);
 
-        let versions: Option<Vec<Option<String>>> = self
+        let listing = self
             .s3
-            .list_versions(self.bucket.as_str(), hash)
+            .list_versions(self.bucket.as_str(), key)
             .await
-            .map(|output| {
-                output
-                    .versions
-                    .map(|versions| versions.into_iter().map(|v| v.version_id).collect())
-            })
-            .map_err(|e| {
-                warn!(%hash, error = ?e, "Failed to list payload versions");
-                if matches!(&e, AwsError::AwsSdkError(_)) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(e, "S3 list object versions failed")
-                }
-            })?;
+            .map_err(|e| store_failure(e, "S3 list object versions failed"))?;
 
-        if let Some(versions) = versions {
-            for version in versions {
-                self.s3
-                    .delete_object(self.bucket.as_str(), hash, version)
-                    .await
-                    .map_err(|e| {
-                        warn!(%hash, error = ?e, "Failed to delete payload");
-                        if matches!(&e, AwsError::AwsSdkError(_)) {
-                            StoreError::from(SlowDown)
-                        } else {
-                            StoreError::internal_with_context(e, "S3 delete object version failed")
-                        }
-                    })?;
+        // A partial listing must not be reported as a completed obliteration.
+        if listing.truncated {
+            warn!(
+                %hash,
+                versions = listing.versions.len(),
+                "S3 could not list every version of a hash being obliterated; retrying later"
+            );
+            return Err(StoreError::from(SlowDown));
+        }
+
+        let mut deleted_a_version = false;
+        for version in listing.versions_of(key) {
+            if version.is_delete_marker {
+                continue;
             }
-        } else {
-            self.s3
-                .delete_object(self.bucket.as_str(), hash, None)
-                .await
-                .map_err(|e| {
-                    warn!(%hash, error = ?e, "Failed to delete payload");
-                    if matches!(&e, AwsError::AwsSdkError(_)) {
-                        StoreError::from(SlowDown)
-                    } else {
-                        StoreError::internal_with_context(e, "S3 delete object failed")
-                    }
-                })?;
+            deleted_a_version = true;
+            self.delete_object_version(key, version.version_id.as_deref())
+                .await?;
+        }
+
+        if !deleted_a_version {
+            self.delete_object_version(key, None).await?;
         }
 
         Ok(())
+    }
+
+    /// Delete one version of the object at `key`, or the unversioned object when `version` is
+    /// `None`.
+    async fn delete_object_version(
+        &self,
+        key: &str,
+        version: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.s3
+            .delete_object(self.bucket.as_str(), key, version)
+            .await
+            .map(|_| ())
+            .map_err(|e| store_failure(e, "S3 delete object failed"))
     }
 
     async fn s3_head_object(&self, hash: Hash) -> Result<HeadObjectOutput, StoreError> {
@@ -1504,18 +1488,13 @@ impl AwsImmutableStore {
             )
             .await
             .map_err(|e| {
-                if let AwsError::AwsSdkError(sdk_error) = e {
-                    debug!(%hash, error = ?sdk_error, "head_fragment SDK error heading object");
-                    match sdk_error.into_service_error() {
-                        HeadObjectError::NotFound(_) => StoreError::from(AddressNotFound::from(
-                            Address::zero_context_hash(hash),
-                        )),
-                        _ => StoreError::from(SlowDown),
-                    }
-                } else {
-                    debug!(%hash, error = ?e, "head_fragment failed to head object");
-                    StoreError::internal_with_context(e, "S3 head object failed")
+                if names_no_object(&e, S3ErrorCode::is_not_found) {
+                    return StoreError::from(AddressNotFound::from(Address::zero_context_hash(
+                        hash,
+                    )));
                 }
+
+                store_failure(e, "S3 head object failed")
             })?;
         Ok(output)
     }
@@ -1557,8 +1536,9 @@ impl AwsImmutableStore {
     /// This is the cheap existence probe the whole design turns on: one strongly consistent
     /// `GetItem` answers "is this payload durable" for every partition at once, with no S3 request
     /// and no dependence on how many partitions reference it.
+    #[lore_macro::test_pub]
     pub(crate) async fn load_state(&self, hash: Hash) -> Result<Option<FragmentState>, StoreError> {
-        let item = serde_dynamo::to_item(FragmentStateEntry::key(hash)).map_err(|e| {
+        let item = to_item(FragmentStateEntry::key(hash)).map_err(|e| {
             warn!("Failed to serialize fragment state entry for {hash}: {e:?}");
             StoreError::internal_with_context(
                 e,
@@ -1574,20 +1554,13 @@ impl AwsImmutableStore {
                 true, /* consistent read */
             )
             .await
-            .map_err(|e| {
-                warn!(%hash, error = ?e, "Failed to get fragment state");
-                if is_dynamodb_overloaded(&e) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(e, "DynamoDB fragment state read failed")
-                }
-            })?
+            .map_err(|e| store_failure(e, "DynamoDB fragment state read failed"))?
             .item
         else {
             return Ok(None);
         };
 
-        let entry: FragmentStateEntry = serde_dynamo::from_item(av_map).map_err(|e| {
+        let entry: FragmentStateEntry = from_item(av_map).map_err(|e| {
             warn!("Failed to deserialize fragment state: {e:?}");
             StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
         })?;
@@ -1620,7 +1593,7 @@ impl AwsImmutableStore {
             ));
         };
 
-        let item = serde_dynamo::to_item(FragmentStateEntry::key(hash)).map_err(|e| {
+        let item = to_item(FragmentStateEntry::key(hash)).map_err(|e| {
             warn!("Failed to serialize legacy fragment key for {hash}: {e:?}");
             StoreError::internal_with_context(
                 e,
@@ -1632,16 +1605,9 @@ impl AwsImmutableStore {
             .dynamodb
             .get_item(table_name, item, true /* consistent read */)
             .await
-            .map_err(|e| {
-                warn!(%hash, error = ?e, "Failed to read fragment metadata table");
-                if is_dynamodb_overloaded(&e) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(e, "DynamoDB fragment metadata read failed")
-                }
-            })?
+            .map_err(|e| store_failure(e, "DynamoDB fragment metadata read failed"))?
             .item
-            .map(serde_dynamo::from_item::<_, FragmentMetadataEntry>)
+            .map(from_item::<FragmentMetadataEntry>)
             .transpose()
             .map_err(|e| {
                 warn!(%hash, "Failed to deserialize fragment metadata row: {e:?}");
@@ -1665,18 +1631,13 @@ impl AwsImmutableStore {
             )
             .await
             .map_err(|e| {
-                if let AwsError::AwsSdkError(sdk_error) = e {
-                    debug!(hash = %hash, error = ?sdk_error, "get_s3_payload SDK error getting object");
-                    match sdk_error.into_service_error() {
-                        GetObjectError::NoSuchKey(_) => StoreError::from(AddressNotFound::from(
-                            Address::zero_context_hash(hash),
-                        )),
-                        _ => StoreError::from(SlowDown),
-                    }
-                } else {
-                    debug!(hash = %hash, error = ?e, "get_s3_payload failed to get object");
-                    StoreError::internal_with_context(e, "S3 get object failed")
+                if names_no_object(&e, S3ErrorCode::is_no_such_key) {
+                    return StoreError::from(AddressNotFound::from(Address::zero_context_hash(
+                        hash,
+                    )));
                 }
+
+                store_failure(e, "S3 get object failed")
             })?;
 
         // The Content-Length header arrives with the response before the body is streamed.
@@ -1692,17 +1653,7 @@ impl AwsImmutableStore {
         if let Some(size) = content_length
             && size > MAX_OBJECT_SIZE
         {
-            warn!(
-                hash = %hash,
-                size,
-                max = MAX_OBJECT_SIZE,
-                "S3 object exceeds maximum allowed size; treating as malicious"
-            );
-            return Err(StoreError::from(Oversized {
-                context: format!(
-                    "S3 object size {size} for {hash} exceeds maximum {MAX_OBJECT_SIZE}"
-                ),
-            }));
+            return Err(oversized_object(hash, size, MAX_OBJECT_SIZE));
         }
 
         let fragment = from_object_metadata(output.metadata());
@@ -1718,10 +1669,17 @@ impl AwsImmutableStore {
         let mut read = 0_usize;
         while let Some(bytes) = output.body.next().await {
             let bytes = bytes.map_err(|e| {
-                warn!(%hash, error = ?e, "Failed to read bytes from S3 response");
-                StoreError::internal_with_context(e, "Failed to read bytes from S3 response stream")
+                // An interrupted body is a transport failure, not a damaged object.
+                warn!("Failed to read bytes from S3 response for key: {hash}: {e:?}");
+                StoreError::from(SlowDown)
             })?;
-            read += bytes.len();
+            // A chunked reply declares no length, so only this bound covers it.
+            let total = read.saturating_add(bytes.len());
+            if total > MAX_OBJECT_SIZE {
+                return Err(oversized_object(hash, total, MAX_OBJECT_SIZE));
+            }
+
+            read = total;
             trace!("Read {read} bytes from S3 stream");
             buffer.extend_from_slice(bytes.as_ref());
         }
@@ -1765,6 +1723,7 @@ impl AwsImmutableStore {
     /// There is no `DynamoDB` read here at all. The fragment arrives as object metadata on the very
     /// response carrying the bytes, so it describes those bytes by construction — no second record
     /// to consult, and nothing that can be stale with respect to what was read.
+    #[lore_macro::test_pub]
     pub(crate) async fn load(&self, hash: Hash) -> Result<(Fragment, Bytes), StoreError> {
         let s3_contents = self.get_s3_object_contents(hash).await?;
 
@@ -1903,9 +1862,9 @@ impl ImmutableStoreTrait for AwsImmutableStore {
     /// Stated rather than defaulted. The default reads `MatchPartition` off
     /// [`ImmutableStoreTrait::isolates_partitions`], on the reasoning that a store reporting a
     /// partition match hands the caller a level to act on with a `copy` instead of a transfer. This
-    /// store declines to establish that level — telling an unassociated hash apart from an absent one
-    /// costs a `Query` per address, which `query` explains — so it would be advertising a shortcut
-    /// that never arrives.
+    /// store declines to establish that level — telling an unassociated hash apart from an absent
+    /// one costs a `Query` per address, which `query` explains — so it would be advertising a
+    /// shortcut that never arrives.
     fn query_scope(&self) -> StoreMatch {
         StoreMatch::MatchFull
     }
@@ -1942,8 +1901,8 @@ impl ImmutableStoreTrait for AwsImmutableStore {
         debug_assert_eq!(addresses.len(), results.len());
 
         // Timed around a call rather than around the body, unlike the other operations here: `?`
-        // inside a `timed!` block returns from this function and skips the record, so an inline body
-        // would report only the calls that succeeded.
+        // inside a `timed!` block returns from this function and skips the record, so an inline
+        // body would report only the calls that succeeded.
         timed!(self.latency_histogram, &self.labels_query, {
             self.do_query_batch(partition, addresses, results).await
         })
@@ -1972,7 +1931,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 partition,
                 address,
                 &self.labels_get_metadata,
-                &self.shared_labels_get_metadata,
+                SharedReadContext::GetMetadata,
             ));
             let mut head_fut = Box::pin(self.head_fragment(address.hash));
 
@@ -2032,9 +1991,10 @@ impl ImmutableStoreTrait for AwsImmutableStore {
     ) -> Result<StoreGetData, StoreError> {
         let result: Result<(Fragment, Bytes), StoreError> =
             timed!(self.latency_histogram, &self.labels_get, {
-                // Run both futures concurrently. The select! loop breaks as soon as exists resolves.
-                // If load finishes first its result is stashed, and we keep waiting for exists check.
-                let exists_fut = self.exists(partition, address, &self.shared_labels_get);
+                // Run both futures concurrently. The select! loop breaks as soon as exists
+                // resolves. If load finishes first its result is stashed, and we keep waiting for
+                // exists check.
+                let exists_fut = self.exists(partition, address, SharedReadContext::Get);
                 let load_fut = self.load(address.hash);
                 tokio::pin!(exists_fut, load_fut);
 
@@ -2047,8 +2007,8 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                         }
                     }
                 };
-                // If exists failed, its error is returned here; load_fut is dropped (canceled) on the
-                // early return. Exists error takes priority over any load error.
+                // If exists failed, its error is returned here; load_fut is dropped (canceled) on
+                // the early return. Exists error takes priority over any load error.
                 if !exists_result? {
                     return Err(StoreError::from(AddressNotFound::from(address)));
                 }
@@ -2102,8 +2062,8 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 (None, false)
             } else {
                 let (associated, state) = tokio::join!(
-                    self.exists(partition, address, &self.shared_labels_put),
-                    self.load_state_shared(address.hash, &self.shared_labels_put)
+                    self.exists(partition, address, SharedReadContext::Put),
+                    self.load_state_shared(address.hash, SharedReadContext::Put)
                 );
                 (state?, associated?)
             };
@@ -2151,7 +2111,8 @@ impl ImmutableStoreTrait for AwsImmutableStore {
     ) -> Result<(), StoreError> {
         timed!(self.latency_histogram, &self.labels_obliterate, {
             // Note: given the importance of the work done here, and how relatively infrequently we
-            // expect this to be invoked, the log output in this method is intentionally very verbose.
+            // expect this to be invoked, the log output in this method is intentionally very
+            // verbose.
             let span = tracing::Span::current();
 
             // Content written before the state table existed has no row here, so this returns
@@ -2165,13 +2126,19 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 return Ok(());
             };
 
-            if state.is_obliteration() {
-                info!("Fragment {address} is already being, or has already been, obliterated");
-                return Ok(());
-            }
-
             // The reference goes first, because that is the obligation: once this returns, this
             // partition does not name the content. Everything after it is reclamation.
+            if state.is_obliteration() {
+                info!(
+                    "Fragment {address} is already being, or has already been, obliterated; \
+                     deleting this partition's association only"
+                );
+                return self
+                    .delete_association(partition, address)
+                    .instrument(span.clone())
+                    .await;
+            }
+
             self.delete_association(partition, address)
                 .instrument(span.clone())
                 .await?;
@@ -2179,38 +2146,28 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 .num_fragments
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-            self.advance_state(
-                address.hash,
-                FragmentState::Stored,
-                FragmentState::Obliterating,
-            )
-            .instrument(span.clone())
-            .await?;
+            Self::marked_step(|| self.take_mark(address.hash))
+                .instrument(span.clone())
+                .await?;
             info!("Acquired obliteration mark for {address}");
 
             // Again, now the mark is up: a writer that raced the first delete recreated the
             // association while the hash still looked live, and would otherwise outlive the
             // obliteration. One that associates after this point sees the mark and is turned away,
             // or is re-storing content of its own - which is a new write, not this one surviving.
-            self.delete_association(partition, address)
+            Self::marked_step(|| self.delete_association(partition, address))
                 .instrument(span.clone())
                 .await?;
 
             tokio::time::sleep(self.obliteration_drain).await;
 
             info!("Association deleted, re-checking for other associations...");
-            if self
-                .has_associations(address.hash)
+            if Self::marked_step(|| self.has_associations(address.hash))
                 .instrument(span.clone())
                 .await?
             {
                 info!("Fragment still associated, releasing the obliteration mark");
-                return self
-                    .advance_state(
-                        address.hash,
-                        FragmentState::Obliterating,
-                        FragmentState::Stored,
-                    )
+                return Self::marked_step(|| self.clear_mark(address.hash, FragmentState::Stored))
                     .instrument(span.clone())
                     .await
                     .inspect_err(|e| {
@@ -2218,12 +2175,14 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                     });
             }
 
-            self.clone()
-                .obliterate_sub_fragments(partition, address, stats.clone())
-                .instrument(span.clone())
-                .await?;
+            Self::marked_step(|| {
+                self.clone()
+                    .obliterate_sub_fragments(partition, address, stats.clone())
+            })
+            .instrument(span.clone())
+            .await?;
 
-            self.delete_payload(address.hash)
+            Self::marked_step(|| self.delete_payload(address.hash))
                 .instrument(span.clone())
                 .await?;
 
@@ -2231,15 +2190,11 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 .num_payloads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-            self.advance_state(
-                address.hash,
-                FragmentState::Obliterating,
-                FragmentState::Obliterated,
-            )
-            .await
-            .inspect_err(|e| {
-                warn!({PARTITION_ID} = %partition, {ADDRESS} = %address, error = ?e, "Failed to finalize obliterate");
-            })
+            Self::marked_step(|| self.clear_mark(address.hash, FragmentState::Obliterated))
+                .await
+                .inspect_err(|e| {
+                    warn!("Failed to finalize obliterate for {address}: {e:?}");
+                })
         })
         .into()
     }
@@ -2267,7 +2222,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 self.has_partition_association(source_partition, source_address.hash)
                     .await?
             } else {
-                self.exists(source_partition, source_address, &self.shared_labels_copy)
+                self.exists(source_partition, source_address, SharedReadContext::Copy)
                     .await?
             };
             if !present {
@@ -2320,6 +2275,33 @@ impl ImmutableStoreTrait for AwsImmutableStore {
     }
 }
 
+/// Access to the store's flights, so a test can hold a read in flight.
+#[cfg(feature = "test-util")]
+pub mod test_util {
+    use lore_base::types::Address;
+    use lore_base::types::Hash;
+    use lore_base::types::Partition;
+    use lore_storage::StoreError;
+
+    use super::AwsImmutableStore;
+    use super::FragmentState;
+    use crate::store::single_flight::SingleFlight;
+
+    impl AwsImmutableStore {
+        pub fn association_reads(
+            &self,
+        ) -> &SingleFlight<(Partition, Address), Result<bool, StoreError>> {
+            &self.association_reads
+        }
+
+        pub fn state_reads(
+            &self,
+        ) -> &SingleFlight<Hash, Result<Option<FragmentState>, StoreError>> {
+            &self.state_reads
+        }
+    }
+}
+
 struct AwsImmutableStoreInstrumentProvider;
 
 impl InstrumentProvider for AwsImmutableStoreInstrumentProvider {
@@ -2329,2352 +2311,5 @@ impl InstrumentProvider for AwsImmutableStoreInstrumentProvider {
 
     fn labels(&self) -> &[KeyValue] {
         STORE_ATTRIBUTES.as_slice()
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use std::sync::atomic::Ordering;
-
-    use lore_base::types::FragmentFlags;
-    use lore_storage::ImmutableStore;
-    use rand::random;
-    use zerocopy::IntoBytes;
-
-    use super::*;
-    use crate::store::object_metadata::PAYLOAD_FLAGS;
-    use crate::store::test_util::*;
-
-    #[tokio::test]
-    async fn put_stores_the_fragment_on_the_object() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        store(&fake)
-            .await
-            .put(partition, address, fragment, Some(payload.clone()), false)
-            .await
-            .expect("put should succeed");
-
-        assert_eq!(fake.stored_fragment(address.hash), Some(fragment));
-        assert_eq!(fake.object(address.hash).unwrap().0, payload.as_ref());
-        assert_eq!(fake.state_of(address.hash), Some(FragmentState::Stored));
-        assert_eq!(fake.association_count(address.hash), 1);
-    }
-
-    #[tokio::test]
-    async fn put_of_an_already_associated_fragment_writes_nothing() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(partition, address, fragment, Some(payload.clone()), false)
-            .await
-            .expect("first put should succeed");
-
-        let (other, other_payload) = representation(FragmentFlags::PayloadCompressedLZ4, 96, 256);
-        store
-            .put(partition, address, other, Some(other_payload), false)
-            .await
-            .expect("second put should succeed");
-
-        assert_eq!(
-            fake.stored_fragment(address.hash),
-            Some(fragment),
-            "an already associated put must not re-upload"
-        );
-        assert_eq!(fake.object(address.hash).unwrap().0, payload.as_ref());
-    }
-
-    #[tokio::test]
-    async fn put_deduplicates_across_partitions_without_uploading() {
-        let fake = Fake::default();
-        let hash: Hash = random();
-        let first = Address {
-            hash,
-            context: random(),
-        };
-        let second = Address {
-            hash,
-            context: random(),
-        };
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(
-                random::<Context>().into(),
-                first,
-                fragment,
-                Some(payload.clone()),
-                false,
-            )
-            .await
-            .expect("first put should succeed");
-
-        let (other, other_payload) = representation(FragmentFlags::PayloadCompressedLZ4, 96, 256);
-        store
-            .put(
-                random::<Context>().into(),
-                second,
-                other,
-                Some(other_payload),
-                false,
-            )
-            .await
-            .expect("cross-partition put should succeed");
-
-        assert_eq!(
-            fake.stored_fragment(hash),
-            Some(fragment),
-            "deduplication must leave the stored representation alone"
-        );
-        assert_eq!(fake.association_count(hash), 2);
-    }
-
-    #[tokio::test]
-    async fn put_without_a_payload_may_not_claim_stored_content() {
-        let fake = Fake::default();
-        let hash: Hash = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(
-                random::<Context>().into(),
-                Address {
-                    hash,
-                    context: random(),
-                },
-                fragment,
-                Some(payload),
-                false,
-            )
-            .await
-            .expect("first put should succeed");
-
-        let claimed = Address {
-            hash,
-            context: random(),
-        };
-        store
-            .put(random::<Context>().into(), claimed, fragment, None, false)
-            .await
-            .expect_err("a hash alone is not evidence the caller holds the content");
-
-        assert_eq!(fake.association_count(hash), 1);
-    }
-
-    #[tokio::test]
-    async fn get_reads_the_fragment_from_the_object_it_returns() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(partition, address, fragment, Some(payload.clone()), false)
-            .await
-            .expect("put should succeed");
-
-        let (loaded, bytes) = store
-            .get(partition, address)
-            .await
-            .and_then(lore_storage::StoreGetData::into_payload)
-            .expect("get should succeed");
-
-        assert_eq!(bytes, payload);
-        assert_eq!(loaded.size_payload, fragment.size_payload);
-        assert_eq!(loaded.size_content, fragment.size_content);
-        assert_eq!(
-            loaded.flags & FragmentFlags::PayloadStoredDurable,
-            FragmentFlags::PayloadStoredDurable,
-            "durability is derived from the object existing, not read from a record"
-        );
-    }
-
-    /// Query answers from `DynamoDB` alone. It is on the ingress write path, once per fragment
-    /// stored, so it must not reach S3 — which means it reports whether the payload is there and
-    /// durable, not what representation is stored.
-    #[tokio::test]
-    async fn query_reports_a_match_without_reading_s3() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(partition, address, fragment, Some(payload), false)
-            .await
-            .expect("put should succeed");
-
-        let result = query_one(&(store as Arc<dyn ImmutableStoreTrait>), partition, address)
-            .await
-            .expect("resolve should succeed");
-
-        assert_eq!(result.match_made, StoreMatch::MatchFull);
-        assert!(result.stored_durable);
-        assert_eq!(
-            fake.object_reads(),
-            0,
-            "resolve must not touch S3; it is called once per fragment on the ingress write path"
-        );
-    }
-
-    /// The representation a put stored must come back from a later metadata read — the whole
-    /// reason this path exists separately from `query`, which cannot report it.
-    #[tokio::test]
-    async fn get_metadata_returns_the_representation_that_was_stored() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(partition, address, fragment, Some(payload), false)
-            .await
-            .expect("put should succeed");
-
-        let result = store
-            .get_metadata(partition, address)
-            .await
-            .expect("get_metadata should succeed");
-
-        assert_eq!(result.match_made, StoreMatch::MatchFull);
-        assert_eq!(result.fragment.size_payload, fragment.size_payload);
-        assert_eq!(result.fragment.size_content, fragment.size_content);
-        assert_eq!(
-            result.fragment.flags & PAYLOAD_FLAGS,
-            fragment.flags & PAYLOAD_FLAGS,
-            "the stored compression must survive the round trip"
-        );
-        assert_eq!(
-            result.fragment.flags & FragmentFlags::PayloadStoredDurable,
-            FragmentFlags::PayloadStoredDurable
-        );
-        assert_eq!(
-            fake.object_reads(),
-            1,
-            "exactly one HeadObject, and only on this path"
-        );
-    }
-
-    #[tokio::test]
-    async fn get_metadata_reads_a_preexisting_object_from_the_fragment_metadata_table() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, _) = preexisting_object(&fake, partition, address);
-
-        let result = migrated_store(&fake)
-            .await
-            .get_metadata(partition, address)
-            .await
-            .expect("get_metadata should succeed");
-
-        assert_eq!(result.match_made, StoreMatch::MatchFull);
-        assert_eq!(result.fragment.size_payload, fragment.size_payload);
-        assert_eq!(result.fragment.size_content, fragment.size_content);
-    }
-
-    /// The resolution alone decides a miss, and it is not held back for the object.
-    ///
-    /// Whether the overlapped `HeadObject` reaches S3 first is not part of the contract: it is
-    /// started alongside the resolution rather than after it, so a resolution that answers without
-    /// ever yielding cancels it unsent, while one that yields lets it go out. Both are correct and
-    /// its result is discarded either way, so this bounds the reads instead of fixing them — an
-    /// equality here asserts the scheduler, not the store.
-    #[tokio::test]
-    async fn get_metadata_reports_a_miss_for_an_unknown_address() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-
-        let result = store(&fake)
-            .await
-            .get_metadata(random::<Context>().into(), address)
-            .await
-            .expect("get_metadata should succeed");
-
-        assert_eq!(result.match_made, StoreMatch::MatchNone);
-        assert!(
-            fake.object_reads() <= 1,
-            "a miss must cost at most the one overlapped HeadObject, saw {}",
-            fake.object_reads()
-        );
-    }
-
-    /// The ordering the single-read existence path rests on: the association is written last, so
-    /// nothing can observe one whose content is not already stored and published.
-    #[tokio::test]
-    async fn a_put_associates_only_after_publishing_the_state() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(partition, address, fragment, Some(payload), false)
-            .await
-            .expect("put should succeed");
-
-        assert_eq!(fake.state_of(address.hash), Some(FragmentState::Stored));
-        assert!(fake.has_association(partition, address));
-    }
-
-    /// Obliteration drops the reference before it marks the hash, because the reference is the
-    /// obligation and the mark is only bookkeeping for the reclamation that follows.
-    #[tokio::test]
-    async fn obliterate_deletes_the_association_before_marking_the_hash() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(partition, address, fragment, Some(payload), false)
-            .await
-            .expect("put should succeed");
-
-        store
-            .clone()
-            .obliterate(
-                partition,
-                address,
-                Arc::new(StoreObliterateStats::default()),
-            )
-            .await
-            .expect("obliterate should succeed");
-
-        assert!(!fake.has_association(partition, address));
-
-        let result = query_one(&(store as Arc<dyn ImmutableStoreTrait>), partition, address)
-            .await
-            .expect("query should succeed");
-        assert_eq!(result.match_made, StoreMatch::MatchNone);
-    }
-
-    /// Obliterating a list passes over its holes: a hole names no fragment, so its state is never
-    /// read, and the list's leaves are obliterated as those of a list without holes are.
-    #[tokio::test]
-    async fn obliterate_passes_over_the_holes_of_a_list() {
-        let fake = Fake::default();
-        let partition: Partition = random();
-        let context: Context = random();
-        let store = store(&fake).await;
-        let mut state_reads = Vec::new();
-        for with_hole in [false, true] {
-            let leaves: [Hash; 2] = [random(), random()];
-            for hash in leaves {
-                let (fragment, payload) =
-                    representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-                store
-                    .clone()
-                    .put(
-                        partition,
-                        Address { hash, context },
-                        fragment,
-                        Some(payload),
-                        false,
-                    )
-                    .await
-                    .expect("put a leaf");
-            }
-            let mut references = vec![FragmentReference {
-                hash: leaves[0],
-                offset_content: 0,
-            }];
-            if with_hole {
-                references.push(FragmentReference {
-                    hash: Hash::default(),
-                    offset_content: 256,
-                });
-            }
-            references.push(FragmentReference {
-                hash: leaves[1],
-                offset_content: 4096,
-            });
-            let list = Bytes::copy_from_slice(references.as_bytes());
-            let fragment = Fragment {
-                flags: FragmentFlags::PayloadFragmented.bits(),
-                size_payload: u32::try_from(list.len()).unwrap(),
-                size_content: 4096 + 256,
-            };
-            let list_address = Address {
-                hash: random(),
-                context,
-            };
-            store
-                .clone()
-                .put(partition, list_address, fragment, Some(list), false)
-                .await
-                .expect("put the list");
-
-            let before = fake.state_get_items();
-            store
-                .clone()
-                .obliterate(partition, list_address, Arc::default())
-                .await
-                .expect("obliterate the list");
-            state_reads.push(fake.state_get_items() - before);
-            for hash in leaves {
-                assert_eq!(
-                    fake.state_of(hash),
-                    Some(FragmentState::Obliterated),
-                    "with a hole: {with_hole}"
-                );
-            }
-        }
-        assert_eq!(
-            state_reads[0], state_reads[1],
-            "the state of a hole is read"
-        );
-    }
-
-    #[tokio::test]
-    async fn force_write_replaces_the_stored_representation() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        store(&fake)
-            .await
-            .put(partition, address, fragment, Some(payload), false)
-            .await
-            .expect("put should succeed");
-
-        let (replacement, replacement_payload) =
-            representation(FragmentFlags::PayloadCompressedLZ4, 96, 256);
-        store_with(&fake, true, false)
-            .await
-            .put(
-                partition,
-                address,
-                replacement,
-                Some(replacement_payload.clone()),
-                false,
-            )
-            .await
-            .expect("forced put should succeed");
-
-        assert_eq!(fake.stored_fragment(address.hash), Some(replacement));
-        assert_eq!(
-            fake.object(address.hash).unwrap().0,
-            replacement_payload.as_ref()
-        );
-    }
-
-    #[tokio::test]
-    async fn put_backs_off_while_an_obliteration_holds_the_hash() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        fake.set_state(address.hash, FragmentState::Obliterating);
-
-        let error = store(&fake)
-            .await
-            .put(
-                random::<Context>().into(),
-                address,
-                fragment,
-                Some(payload),
-                false,
-            )
-            .await
-            .expect_err("a put racing an obliteration must back off");
-
-        assert!(error.is_slow_down(), "expected a retryable back-off");
-        assert_eq!(fake.association_count(address.hash), 0);
-    }
-
-    /// Sets up an object as it was stored before the fragment moved onto it: bare bytes in S3, the
-    /// fragment in a table row.
-    fn preexisting_object(
-        fake: &Fake,
-        partition: Partition,
-        address: Address,
-    ) -> (Fragment, Bytes) {
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        fake.put_object_without_metadata(address.hash, payload.as_ref());
-        fake.set_fragment_metadata_row(address.hash, fragment);
-        fake.add_association(partition, address);
-
-        (fragment, payload)
-    }
-
-    #[tokio::test]
-    async fn get_falls_back_to_the_legacy_row_for_an_object_with_no_metadata() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = preexisting_object(&fake, partition, address);
-
-        let (loaded, bytes) = migrated_store(&fake)
-            .await
-            .get(partition, address)
-            .await
-            .and_then(lore_storage::StoreGetData::into_payload)
-            .expect("an object written before the cut-over must still be readable");
-
-        assert_eq!(bytes, payload);
-        assert_eq!(loaded.size_payload, fragment.size_payload);
-        assert_eq!(loaded.size_content, fragment.size_content);
-        assert_eq!(
-            loaded.flags & FragmentFlags::PayloadStoredDurable,
-            FragmentFlags::PayloadStoredDurable
-        );
-    }
-
-    /// A pre-cut-over object is answered from its state row like any other, with no fallback read:
-    /// query never needs the representation, so it never needs the fragment metadata table either.
-    #[tokio::test]
-    async fn query_matches_a_preexisting_object_without_reading_s3() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        preexisting_object(&fake, partition, address);
-
-        let result = query_one(
-            &(migrated_store(&fake).await as Arc<dyn ImmutableStoreTrait>),
-            partition,
-            address,
-        )
-        .await
-        .expect("resolve should succeed");
-
-        assert_eq!(result.match_made, StoreMatch::MatchFull);
-        assert_eq!(fake.object_reads(), 0, "resolve must not touch S3");
-    }
-
-    /// A deployment that never wrote an object without metadata should not go looking for a row
-    /// describing one. An object in that shape is damaged, not old.
-    #[tokio::test]
-    async fn get_refuses_an_object_with_no_metadata_when_no_legacy_table_is_configured() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        preexisting_object(&fake, partition, address);
-
-        store(&fake)
-            .await
-            .get(partition, address)
-            .await
-            .expect_err("without a legacy table configured there is nothing to fall back to");
-    }
-
-    /// Metadata that is present but unreadable means a damaged object. Describing it from a
-    /// separate record is exactly the mismatch this design removes, so it must not fall back even
-    /// where a legacy row exists.
-    #[tokio::test]
-    async fn get_does_not_fall_back_for_an_object_with_damaged_metadata() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        fake.put_object_with_damaged_metadata(address.hash, payload.as_ref());
-        fake.set_fragment_metadata_row(address.hash, fragment);
-        fake.add_association(partition, address);
-
-        migrated_store(&fake)
-            .await
-            .get(partition, address)
-            .await
-            .expect_err("a damaged object must not be described by a legacy row");
-    }
-
-    mod separate_metadata_table {
-        use super::*;
-
-        /// When the metadata table IS configured but holds no row for a hash that has an
-        /// association but no state row, `query` must still return a miss. The metadata-table
-        /// check in `do_query` must not turn a genuine miss into a phantom match.
-        #[tokio::test]
-        async fn query_misses_when_no_state_or_legacy_row() {
-            let fake = Fake::default();
-            let address = Address {
-                hash: random(),
-                context: random(),
-            };
-            let partition: Partition = random();
-            fake.add_association(partition, address);
-            // No state row, no legacy metadata row.
-
-            let result = query_one(
-                &(store_with_separate_metadata_table(&fake).await as Arc<dyn ImmutableStoreTrait>),
-                partition,
-                address,
-            )
-            .await
-            .expect("query should succeed even when no row is found");
-
-            assert_eq!(result.match_made, StoreMatch::MatchNone);
-        }
-
-        /// A legacy fragment whose flags carry obliteration bits must not be returned as a match.
-        /// The state table has no row (pre-state-table era), but the metadata row records that the
-        /// fragment was obliterated — `do_query` must treat it the same as a state-row obliteration.
-        #[tokio::test]
-        async fn query_misses_for_an_obliterated_legacy_fragment() {
-            let fake = Fake::default();
-            let address = Address {
-                hash: random(),
-                context: random(),
-            };
-            let partition: Partition = random();
-            let obliterated = Fragment {
-                flags: FragmentFlags::PayloadObliterated.bits(),
-                size_payload: 64,
-                size_content: 256,
-            };
-
-            fake.add_association(partition, address);
-            fake.set_legacy_metadata_row(address.hash, obliterated);
-            // No state row — the obliteration bit lives only in the legacy metadata flags.
-
-            let result = query_one(
-                &(store_with_separate_metadata_table(&fake).await as Arc<dyn ImmutableStoreTrait>),
-                partition,
-                address,
-            )
-            .await
-            .expect("query should succeed");
-
-            assert_eq!(result.match_made, StoreMatch::MatchNone);
-        }
-
-        /// What a push actually calls: one batch holding a legacy fragment, a current one and an
-        /// address the store does not have. Each must resolve on its own terms, and the legacy rows
-        /// must be read together rather than one round trip at a time.
-        #[tokio::test]
-        async fn query_resolves_a_batch_mixing_legacy_and_current_fragments() {
-            let fake = Fake::default();
-            let partition: Partition = random();
-            let (fragment, _) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-            let legacy = Address {
-                hash: random(),
-                context: random(),
-            };
-            fake.add_association(partition, legacy);
-            fake.set_legacy_metadata_row(legacy.hash, fragment);
-
-            let current = Address {
-                hash: random(),
-                context: random(),
-            };
-            fake.add_association(partition, current);
-            fake.set_state(current.hash, FragmentState::Stored);
-
-            let obliterated = Address {
-                hash: random(),
-                context: random(),
-            };
-            fake.add_association(partition, obliterated);
-            fake.set_state(obliterated.hash, FragmentState::Obliterated);
-
-            let absent = Address {
-                hash: random(),
-                context: random(),
-            };
-
-            let addresses = [legacy, current, obliterated, absent];
-            let mut results = [StoreMatchResult::default(); 4];
-            store_with_separate_metadata_table(&fake)
-                .await
-                .query(partition, &addresses, &mut results)
-                .await
-                .expect("query should succeed");
-
-            assert_eq!(
-                results.map(|result| result.match_made),
-                [
-                    StoreMatch::MatchFull,
-                    StoreMatch::MatchFull,
-                    StoreMatch::MatchNone,
-                    StoreMatch::MatchNone
-                ],
-                "a legacy fragment and a current one both resolve, an obliterated one does not, \
-                 and an address the store never had does not"
-            );
-        }
-
-        /// A fragment stored before the state table existed: an association exists, no state row,
-        /// but the metadata table holds the legacy fragment description. `query` must report a
-        /// match — the legacy fallback exists precisely for this scenario.
-        #[tokio::test]
-        async fn query_matches_a_legacy_fragment_with_no_state_row() {
-            let fake = Fake::default();
-            let address = Address {
-                hash: random(),
-                context: random(),
-            };
-            let partition: Partition = random();
-            let (fragment, _) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-            fake.add_association(partition, address);
-            fake.set_legacy_metadata_row(address.hash, fragment);
-            // No state row — `load_state` returns `Ok(None)`.
-
-            let result = query_one(
-                &(store_with_separate_metadata_table(&fake).await as Arc<dyn ImmutableStoreTrait>),
-                partition,
-                address,
-            )
-            .await
-            .expect("a legacy fragment with no state row must be queryable");
-
-            assert_eq!(result.match_made, StoreMatch::MatchFull);
-        }
-
-        /// When `do_query` returns `QueryResultSource::LegacyMetadata`, `get_metadata` must report
-        /// the fragment from the metadata table, not whatever the object says.
-        ///
-        /// It may well have read the object: the `HeadObject` is issued alongside the resolution,
-        /// so on this path it is spent and discarded. That is deliberate — the legacy row is the
-        /// fallback, and holding the common path back to spare it would be the wrong trade. What
-        /// matters is which fragment wins, which is what this asserts.
-        ///
-        /// The returned fragment must carry `PayloadStoredDurable` (set by `do_query` when it
-        /// takes the `LegacyMetadata` branch) and must preserve the original flags from the
-        /// metadata row.
-        #[tokio::test]
-        async fn get_metadata_prefers_legacy_metadata_over_the_object() {
-            let fake = Fake::default();
-            let address = Address {
-                hash: random(),
-                context: random(),
-            };
-            let partition: Partition = random();
-            let (mut fragment, payload) =
-                representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-            fragment.flags |= FragmentFlags::PayloadDoNotReplicate;
-
-            fake.add_association(partition, address);
-            fake.set_legacy_metadata_row(address.hash, fragment);
-            // Unusable metadata on the object, so the concurrent head cannot describe it: if its
-            // result were the one reported, this call would fail instead of returning the row.
-            fake.put_object_with_damaged_metadata(address.hash, payload.as_ref());
-            // No state row — `do_query` returns `QueryResultSource::LegacyMetadata`.
-
-            let result = store_with_separate_metadata_table(&fake)
-                .await
-                .get_metadata(partition, address)
-                .await
-                .expect("get_metadata must succeed for a legacy fragment");
-
-            assert_eq!(result.match_made, StoreMatch::MatchFull);
-            assert_eq!(result.fragment.size_payload, fragment.size_payload);
-            assert_eq!(result.fragment.size_content, fragment.size_content);
-            assert_eq!(
-                result.fragment.flags & FragmentFlags::PayloadStoredDurable,
-                FragmentFlags::PayloadStoredDurable,
-                "do_query must mark legacy metadata fragments as durably stored"
-            );
-            assert_eq!(
-                result.fragment.flags & FragmentFlags::PayloadDoNotReplicate,
-                FragmentFlags::PayloadDoNotReplicate,
-                "original flags from the metadata row must be preserved"
-            );
-        }
-
-        /// When `head_fragment` falls back to `fragment_from_metadata_table` and finds no row
-        /// (`Ok(None)`), `get_metadata` must return an error. This covers the caller-side
-        /// `ok_or_else` added in `head_fragment`.
-        #[tokio::test]
-        async fn get_metadata_fails_when_object_has_no_s3_metadata_and_no_legacy_row() {
-            let fake = Fake::default();
-            let address = Address {
-                hash: random(),
-                context: random(),
-            };
-            let partition: Partition = random();
-            let (_, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-            fake.add_association(partition, address);
-            fake.set_state(address.hash, FragmentState::Stored);
-            fake.put_object_without_metadata(address.hash, payload.as_ref());
-            // No metadata row — `fragment_from_metadata_table` returns `Ok(None)`.
-
-            store_with_separate_metadata_table(&fake)
-                .await
-                .get_metadata(partition, address)
-                .await
-                .expect_err("an object with no S3 metadata and no legacy row must not be returned");
-        }
-
-        /// The same `ok_or_else` guard on the `get_s3_object_contents` path: when `get` reads an
-        /// object with no S3 metadata and the metadata table holds no row either, it must fail.
-        #[tokio::test]
-        async fn get_fails_when_object_has_no_s3_metadata_and_no_legacy_row() {
-            let fake = Fake::default();
-            let address = Address {
-                hash: random(),
-                context: random(),
-            };
-            let partition: Partition = random();
-            let (_, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-            fake.add_association(partition, address);
-            fake.set_state(address.hash, FragmentState::Stored);
-            fake.put_object_without_metadata(address.hash, payload.as_ref());
-            // No legacy row — `fragment_from_metadata_table` returns `Ok(None)`, which
-            // `get_s3_object_contents` maps to an error.
-
-            store_with_separate_metadata_table(&fake)
-                .await
-                .get(partition, address)
-                .await
-                .expect_err("an object with no S3 metadata and no legacy row must not be returned");
-        }
-    }
-
-    /// A lost payload must not stay lost. Clearing the state row is what lets the next put stop
-    /// short-circuiting on "already durable" and upload the content again.
-    #[tokio::test]
-    async fn a_read_of_a_lost_payload_clears_its_state_so_a_put_can_restore_it() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(partition, address, fragment, Some(payload.clone()), false)
-            .await
-            .expect("put should succeed");
-
-        fake.lose_object(address.hash);
-
-        let error = store
-            .clone()
-            .get(partition, address)
-            .await
-            .expect_err("a lost payload reads as not found");
-        assert!(error.is_address_not_found());
-
-        assert_eq!(
-            fake.state_of(address.hash),
-            None,
-            "the state row must be cleared so the hash stops looking durable"
-        );
-
-        store
-            .clone()
-            .put(partition, address, fragment, Some(payload.clone()), false)
-            .await
-            .expect("re-put should succeed");
-
-        assert_eq!(fake.object(address.hash).unwrap().0, payload.as_ref());
-        assert_eq!(fake.state_of(address.hash), Some(FragmentState::Stored));
-
-        let (_, restored) = store
-            .get(partition, address)
-            .await
-            .and_then(lore_storage::StoreGetData::into_payload)
-            .expect("the payload should be readable again");
-        assert_eq!(restored, payload);
-    }
-
-    /// A lost payload must be reported however it is found. `get_metadata` is the cheaper call, so
-    /// a client that only ever reads metadata would otherwise never raise the alarm.
-    #[tokio::test]
-    async fn get_metadata_of_a_lost_payload_reports_and_repairs_it() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(partition, address, fragment, Some(payload), false)
-            .await
-            .expect("put should succeed");
-
-        fake.lose_object(address.hash);
-
-        let result = store
-            .get_metadata(partition, address)
-            .await
-            .expect("a lost payload reports a miss");
-
-        assert_eq!(result.match_made, StoreMatch::MatchNone);
-        assert_eq!(
-            fake.state_of(address.hash),
-            None,
-            "get_metadata must repair the loss it found, exactly as get does"
-        );
-    }
-
-    /// An obliteration in flight owns the hash. Its mark must survive a read that races the payload
-    /// deletion, or a put could republish underneath it.
-    #[tokio::test]
-    async fn a_read_of_a_lost_payload_leaves_an_obliteration_mark_alone() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(partition, address, fragment, Some(payload), false)
-            .await
-            .expect("put should succeed");
-
-        fake.lose_object(address.hash);
-        fake.set_state(address.hash, FragmentState::Obliterating);
-
-        store
-            .get(partition, address)
-            .await
-            .expect_err("a lost payload reads as not found");
-
-        assert_eq!(
-            fake.state_of(address.hash),
-            Some(FragmentState::Obliterating),
-            "a read must not clear a mark an obliteration is holding"
-        );
-    }
-
-    #[tokio::test]
-    async fn put_revives_a_tombstoned_hash() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        fake.set_state(address.hash, FragmentState::Obliterated);
-
-        store(&fake)
-            .await
-            .put(partition, address, fragment, Some(payload), false)
-            .await
-            .expect("re-upload over a tombstone is allowed");
-
-        assert_eq!(fake.state_of(address.hash), Some(FragmentState::Stored));
-        assert_eq!(fake.stored_fragment(address.hash), Some(fragment));
-        assert_eq!(fake.association_count(address.hash), 1);
-    }
-
-    /// Store a fragmented parent whose payload is a list of references to `leaves`, all under one
-    /// partition and context so obliteration walks from the parent into each leaf.
-    async fn store_fragmented(
-        store: &Arc<AwsImmutableStore>,
-        partition: Partition,
-        context: Context,
-        leaves: &[Hash],
-    ) -> Address {
-        const LEAF_CONTENT: u64 = 256;
-
-        for (index, hash) in leaves.iter().enumerate() {
-            let (fragment, payload) = representation(
-                FragmentFlags::PayloadCompressedZstd,
-                64 + index,
-                LEAF_CONTENT,
-            );
-            store
-                .clone()
-                .put(
-                    partition,
-                    Address {
-                        hash: *hash,
-                        context,
-                    },
-                    fragment,
-                    Some(payload),
-                    false,
-                )
-                .await
-                .expect("leaf put should succeed");
-        }
-
-        let references: Vec<FragmentReference> = leaves
-            .iter()
-            .enumerate()
-            .map(|(index, hash)| FragmentReference {
-                hash: *hash,
-                offset_content: index as u64 * LEAF_CONTENT,
-            })
-            .collect();
-
-        let payload = Bytes::from(references.as_bytes().to_vec());
-        let parent = Address {
-            hash: random(),
-            context,
-        };
-        let fragment = Fragment {
-            flags: FragmentFlags::PayloadFragmented.bits(),
-            size_payload: u32::try_from(payload.len()).unwrap(),
-            size_content: LEAF_CONTENT * leaves.len() as u64,
-        };
-
-        store
-            .clone()
-            .put(partition, parent, fragment, Some(payload), false)
-            .await
-            .expect("parent put should succeed");
-
-        parent
-    }
-
-    #[tokio::test]
-    async fn obliterate_recurses_into_sub_fragments() {
-        let fake = Fake::default();
-        let partition: Partition = random();
-        let context: Context = random();
-        let leaves = [random::<Hash>(), random::<Hash>()];
-
-        let store = store(&fake).await;
-        let parent = store_fragmented(&store, partition, context, &leaves).await;
-
-        let stats = Arc::new(StoreObliterateStats::default());
-        store
-            .obliterate(partition, parent, stats.clone())
-            .await
-            .expect("obliterate should succeed");
-
-        assert!(fake.object(parent.hash).is_none(), "parent payload remains");
-        assert_eq!(fake.association_count(parent.hash), 0);
-
-        for leaf in leaves {
-            assert!(
-                fake.object(leaf).is_none(),
-                "a sub-fragment payload was not obliterated"
-            );
-            assert_eq!(fake.association_count(leaf), 0);
-            assert_eq!(fake.state_of(leaf), Some(FragmentState::Obliterated));
-        }
-
-        assert_eq!(
-            stats.num_fragments.load(Ordering::Relaxed),
-            3,
-            "the parent and both sub-fragments should each be counted"
-        );
-        assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 3);
-    }
-
-    /// Recursion must respect each sub-fragment's own reference count. A leaf another partition
-    /// still holds survives, and its mark is released so the hash stays writable.
-    #[tokio::test]
-    async fn obliterate_keeps_a_sub_fragment_another_partition_references() {
-        let fake = Fake::default();
-        let partition: Partition = random();
-        let context: Context = random();
-        let shared = random::<Hash>();
-        let leaves = [shared, random::<Hash>()];
-
-        let store = store(&fake).await;
-        let parent = store_fragmented(&store, partition, context, &leaves).await;
-
-        let other = Address {
-            hash: shared,
-            context: random(),
-        };
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-        store
-            .clone()
-            .put(
-                random::<Context>().into(),
-                other,
-                fragment,
-                Some(payload),
-                false,
-            )
-            .await
-            .expect("second partition put should succeed");
-
-        store
-            .obliterate(partition, parent, Arc::new(StoreObliterateStats::default()))
-            .await
-            .expect("obliterate should succeed");
-
-        assert!(
-            fake.object(shared).is_some(),
-            "a sub-fragment referenced elsewhere must survive"
-        );
-        assert_eq!(fake.association_count(shared), 1);
-        assert_eq!(
-            fake.state_of(shared),
-            Some(FragmentState::Stored),
-            "the surviving sub-fragment must not be left marked"
-        );
-
-        assert!(fake.object(leaves[1]).is_none(), "unshared leaf remains");
-        assert!(fake.object(parent.hash).is_none(), "parent remains");
-    }
-
-    /// The parent's payload must still be readable when recursion runs, since that is where the
-    /// reference list comes from — it is deleted only after the sub-fragments are handled.
-    #[tokio::test]
-    async fn obliterate_reads_the_reference_list_before_deleting_the_parent() {
-        let fake = Fake::default();
-        let partition: Partition = random();
-        let context: Context = random();
-        let leaves = [random::<Hash>()];
-
-        let store = store(&fake).await;
-        let parent = store_fragmented(&store, partition, context, &leaves).await;
-
-        store
-            .obliterate(partition, parent, Arc::new(StoreObliterateStats::default()))
-            .await
-            .expect("obliterate should succeed");
-
-        assert!(
-            fake.object(leaves[0]).is_none(),
-            "the reference list was not read, so the sub-fragment survived"
-        );
-    }
-
-    #[tokio::test]
-    async fn obliterate_removes_the_reference_and_the_payload() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(partition, address, fragment, Some(payload), false)
-            .await
-            .expect("put should succeed");
-
-        let stats = Arc::new(StoreObliterateStats::default());
-        store
-            .obliterate(partition, address, stats.clone())
-            .await
-            .expect("obliterate should succeed");
-
-        assert_eq!(fake.association_count(address.hash), 0);
-        assert!(fake.object(address.hash).is_none());
-        assert_eq!(
-            fake.state_of(address.hash),
-            Some(FragmentState::Obliterated)
-        );
-        assert_eq!(stats.num_fragments.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn obliterate_keeps_the_payload_while_another_partition_references_it() {
-        let fake = Fake::default();
-        let hash: Hash = random();
-        let mine = Address {
-            hash,
-            context: random(),
-        };
-        let theirs = Address {
-            hash,
-            context: random(),
-        };
-        let partition: Partition = random();
-        let other_partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(partition, mine, fragment, Some(payload.clone()), false)
-            .await
-            .expect("put should succeed");
-        store
-            .clone()
-            .put(other_partition, theirs, fragment, Some(payload), false)
-            .await
-            .expect("second put should succeed");
-
-        store
-            .obliterate(partition, mine, Arc::new(StoreObliterateStats::default()))
-            .await
-            .expect("obliterate should succeed");
-
-        assert_eq!(fake.association_count(hash), 1);
-        assert!(
-            fake.object(hash).is_some(),
-            "compliance only requires the obliterated partition's reference to be gone"
-        );
-        assert_eq!(
-            fake.state_of(hash),
-            Some(FragmentState::Stored),
-            "the mark must be released so the hash stays writable"
-        );
-    }
-
-    // ---------------------------------------------------------------------
-    // Failure paths
-    // ---------------------------------------------------------------------
-
-    /// A timeout means the answer is unknown, so the caller must be told to retry. Any other
-    /// `DynamoDB` failure means the hash could not be resolved, which reads as not found.
-    #[tokio::test]
-    async fn a_state_read_timeout_asks_the_caller_to_retry() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        fake.fail(Fault::StateReadTimeout);
-
-        let error = store(&fake)
-            .await
-            .put(
-                random::<Context>().into(),
-                address,
-                fragment,
-                Some(payload),
-                false,
-            )
-            .await
-            .expect_err("a timeout must not be reported as a definite answer");
-
-        assert!(error.is_slow_down(), "expected a retryable back-off");
-    }
-
-    #[tokio::test]
-    async fn a_throttled_state_read_asks_the_caller_to_retry() {
-        let fake = Fake::default();
-        fake.fail(Fault::StateRead);
-
-        let error = store(&fake)
-            .await
-            .load_state(random())
-            .await
-            .expect_err("throttling is not an answer");
-
-        assert!(error.is_slow_down(), "throttling must be retryable");
-    }
-
-    #[tokio::test]
-    async fn a_batch_read_left_unprocessed_asks_the_caller_to_retry() {
-        let fake = Fake::default();
-        fake.fail(Fault::BatchReadUnprocessed);
-        let addresses = [Address {
-            hash: random(),
-            context: random(),
-        }];
-        let mut results = [StoreMatchResult::default()];
-
-        let error = store(&fake)
-            .await
-            .query(random(), &addresses, &mut results)
-            .await
-            .expect_err("keys left unprocessed are not an answer");
-
-        assert!(error.is_slow_down(), "unprocessed keys must be retryable");
-    }
-
-    /// A failed read must never read as a miss. A caller told "not found" for a hash it references
-    /// treats the content as lost, which counts data loss and clears the state row — off a
-    /// `DynamoDB` error that says nothing about whether the content is there.
-    #[tokio::test]
-    async fn a_broken_state_read_is_an_error_not_a_miss() {
-        let fake = Fake::default();
-        fake.fail(Fault::StateReadBroken);
-
-        let error = store(&fake)
-            .await
-            .load_state(random())
-            .await
-            .expect_err("a broken read is not an empty table");
-
-        assert!(!error.is_address_not_found(), "must not read as a miss");
-        assert!(!error.is_slow_down(), "and is not retryable either");
-    }
-
-    /// The same rule on the fallback path, where the consequence is sharpest: this read only
-    /// happens for a hash a partition references, so a miss here is what triggers the repair.
-    #[tokio::test]
-    async fn a_failed_fragment_metadata_read_does_not_clear_the_state_row() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        preexisting_object(&fake, partition, address);
-
-        let store = migrated_store(&fake).await;
-        fake.fail(Fault::StateRead);
-
-        let error = store
-            .get(partition, address)
-            .await
-            .expect_err("the metadata read is throttled");
-
-        assert!(error.is_slow_down());
-        assert!(
-            fake.state_of(address.hash).is_some(),
-            "a throttle must not be mistaken for a lost payload and clear the row"
-        );
-    }
-
-    /// Two writers reviving the same tombstone both want the hash stored. The one that loses the
-    /// compare-and-set has already uploaded its bytes and got the state it wanted, so it must not
-    /// fail.
-    #[tokio::test]
-    async fn reviving_a_hash_another_writer_already_revived_succeeds() {
-        let fake = Fake::default();
-        let hash: Hash = random();
-
-        fake.set_state(hash, FragmentState::Stored);
-
-        store(&fake)
-            .await
-            .revive_state(hash)
-            .await
-            .expect("losing the revival race is not a failure");
-    }
-
-    #[tokio::test]
-    async fn reviving_a_hash_an_obliteration_retook_backs_off() {
-        let fake = Fake::default();
-        let hash: Hash = random();
-
-        fake.set_state(hash, FragmentState::Obliterating);
-
-        let error = store(&fake)
-            .await
-            .revive_state(hash)
-            .await
-            .expect_err("an obliteration holds the hash again");
-
-        assert!(error.is_slow_down(), "the mark is transient, so back off");
-    }
-
-    /// The upload and the state row survive an association failure, so a retry finishes the job
-    /// without re-uploading. Nothing is left that a later put would mistake for a complete write.
-    #[tokio::test]
-    async fn a_put_that_cannot_associate_leaves_the_payload_ready_for_a_retry() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        fake.fail(Fault::AssociationWrite);
-
-        store(&fake)
-            .await
-            .put(partition, address, fragment, Some(payload.clone()), false)
-            .await
-            .expect_err("the association write fails");
-
-        assert_eq!(fake.object(address.hash).unwrap().0, payload.as_ref());
-        assert_eq!(fake.state_of(address.hash), Some(FragmentState::Stored));
-        assert_eq!(fake.association_count(address.hash), 0);
-
-        let recovered = Fake::default();
-        recovered.set_state(address.hash, FragmentState::Stored);
-        recovered.put_object_without_metadata(address.hash, payload.as_ref());
-        store(&recovered)
-            .await
-            .put(partition, address, fragment, Some(payload), false)
-            .await
-            .expect("a retry associates without re-uploading");
-        assert_eq!(recovered.association_count(address.hash), 1);
-    }
-
-    /// Compliance is discharged by the association delete. If the count that follows fails, the
-    /// obliteration reports failure and holds its mark — but the reference is already gone.
-    #[tokio::test]
-    async fn an_obliterate_that_cannot_count_references_still_removed_the_reference() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(partition, address, fragment, Some(payload), false)
-            .await
-            .expect("put should succeed");
-
-        fake.fail(Fault::AssociationCount);
-
-        store
-            .obliterate(
-                partition,
-                address,
-                Arc::new(StoreObliterateStats::default()),
-            )
-            .await
-            .expect_err("counting references fails");
-
-        assert_eq!(
-            fake.association_count(address.hash),
-            0,
-            "the compliance obligation is discharged before anything that can fail after it"
-        );
-        assert_eq!(
-            fake.state_of(address.hash),
-            Some(FragmentState::Obliterating),
-            "the mark is held, which is the known crashed-obliteration gap"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_obliterate_that_cannot_delete_the_payload_does_not_tombstone_it() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(partition, address, fragment, Some(payload), false)
-            .await
-            .expect("put should succeed");
-
-        fake.fail(Fault::ObjectDelete);
-
-        store
-            .obliterate(
-                partition,
-                address,
-                Arc::new(StoreObliterateStats::default()),
-            )
-            .await
-            .expect_err("deleting the payload fails");
-
-        assert!(
-            fake.object(address.hash).is_some(),
-            "the payload survives a failed delete"
-        );
-        assert_eq!(
-            fake.state_of(address.hash),
-            Some(FragmentState::Obliterating),
-            "it must not be tombstoned while its payload is still there"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_obliterate_that_cannot_list_versions_does_not_tombstone_the_payload() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(partition, address, fragment, Some(payload), false)
-            .await
-            .expect("put should succeed");
-
-        fake.fail(Fault::ObjectList);
-
-        store
-            .obliterate(
-                partition,
-                address,
-                Arc::new(StoreObliterateStats::default()),
-            )
-            .await
-            .expect_err("listing versions fails");
-
-        assert_ne!(
-            fake.state_of(address.hash),
-            Some(FragmentState::Obliterated)
-        );
-    }
-
-    /// Recursion must not report success when a sub-fragment could not be obliterated, or the
-    /// parent would be tombstoned over content that is still referenced.
-    #[tokio::test]
-    async fn obliterate_fails_when_a_sub_fragment_fails() {
-        let fake = Fake::default();
-        let partition: Partition = random();
-        let context: Context = random();
-        let leaves = [random::<Hash>(), random::<Hash>()];
-
-        let store = store(&fake).await;
-        let parent = store_fragmented(&store, partition, context, &leaves).await;
-
-        fake.fail(Fault::ObjectDelete);
-
-        store
-            .obliterate(partition, parent, Arc::new(StoreObliterateStats::default()))
-            .await
-            .expect_err("a sub-fragment failure must fail the parent");
-
-        assert_ne!(fake.state_of(parent.hash), Some(FragmentState::Obliterated));
-    }
-
-    /// The repair is best effort: failing to clear the row must not turn a not-found into an error,
-    /// because the caller's answer does not depend on the repair succeeding.
-    #[tokio::test]
-    async fn a_failed_repair_still_reports_the_lost_payload_as_not_found() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(partition, address, fragment, Some(payload), false)
-            .await
-            .expect("put should succeed");
-
-        fake.lose_object(address.hash);
-        fake.fail(Fault::StateDelete);
-
-        let error = store
-            .get(partition, address)
-            .await
-            .expect_err("the payload is gone");
-
-        assert!(error.is_address_not_found());
-        assert_eq!(
-            fake.state_of(address.hash),
-            Some(FragmentState::Stored),
-            "the row survives a failed repair, unchanged"
-        );
-    }
-
-    /// The probe saw nothing, the upload landed, and an obliteration took the hash in between. The
-    /// put must not associate, or it would restore a reference the obliteration is removing.
-    #[tokio::test]
-    async fn a_put_that_loses_the_hash_mid_upload_backs_off_without_associating() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        fake.obliterate_during_upload(address.hash, FragmentState::Obliterating);
-
-        let error = store(&fake)
-            .await
-            .put(partition, address, fragment, Some(payload), false)
-            .await
-            .expect_err("an obliteration holds the hash by the time the put publishes");
-
-        assert!(
-            error.is_slow_down(),
-            "the mark is transient, so this is a back-off"
-        );
-        assert_eq!(
-            fake.association_count(address.hash),
-            0,
-            "no reference may be created while an obliteration holds the hash"
-        );
-        assert_eq!(
-            fake.state_of(address.hash),
-            Some(FragmentState::Obliterating),
-            "the put must not disturb the mark"
-        );
-    }
-
-    /// Racing a *completed* obliteration is different: the tombstone is not a lock, and re-upload
-    /// over one is allowed, so the put finishes and revives the hash.
-    #[tokio::test]
-    async fn a_put_that_lands_on_a_fresh_tombstone_revives_it() {
-        let fake = Fake::default();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        fake.obliterate_during_upload(address.hash, FragmentState::Obliterated);
-
-        store(&fake)
-            .await
-            .put(partition, address, fragment, Some(payload), false)
-            .await
-            .expect("re-upload over a tombstone is allowed");
-
-        assert_eq!(fake.state_of(address.hash), Some(FragmentState::Stored));
-        assert_eq!(fake.association_count(address.hash), 1);
-    }
-
-    /// The drain exists so a put that had already passed its state probe can land its association
-    /// and be counted. Without the wait the count runs immediately, sees nothing, and the payload
-    /// is deleted underneath a partition that legitimately stored it.
-    #[tokio::test]
-    async fn the_drain_lets_an_in_flight_association_be_counted() {
-        let fake = Fake::default();
-        let hash: Hash = random();
-        let mine = Address {
-            hash,
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(partition, mine, fragment, Some(payload), false)
-            .await
-            .expect("put should succeed");
-
-        let deleted = fake.association_deleted();
-        let injector = fake.clone();
-        let racing_partition: Partition = random();
-        let racing = Address {
-            hash,
-            context: random(),
-        };
-        let mut tasks = JoinSet::new();
-        lore_base::lore_spawn!(tasks, async move {
-            deleted
-                .await
-                .expect("the obliteration must delete its association");
-            injector.add_association(racing_partition, racing);
-        });
-
-        store
-            .obliterate(partition, mine, Arc::new(StoreObliterateStats::default()))
-            .await
-            .expect("obliterate should succeed");
-
-        while let Some(result) = tasks.join_next().await {
-            result.expect("the racing writer should not panic");
-        }
-
-        assert!(
-            fake.object(hash).is_some(),
-            "an association that landed during the drain must keep the payload alive"
-        );
-        assert_eq!(fake.association_count(hash), 1);
-        assert_eq!(
-            fake.state_of(hash),
-            Some(FragmentState::Stored),
-            "the mark must be released so the surviving reference stays usable"
-        );
-    }
-
-    // ---------------------------------------------------------------------
-    // Surface that had coverage on main
-    // ---------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn copy_associates_the_destination_without_touching_the_payload() {
-        let fake = Fake::default();
-        let source = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(partition, source, fragment, Some(payload.clone()), false)
-            .await
-            .expect("put should succeed");
-
-        let destination_context: Context = random();
-        store
-            .copy(
-                partition,
-                source,
-                partition,
-                destination_context,
-                CopyBehavior {
-                    durable: true,
-                    do_not_replicate: false,
-                },
-            )
-            .await
-            .expect("copy should succeed");
-
-        assert_eq!(fake.association_count(source.hash), 2);
-        assert_eq!(
-            fake.object(source.hash).unwrap().0,
-            payload.as_ref(),
-            "copy must not rewrite the payload"
-        );
-        assert_eq!(fake.object_reads(), 0, "copy must not read S3");
-    }
-
-    #[tokio::test]
-    async fn copy_of_an_unknown_address_is_not_found() {
-        let fake = Fake::default();
-        let source = Address {
-            hash: random(),
-            context: random(),
-        };
-        let partition: Partition = random();
-
-        store(&fake)
-            .await
-            .copy(
-                partition,
-                source,
-                partition,
-                random::<Context>(),
-                CopyBehavior {
-                    durable: true,
-                    do_not_replicate: false,
-                },
-            )
-            .await
-            .expect_err("nothing to copy");
-
-        assert_eq!(fake.association_count(source.hash), 0);
-    }
-
-    /// A hash present in another context is not a full match, so it must not be copyable from this
-    /// one — the copy would otherwise fabricate a reference from a partial match.
-    #[tokio::test]
-    async fn copy_of_a_partial_match_is_not_found() {
-        let fake = Fake::default();
-        let hash: Hash = random();
-        let stored = Address {
-            hash,
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(partition, stored, fragment, Some(payload), false)
-            .await
-            .expect("put should succeed");
-
-        let other_context = Address {
-            hash,
-            context: random(),
-        };
-        store
-            .copy(
-                partition,
-                other_context,
-                partition,
-                random::<Context>(),
-                CopyBehavior {
-                    durable: true,
-                    do_not_replicate: false,
-                },
-            )
-            .await
-            .expect_err("a different context is not a full match");
-
-        assert_eq!(fake.association_count(hash), 1);
-    }
-
-    /// A source naming no context is any association the partition holds, which is what a caller
-    /// acting on a partition match has. The payload is untouched, as for an exact source.
-    #[tokio::test]
-    async fn copy_from_an_unnamed_context_takes_any_association_in_the_partition() {
-        let fake = Fake::default();
-        let hash: Hash = random();
-        let stored = Address {
-            hash,
-            context: random(),
-        };
-        let partition: Partition = random();
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(partition, stored, fragment, Some(payload.clone()), false)
-            .await
-            .expect("put should succeed");
-
-        store
-            .copy(
-                partition,
-                Address::zero_context_hash(hash),
-                partition,
-                random::<Context>(),
-                CopyBehavior {
-                    durable: true,
-                    do_not_replicate: false,
-                },
-            )
-            .await
-            .expect("a partition holding the hash answers a source naming no context");
-
-        assert_eq!(fake.association_count(hash), 2);
-        assert_eq!(
-            fake.object(hash).unwrap().0,
-            payload.as_ref(),
-            "copy must not rewrite the payload"
-        );
-        assert_eq!(fake.object_reads(), 0, "copy must not read S3");
-    }
-
-    /// Naming no context widens the search inside one partition, never across them — this store
-    /// isolates, so a hash held only elsewhere is not the caller's to copy from.
-    #[tokio::test]
-    async fn copy_from_an_unnamed_context_does_not_reach_another_partition() {
-        let fake = Fake::default();
-        let hash: Hash = random();
-        let stored = Address {
-            hash,
-            context: random(),
-        };
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        store
-            .clone()
-            .put(
-                random::<Partition>(),
-                stored,
-                fragment,
-                Some(payload),
-                false,
-            )
-            .await
-            .expect("put should succeed");
-
-        store
-            .copy(
-                random::<Partition>(),
-                Address::zero_context_hash(hash),
-                random::<Partition>(),
-                random::<Context>(),
-                CopyBehavior {
-                    durable: true,
-                    do_not_replicate: false,
-                },
-            )
-            .await
-            .expect_err("a partition holding nothing has no association to name");
-
-        assert_eq!(fake.association_count(hash), 1);
-    }
-
-    #[tokio::test]
-    async fn exist_batch_reports_a_match_per_address_in_order() {
-        let fake = Fake::default();
-        let partition: Partition = random();
-        let absent = Address {
-            hash: random(),
-            context: random(),
-        };
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-
-        let store = store(&fake).await;
-        let mut stored = Vec::new();
-        for _ in 0..2 {
-            let address = Address {
-                hash: random(),
-                context: random(),
-            };
-            store
-                .clone()
-                .put(partition, address, fragment, Some(payload.clone()), false)
-                .await
-                .expect("put should succeed");
-            stored.push(address);
-        }
-
-        let addresses = [stored[0], absent, stored[1]];
-        let mut results = [StoreMatchResult::default(); 3];
-        store
-            .query(partition, &addresses, &mut results)
-            .await
-            .expect("resolve should succeed");
-
-        assert_eq!(
-            results.map(|result| result.match_made),
-            [
-                StoreMatch::MatchFull,
-                StoreMatch::MatchNone,
-                StoreMatch::MatchFull
-            ],
-            "results must line up with the addresses given, misses included"
-        );
-    }
-
-    /// The corruption this design exists to make impossible.
-    ///
-    /// Writers race on one hash with different representations, each a valid encoding of the same
-    /// content. Under a model that stores the fragment separately from the bytes, an interleaving
-    /// can leave one writer's fragment describing another writer's payload. Here the fragment
-    /// travels on the object, so whichever upload lands last is the one that is read back — whole.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_writers_cannot_tear_the_fragment_from_its_payload() {
-        const CONTENT_SIZE: u64 = 4096;
-
-        for _ in 0..64 {
-            let fake = Fake::default();
-            let hash: Hash = random();
-            let store = store(&fake).await;
-
-            let representations = [
-                representation(FragmentFlags::PayloadCompressedZstd, 64, CONTENT_SIZE),
-                representation(FragmentFlags::PayloadCompressedLZ4, 512, CONTENT_SIZE),
-                representation(FragmentFlags::PayloadCompressedOodle2, 1024, CONTENT_SIZE),
-                representation(FragmentFlags::PayloadFragmented, 2048, CONTENT_SIZE),
-            ];
-
-            let mut writers = JoinSet::new();
-            for (fragment, payload) in representations {
-                let store = store.clone();
-                let address = Address {
-                    hash,
-                    context: random(),
-                };
-                let partition: Partition = random();
-
-                lore_base::lore_spawn!(writers, async move {
-                    store
-                        .put(partition, address, fragment, Some(payload), false)
-                        .await
-                });
-            }
-
-            while let Some(result) = writers.join_next().await {
-                result
-                    .expect("writer task should not panic")
-                    .expect("every writer should succeed");
-            }
-
-            let (body, metadata) = fake.object(hash).expect("a payload must be stored");
-            let stored = from_object_metadata(Some(&metadata))
-                .expect("the stored object must carry a fragment");
-
-            assert_eq!(
-                stored.size_payload as usize,
-                body.len(),
-                "the fragment on the object must describe the bytes on that same object"
-            );
-            assert_eq!(stored.size_content, CONTENT_SIZE);
-            assert_eq!(
-                fake.state_of(hash),
-                Some(FragmentState::Stored),
-                "the state row must not be left mid-flight"
-            );
-            assert_eq!(
-                fake.association_count(hash),
-                4,
-                "every writer's partition must end up referencing the payload"
-            );
-
-            let expected_byte = (stored.flags & PAYLOAD_FLAGS) as u8;
-            assert!(
-                body.iter().all(|byte| *byte == expected_byte),
-                "the bytes must be the ones the winning writer uploaded, not a mix"
-            );
-        }
-    }
-
-    /// A store containing one fragment inserted through its put operation.
-    async fn stored(fake: &Fake) -> (Arc<AwsImmutableStore>, Partition, Address, Fragment, Bytes) {
-        let store = store(fake).await;
-        let partition: Partition = random();
-        let address = Address {
-            hash: random(),
-            context: random(),
-        };
-        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
-        store
-            .clone()
-            .put(partition, address, fragment, Some(payload.clone()), false)
-            .await
-            .expect("put should succeed");
-        (store, partition, address, fragment, payload)
-    }
-
-    mod put {
-        use tokio::sync::oneshot;
-
-        use super::*;
-
-        #[tokio::test]
-        async fn takes_the_state_read_already_in_flight() {
-            let fake = Fake::default();
-            let (store, partition, address, fragment, payload) = stored(&fake).await;
-            let state_get_items = fake.state_get_items();
-
-            let (release, released) = oneshot::channel();
-            let mut in_flight = Box::pin(
-                store
-                    .state_reads
-                    .run(address.hash, || async { released.await.expect("released") }),
-            );
-            assert!(poll_once(in_flight.as_mut()).await.is_pending());
-
-            let mut put = store
-                .clone()
-                .put(partition, address, fragment, Some(payload), false);
-            assert!(poll_once(put.as_mut()).await.is_pending());
-
-            release
-                .send(Ok(Some(FragmentState::Stored)))
-                .expect("the read in flight is waiting");
-            assert_eq!(in_flight.await.1, Role::Leader);
-            put.await.expect("put should succeed");
-            assert_eq!(fake.state_get_items(), state_get_items);
-        }
-    }
-
-    mod get {
-        use std::task::Poll;
-
-        use tokio::sync::oneshot;
-
-        use super::*;
-
-        #[tokio::test]
-        async fn after_a_copy_reads_the_association_the_copy_wrote() {
-            let fake = Fake::default();
-            let (store, partition, address, _, payload) = stored(&fake).await;
-            let destination_partition: Partition = random();
-            let destination = Address {
-                hash: address.hash,
-                context: random(),
-            };
-
-            let (_release, released) = oneshot::channel::<Result<bool, StoreError>>();
-            let mut before_copy = Box::pin(
-                store
-                    .association_reads
-                    .run((destination_partition, destination), || async {
-                        released.await.expect("released")
-                    }),
-            );
-            assert!(poll_once(before_copy.as_mut()).await.is_pending());
-
-            store
-                .clone()
-                .copy(
-                    partition,
-                    address,
-                    destination_partition,
-                    destination.context,
-                    CopyBehavior {
-                        durable: true,
-                        do_not_replicate: false,
-                    },
-                )
-                .await
-                .expect("copy should succeed");
-
-            let mut get = store.clone().get(destination_partition, destination);
-            let Poll::Ready(got) = poll_once(get.as_mut()).await else {
-                panic!("the get joined a read that began before the copy");
-            };
-            assert_eq!(got.expect("get should succeed").payload, Some(payload));
-        }
-    }
-
-    mod exists {
-        use std::task::Poll;
-
-        use tokio::sync::oneshot;
-
-        use super::*;
-
-        #[tokio::test]
-        async fn after_a_delete_reads_the_association_gone() {
-            let fake = Fake::default();
-            let (store, partition, address, _, _) = stored(&fake).await;
-
-            let (_release, released) = oneshot::channel::<Result<bool, StoreError>>();
-            let mut before_delete =
-                Box::pin(store.association_reads.run((partition, address), || async {
-                    released.await.expect("released")
-                }));
-            assert!(poll_once(before_delete.as_mut()).await.is_pending());
-
-            store
-                .delete_association(partition, address)
-                .await
-                .expect("delete should succeed");
-
-            let mut exists = Box::pin(store.exists(partition, address, &store.shared_labels_put));
-            let Poll::Ready(exists) = poll_once(exists.as_mut()).await else {
-                panic!("the read joined one that began before the delete");
-            };
-            assert!(!exists.expect("exists should succeed"));
-        }
-    }
-
-    mod load_state_shared {
-        use std::pin::Pin;
-        use std::task::Poll;
-
-        use tokio::sync::oneshot;
-
-        use super::*;
-
-        /// Keeps a state read for `hash` in flight so it predates the test's next operation.
-        async fn hold_state_read(
-            store: &AwsImmutableStore,
-            hash: Hash,
-        ) -> (
-            oneshot::Sender<Result<Option<FragmentState>, StoreError>>,
-            Pin<Box<impl Future<Output = (Result<Option<FragmentState>, StoreError>, Role)> + '_>>,
-        ) {
-            let (release, released) = oneshot::channel();
-            let mut in_flight = Box::pin(
-                store
-                    .state_reads
-                    .run(hash, || async { released.await.expect("released") }),
-            );
-            assert!(poll_once(in_flight.as_mut()).await.is_pending());
-            (release, in_flight)
-        }
-
-        #[tokio::test]
-        async fn after_an_obliteration_mark_reads_the_mark() {
-            let fake = Fake::default();
-            let store = store(&fake).await;
-            let hash: Hash = random();
-            fake.set_state(hash, FragmentState::Stored);
-            let _before_mark = hold_state_read(&store, hash).await;
-
-            store
-                .advance_state(hash, FragmentState::Stored, FragmentState::Obliterating)
-                .await
-                .expect("the mark should be taken");
-
-            let mut state = Box::pin(store.load_state_shared(hash, &store.shared_labels_put));
-            let Poll::Ready(state) = poll_once(state.as_mut()).await else {
-                panic!("the read joined one that began before the mark");
-            };
-            assert_eq!(
-                state.expect("state read should succeed"),
-                Some(FragmentState::Obliterating)
-            );
-        }
-
-        #[tokio::test]
-        async fn after_a_clear_reads_no_state() {
-            let fake = Fake::default();
-            let store = store(&fake).await;
-            let hash: Hash = random();
-            fake.set_state(hash, FragmentState::Stored);
-            let _before_clear = hold_state_read(&store, hash).await;
-
-            store.clear_state(hash).await.expect("clear should succeed");
-
-            let mut state = Box::pin(store.load_state_shared(hash, &store.shared_labels_put));
-            let Poll::Ready(state) = poll_once(state.as_mut()).await else {
-                panic!("the read joined one that began before the clear");
-            };
-            assert_eq!(state.expect("state read should succeed"), None);
-        }
-
-        #[tokio::test]
-        async fn after_a_publish_reads_the_published_state() {
-            let fake = Fake::default();
-            let store = store(&fake).await;
-            let hash: Hash = random();
-
-            let (_release, released) =
-                oneshot::channel::<Result<Option<FragmentState>, StoreError>>();
-            let mut before_publish = Box::pin(
-                store
-                    .state_reads
-                    .run(hash, || async { released.await.expect("released") }),
-            );
-            assert!(poll_once(before_publish.as_mut()).await.is_pending());
-
-            assert_eq!(
-                store
-                    .publish_state(hash)
-                    .await
-                    .expect("publish should succeed"),
-                FragmentState::Stored
-            );
-
-            let mut state = Box::pin(store.load_state_shared(hash, &store.shared_labels_put));
-            let Poll::Ready(state) = poll_once(state.as_mut()).await else {
-                panic!("the read joined one that began before the publish");
-            };
-            assert_eq!(
-                state.expect("state read should succeed"),
-                Some(FragmentState::Stored)
-            );
-        }
-    }
-
-    mod malicious_s3_object_tests {
-        use super::*;
-
-        const MAX_OBJECT_SIZE: usize = FRAGMENT_SIZE_THRESHOLD + size_of::<Fragment>();
-
-        #[tokio::test]
-        async fn load_rejects_object_one_byte_over_max_size() {
-            let fake = Fake::default();
-            let hash: Hash = random();
-            fake.put_object_without_metadata(hash, &vec![0u8; MAX_OBJECT_SIZE + 1]);
-            assert!(matches!(
-                store(&fake).await.load(hash).await,
-                Err(StoreError::Oversized(_))
-            ));
-        }
-
-        #[tokio::test]
-        async fn load_rejects_object_far_over_max_size() {
-            let fake = Fake::default();
-            let hash: Hash = random();
-            fake.put_object_without_metadata(hash, &vec![0u8; MAX_OBJECT_SIZE * 2]);
-            assert!(matches!(
-                store(&fake).await.load(hash).await,
-                Err(StoreError::Oversized(_))
-            ));
-        }
-
-        #[tokio::test]
-        async fn load_accepts_object_exactly_at_max_size() {
-            // An object at exactly MAX_OBJECT_SIZE must not be rejected by the size guard.
-            // It has no fragment metadata header and no legacy row, so load will fail for a
-            // different reason — but the error must not be Oversized.
-            let fake = Fake::default();
-            let hash: Hash = random();
-            fake.put_object_without_metadata(hash, &vec![0u8; MAX_OBJECT_SIZE]);
-            assert!(!matches!(
-                store(&fake).await.load(hash).await,
-                Err(StoreError::Oversized(_))
-            ));
-        }
-
-        #[tokio::test]
-        async fn load_rejects_oversized_s3_object_with_valid_fragment_header() {
-            // Content-Length guard fires even when the object carries a valid lore-fragment
-            // header — the raw S3 object size check runs before the body is read.
-            let fake = Fake::default();
-            let body = vec![0u8; MAX_OBJECT_SIZE + 1];
-            let hash: Hash = random();
-            let fragment = Fragment {
-                flags: 0,
-                size_payload: body.len() as u32,
-                size_content: body.len() as u64,
-            };
-            fake.put_object_with_fragment_metadata(hash, &body, fragment);
-            assert!(matches!(
-                store(&fake).await.load(hash).await,
-                Err(StoreError::Oversized(_))
-            ));
-        }
-
-        #[tokio::test]
-        async fn load_rejects_fragment_metadata_claiming_oversized_payload() {
-            // A small S3 object (passes the content_length guard) but whose lore-fragment
-            // header declares size_payload > FRAGMENT_SIZE_THRESHOLD is caught by
-            // validate_fragment_size.
-            let fake = Fake::default();
-            let body = vec![0u8; 64];
-            let hash: Hash = random();
-            let malicious_fragment = Fragment {
-                flags: 0,
-                size_payload: (FRAGMENT_SIZE_THRESHOLD + 1) as u32,
-                size_content: (FRAGMENT_SIZE_THRESHOLD + 1) as u64,
-            };
-            fake.put_object_with_fragment_metadata(hash, &body, malicious_fragment);
-            assert!(matches!(
-                store(&fake).await.load(hash).await,
-                Err(StoreError::Oversized(_))
-            ));
-        }
     }
 }

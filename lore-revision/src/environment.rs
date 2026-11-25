@@ -15,15 +15,11 @@ pub struct EnvironmentConfig {
     pub oidc: Option<Oidc>,
 }
 
-impl EnvironmentConfig {
-    pub fn max_query_batch(&self) -> Option<usize> {
-        self.config.as_ref().and_then(|c| c.max_query_batch)
-    }
-}
-
+/// Server-tunable settings a server advertises in its environment.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(bound(deserialize = "'de: 'static"))]
 pub struct Config {
     pub max_query_batch: Option<usize>,
     pub compression_mode: Option<CompressionMode>,
+    pub max_lock_batch: Option<usize>,
 }

@@ -123,6 +123,21 @@ user_url = "ucs-auth://directory.example.com"
 
 A client connected over `lores://` refuses to connect if the server advertises a `storage_url`, `repository_url`, `revision_url`, `lock_url`, or `notification_url` whose scheme doesn't authenticate the server, such as `lore://`. Give these endpoints a scheme that does, such as `lores://`.
 
+### Advertised client settings
+
+`[environment.config]` defines settings the environment service hands to clients with the endpoints. Every field is optional. Where a store limits a batch, the server narrows the advertised value to that limit.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `max_query_batch` | none | The most addresses a client puts in one storage query. When the immutable store has a limit, `0` or unset advertises that limit, and any other value advertises the smaller of the two. Otherwise the value is advertised as set, and a client told `0` uses its own default. |
+| `max_lock_batch` | none | The most resources a client puts in one lock, unlock or lock status request. A client splits a larger request into batches of this size. `0` or unset advertises the lock store's limit, and any other value advertises the smaller of the two. The limit is 100 for both the `local` and the `aws` lock stores. The lock service refuses a request with more resources than the limit. |
+| `compression_mode` | none | The codec the server asks clients to compress new payloads with: `NoCompression`, `Lz4` or `Zstd`. `Oodle` is advertised as `Zstd`. A client that already has a mode selected keeps it. Unset leaves the choice to the client. |
+
+```toml
+[environment.config]
+max_lock_batch = 50
+```
+
 ### Local store disk space
 
 `[server.local_store_monitor]` configures the periodic check of the disk space left to the local stores (see [Store settings](#store-settings)). Only stores the server writes at are watched, so a `[local]` block left in a remote deployment's configuration is ignored, as is a composite immutable tier that names a path other than the first local tier's — every local tier is handed the store the first one creates.
@@ -728,7 +743,7 @@ When a selector names a plugin rather than a built-in, the server hands that plu
 
 This repository ships two reference plugin implementations as source. Both require a derived server binary that registers them; neither is compiled into `loreserver`.
 
-- **`lore-aws`** backs the immutable store with Amazon S3 and DynamoDB, and the mutable and lock stores with DynamoDB. AWS credentials come from the SDK's default credential chain (environment, profile, instance role), not from the config file.
+- **`lore-aws`** backs the immutable store with Amazon S3 and DynamoDB, and the mutable and lock stores with DynamoDB. AWS credentials do not come from the config file. They resolve from, in order: the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` environment variables, container credentials (ECS and EKS Pod Identity), web identity (`AWS_WEB_IDENTITY_TOKEN_FILE` with `AWS_ROLE_ARN`, as EKS IRSA sets them), the EC2 instance metadata service, and static keys in `~/.aws/credentials`, or `AWS_SHARED_CREDENTIALS_FILE`, for the profile `AWS_PROFILE` names (`default` when unset). `~/.aws/config` is not read, and a profile that takes its credentials from `role_arn`, SSO or `credential_process` does not resolve. Each store takes its region from its region setting, `AWS_REGION` or `AWS_DEFAULT_REGION`, and fails to start without one.
 - **`lore-hashicorp`** provides a Consul topology that discovers peers from a service catalog. It only *reads* the catalog — each server must be registered in Consul externally (by your orchestrator or a Consul agent) — returns only passing or healthy nodes, and re-polls on a fixed interval.
 
 > [!NOTE]

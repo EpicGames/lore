@@ -25,6 +25,7 @@ mod packstore;
 mod read;
 mod read_flight;
 mod store_fixture;
+mod store_retry;
 mod write;
 mod write_stats;
 mod write_tracker;

@@ -1,30 +1,36 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aws_config::meta::region::ProvideRegion;
-use aws_sdk_dynamodb::config::ProvideCredentials;
-use aws_sdk_dynamodb::operation::describe_table::DescribeTableError;
-use aws_sdk_s3::operation::head_bucket::HeadBucketError;
-use aws_smithy_http_client::Builder as HttpClientBuilder;
-use aws_smithy_http_client::Connector;
-use aws_smithy_http_client::tls;
-use aws_smithy_http_client::tls::rustls_provider::CryptoMode;
-use aws_smithy_runtime_api::client::behavior_version::BehaviorVersion;
 use lore_revision::util::time::RetryPolicy;
 use opentelemetry::KeyValue;
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tracing::debug;
-use tracing::warn;
+use url::Url;
 
+use crate::aws::ClientCore;
+use crate::aws::configured_endpoint;
+use crate::aws::creds::CachedCredentials;
+use crate::aws::creds::Credentials;
+use crate::aws::creds::ProvideCredentials;
+use crate::aws::creds::StaticProvider;
+use crate::aws::default_credentials_chain;
+use crate::aws::default_endpoint;
+use crate::aws::dynamodb::DynamoClient;
+use crate::aws::error::TransportError;
+use crate::aws::http::HttpClient;
+use crate::aws::resolve_region;
+use crate::aws::s3::S3Client;
 use crate::aws_error::AwsError;
 use crate::dynamodb::DynamoDb;
+use crate::dynamodb::DynamoError;
 use crate::dynamodb::default_unprocessed_keys_retry;
-use crate::net_http_client::NetHttpClient;
 use crate::s3::S3;
+use crate::s3::S3Error;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum AwsClientError<E> {
@@ -32,11 +38,8 @@ pub enum AwsClientError<E> {
     DynamoTableNotFound(String),
     #[error("S3 bucket not found: {0}")]
     BucketNotFound(String),
-    /// Boxed for the reason on [`AwsError::AwsSdkError`].
-    #[error("AWS SDK error: {0:?}")]
-    SdkError(#[from] Box<E>),
-    #[error("Unknown error")]
-    Unknown,
+    #[error("AWS error: {0}")]
+    Aws(#[from] E),
 }
 
 pub const DEFAULT_POOL_IDLE_TIMEOUT_SECONDS: u64 = 30;
@@ -51,6 +54,13 @@ pub struct HttpClientSettings {
     pub pool_idle_timeout_seconds: u64,
     #[serde(default)]
     pub nodelay: bool,
+    /// The most connections each client built from these settings has in use at once, or no limit
+    /// when unset. Zero is refused when the settings are read.
+    ///
+    /// Each service client has a pool of its own and takes this many. A request past the limit
+    /// waits for a connection to be released until its operation's deadline.
+    #[serde(default)]
+    pub max_connections: Option<NonZeroUsize>,
 }
 
 fn default_quota_per_second() -> u32 {
@@ -85,7 +95,56 @@ impl Default for TaskQueueSettings {
     }
 }
 
-pub type TimeoutConfig = aws_config::timeout::TimeoutConfig;
+/// How long an operation gets, retries included.
+///
+/// Each attempt's exchange is given what remains of this budget, capped at a share of it so that a
+/// retry stays possible, and the attempt's deadline also bounds reading its response body. A
+/// `GetObject` body is streamed by the caller after the call returns, so it is read under the
+/// operation's deadline, and the client does not retry a read that overruns it. With a connection
+/// limit, an attempt's wait for a connection may take what remains of the budget, past its share.
+/// There is no separate connect timeout.
+#[derive(Clone, Copy, Debug)]
+pub struct TimeoutConfig {
+    operation_timeout: Duration,
+}
+
+impl TimeoutConfig {
+    pub fn builder() -> TimeoutConfigBuilder {
+        TimeoutConfigBuilder::default()
+    }
+
+    pub fn operation_timeout(&self) -> Duration {
+        self.operation_timeout
+    }
+}
+
+impl Default for TimeoutConfig {
+    fn default() -> Self {
+        Self {
+            operation_timeout: Duration::from_millis(crate::default_aws_timeout_millis()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TimeoutConfigBuilder {
+    operation_timeout: Option<Duration>,
+}
+
+impl TimeoutConfigBuilder {
+    pub fn operation_timeout(mut self, timeout: Duration) -> Self {
+        self.operation_timeout = Some(timeout);
+        self
+    }
+
+    pub fn build(self) -> TimeoutConfig {
+        TimeoutConfig {
+            operation_timeout: self
+                .operation_timeout
+                .unwrap_or_else(|| Duration::from_millis(crate::default_aws_timeout_millis())),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AwsSettings {
@@ -98,6 +157,26 @@ impl Default for HttpClientSettings {
         Self {
             pool_idle_timeout_seconds: DEFAULT_POOL_IDLE_TIMEOUT_SECONDS,
             nodelay: false,
+            max_connections: None,
+        }
+    }
+}
+
+/// The store a client serves, which labels the time its requests wait for a connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreKind {
+    Immutable,
+    Mutable,
+    Lock,
+}
+
+impl StoreKind {
+    /// The `store` label value naming this store.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Immutable => "immutable",
+            Self::Mutable => "mutable",
+            Self::Lock => "lock",
         }
     }
 }
@@ -116,80 +195,83 @@ impl AwsClientBuilder<WantsHttpConfig> {
         self,
         settings: &HttpClientSettings,
     ) -> AwsClientBuilder<WantsAwsConfig> {
-        let nodelay = settings.nodelay;
-        let http_client = HttpClientBuilder::new()
-            .pool_idle_timeout(Duration::from_secs(settings.pool_idle_timeout_seconds))
-            .build_with_connector_fn(move |_, _| {
-                Connector::builder()
-                    .tls_provider(tls::Provider::Rustls(CryptoMode::Ring))
-                    .enable_tcp_nodelay(nodelay)
-                    .build()
-            });
-
         AwsClientBuilder(WantsAwsConfig {
-            config: aws_config::defaults(BehaviorVersion::latest())
-                .http_client(NetHttpClient::new(http_client))
-                // We default to disabling HTTP connect timeouts for the time being, hopefully once
-                // we sort out whatever is causing our mysterious network latency we can remove
-                // this. Note: this is override-able in the next phase of the client builder
-                // typestate settings.
-                .timeout_config(TimeoutConfig::builder().disable_connect_timeout().build()),
+            http: settings.clone(),
+            store: None,
+            credentials: None,
+            region: None,
+            endpoint: None,
+            timeout: TimeoutConfig::default(),
         })
     }
 }
 
 pub struct WantsAwsConfig {
-    config: aws_config::ConfigLoader,
+    /// Built into a transport with the service it sends to, so a transport that cannot be built is
+    /// reported by `build()` rather than by a panic in the middle of the builder chain.
+    http: HttpClientSettings,
+    /// The store the clients serve, when one is named.
+    store: Option<StoreKind>,
+    credentials: Option<Arc<dyn ProvideCredentials>>,
+    region: Option<String>,
+    endpoint: Option<String>,
+    timeout: TimeoutConfig,
 }
 
 impl AwsClientBuilder<WantsAwsConfig> {
-    pub fn with_credentials_provider(
-        mut self,
-        credentials_provider: impl ProvideCredentials + 'static,
-    ) -> Self {
-        self.0.config = self.0.config.credentials_provider(credentials_provider);
+    /// Name the store these clients serve, as the `store` label on the time their requests wait
+    /// for a connection.
+    pub fn for_store(mut self, store: StoreKind) -> Self {
+        self.0.store = Some(store);
 
         self
     }
 
-    pub fn region(mut self, region: impl ProvideRegion + 'static) -> Self {
-        self.0.config = self.0.config.region(region);
+    /// Sign with these credentials rather than resolving the default chain.
+    pub fn with_static_credentials(mut self, credentials: Credentials) -> Self {
+        self.0.credentials = Some(Arc::new(StaticProvider::new(credentials)));
+
+        self
+    }
+
+    pub fn region(mut self, region: impl Into<String>) -> Self {
+        self.0.region = Some(region.into());
 
         self
     }
 
     pub fn maybe_region(mut self, region: Option<String>) -> Self {
         if let Some(region) = region {
-            let region = aws_types::region::Region::new(region);
-            self.0.config = self.0.config.region(region);
+            self.0.region = Some(region);
         }
 
         self
     }
 
     pub fn endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.0.config = self.0.config.endpoint_url(endpoint.into());
+        self.0.endpoint = Some(endpoint.into());
 
         self
     }
 
     pub fn maybe_endpoint(mut self, endpoint: Option<String>) -> Self {
         if let Some(endpoint) = endpoint {
-            self.0.config = self.0.config.endpoint_url(endpoint);
+            self.0.endpoint = Some(endpoint);
         }
 
         self
     }
 
     pub fn with_timeout_config(mut self, timeout_config: TimeoutConfig) -> Self {
-        self.0.config = self.0.config.timeout_config(timeout_config);
+        self.0.timeout = timeout_config;
 
         self
     }
 
-    pub async fn build_config(self) -> AwsClientBuilder<WantsService> {
+    /// Fix the configuration every service client is then built from.
+    pub fn build_config(self) -> AwsClientBuilder<WantsService> {
         AwsClientBuilder(WantsService {
-            config: self.0.config.load().await,
+            config: self.0,
             slow_operation_threshold: u64::MAX,
             metric_labels: vec![],
             unprocessed_keys_retry: default_unprocessed_keys_retry(),
@@ -198,10 +280,50 @@ impl AwsClientBuilder<WantsAwsConfig> {
 }
 
 pub struct WantsService {
-    config: aws_config::SdkConfig,
+    config: WantsAwsConfig,
     slow_operation_threshold: u64,
     metric_labels: Vec<KeyValue>,
     unprocessed_keys_retry: RetryPolicy,
+}
+
+impl WantsService {
+    /// The pieces every service client shares, resolved once.
+    ///
+    /// The region is resolved here rather than at first use, so a deployment with no region at all
+    /// fails at startup with something to read instead of on its first request.
+    fn core(&self, service: &'static str) -> Result<Arc<ClientCore>, TransportError> {
+        let http = HttpClient::for_service(&self.config.http, service, self.config.store)?;
+
+        let region = resolve_region(self.config.region.as_deref()).ok_or_else(|| {
+            TransportError::Build(
+                "no AWS region is configured: set the region setting, AWS_REGION or \
+                 AWS_DEFAULT_REGION"
+                    .to_owned(),
+            )
+        })?;
+
+        let credentials = match &self.config.credentials {
+            Some(provider) => Arc::new(CachedCredentials::new(provider.clone())),
+            None => default_credentials_chain(&region)?,
+        };
+
+        let endpoint = configured_endpoint(self.config.endpoint.as_deref(), service)
+            .unwrap_or_else(|| default_endpoint(service, &region));
+        let endpoint = Url::parse(&endpoint).map_err(|error| {
+            TransportError::Build(format!("endpoint {endpoint:?} is not a URL: {error}"))
+        })?;
+
+        Ok(Arc::new(ClientCore::new(
+            http,
+            credentials,
+            Arc::from(region.as_str()),
+            endpoint,
+            self.config.timeout.operation_timeout(),
+            // A request id is only read by the slow-operation warning, so it is captured only when
+            // there is a threshold that can fire.
+            self.slow_operation_threshold != u64::MAX,
+        )))
+    }
 }
 
 impl AwsClientBuilder<WantsService> {
@@ -228,16 +350,14 @@ impl AwsClientBuilder<WantsService> {
     }
 
     pub fn dynamodb(self) -> AwsClientBuilder<WantsTables> {
-        let ddb_config = aws_sdk_dynamodb::config::Builder::from(&self.0.config).build();
-        debug!("Using dynamodb config: {ddb_config:?}");
+        let core = self.0.core("dynamodb");
+        debug!("Using dynamodb core: {core:?}");
 
         AwsClientBuilder(WantsTables {
-            client: DynamoDb::new(
-                aws_sdk_dynamodb::Client::from_conf(ddb_config),
-                Duration::from_millis(self.0.slow_operation_threshold),
-                self.0.metric_labels,
-                self.0.unprocessed_keys_retry,
-            ),
+            core,
+            slow_operation_threshold: self.0.slow_operation_threshold,
+            metric_labels: self.0.metric_labels,
+            unprocessed_keys_retry: self.0.unprocessed_keys_retry,
             tables: vec![],
         })
     }
@@ -247,23 +367,23 @@ impl AwsClientBuilder<WantsService> {
     }
 
     pub fn s3_with_path_style(self, force_path_style: bool) -> AwsClientBuilder<WantsBuckets> {
-        let s3_config = aws_sdk_s3::config::Builder::from(&self.0.config)
-            .force_path_style(force_path_style)
-            .build();
-        debug!("Using S3 config: {s3_config:?}");
+        let core = self.0.core("s3");
+        debug!("Using S3 core: {core:?}, path style: {force_path_style}");
 
         AwsClientBuilder(WantsBuckets {
-            client: S3::new(
-                aws_sdk_s3::Client::from_conf(s3_config),
-                Duration::from_millis(self.0.slow_operation_threshold),
-            ),
+            core,
+            force_path_style,
+            slow_operation_threshold: self.0.slow_operation_threshold,
             buckets: vec![],
         })
     }
 }
 
 pub struct WantsTables {
-    client: DynamoDb,
+    core: Result<Arc<ClientCore>, TransportError>,
+    slow_operation_threshold: u64,
+    metric_labels: Vec<KeyValue>,
+    unprocessed_keys_retry: RetryPolicy,
     tables: Vec<String>,
 }
 
@@ -274,39 +394,41 @@ impl AwsClientBuilder<WantsTables> {
         self
     }
 
-    pub async fn build(
-        self,
-    ) -> Result<DynamoDb, AwsClientError<aws_sdk_dynamodb::error::SdkError<DescribeTableError>>>
-    {
+    pub async fn build(self) -> Result<DynamoDb, AwsClientError<DynamoError>> {
+        let core = self
+            .0
+            .core
+            .map_err(|error| AwsClientError::Aws(AwsError::Aws(error.into())))?;
+
+        let client = DynamoDb::new(
+            DynamoClient::new(core),
+            Duration::from_millis(self.0.slow_operation_threshold),
+            self.0.metric_labels,
+            self.0.unprocessed_keys_retry,
+        );
+
         for table_name in self.0.tables {
             debug!("Checking if table exists: {table_name}");
 
-            match self
-                .0
-                .client
-                .table_exists(&Arc::from(table_name.as_str()))
-                .await
-            {
+            match client.table_exists(&Arc::from(table_name.as_str())).await {
                 Ok(exists) if !exists => {
                     return Err(AwsClientError::DynamoTableNotFound(table_name));
                 }
                 Ok(_) => {
                     debug!("Dynamo table exists: {table_name}");
                 }
-                Err(AwsError::AwsSdkError(e)) => return Err(e.into()),
-                Err(e) => {
-                    warn!("Unknown error while checking if table exists: {e:?}");
-                    return Err(AwsClientError::Unknown);
-                }
+                Err(e) => return Err(AwsClientError::Aws(e)),
             }
         }
 
-        Ok(self.0.client)
+        Ok(client)
     }
 }
 
 pub struct WantsBuckets {
-    client: S3,
+    core: Result<Arc<ClientCore>, TransportError>,
+    force_path_style: bool,
+    slow_operation_threshold: u64,
     buckets: Vec<String>,
 }
 
@@ -317,25 +439,29 @@ impl AwsClientBuilder<WantsBuckets> {
         self
     }
 
-    pub async fn build(
-        self,
-    ) -> Result<S3, AwsClientError<aws_sdk_s3::error::SdkError<HeadBucketError>>> {
+    pub async fn build(self) -> Result<S3, AwsClientError<S3Error>> {
+        let core = self
+            .0
+            .core
+            .map_err(|error| AwsClientError::Aws(AwsError::Aws(error.into())))?;
+
+        let client = S3::new(
+            S3Client::new(core, self.0.force_path_style),
+            Duration::from_millis(self.0.slow_operation_threshold),
+        );
+
         for bucket in self.0.buckets {
             debug!("Checking if bucket exists: {bucket}");
 
-            match self.0.client.bucket_exists(bucket.clone()).await {
+            match client.bucket_exists(&bucket).await {
                 Ok(exists) if exists => {
                     debug!("S3 bucket exists: {bucket}");
                 }
                 Ok(_) => return Err(AwsClientError::BucketNotFound(bucket)),
-                Err(AwsError::AwsSdkError(e)) => return Err(e.into()),
-                Err(e) => {
-                    warn!("Unknown error while checking if bucket exists: {e:?}");
-                    return Err(AwsClientError::Unknown);
-                }
+                Err(e) => return Err(AwsClientError::Aws(e)),
             }
         }
 
-        Ok(self.0.client)
+        Ok(client)
     }
 }

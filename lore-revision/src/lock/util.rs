@@ -7,6 +7,7 @@ use lore_error_set::prelude::*;
 use crate::filter::FilterMode;
 use crate::hash;
 use crate::lock;
+use crate::lock::LockStore;
 use crate::lore::BranchId;
 use crate::node::Node;
 use crate::node::ROOT_NODE;
@@ -15,7 +16,27 @@ use crate::state::State;
 use crate::state::StateError;
 use crate::util::path::RelativePath;
 
+/// The most resources one lock, unlock or status request names when no limit is given.
 pub const LOCK_BATCH_SIZE: usize = 100;
+
+/// How many resources belong in one lock, unlock or status request to the server `environment`
+/// describes.
+///
+/// The limit the server advertises, or [`LOCK_BATCH_SIZE`] when it advertises none. Zero means no
+/// advertised limit.
+pub fn lock_batch_size(environment: &lore_transport::EnvironmentConfig) -> usize {
+    environment
+        .max_lock_batch()
+        .filter(|size| *size > 0)
+        .unwrap_or(LOCK_BATCH_SIZE)
+}
+
+/// The most resources one lock, unlock or status request may name against `store`.
+///
+/// The store's own limit, or [`LOCK_BATCH_SIZE`] when it names none.
+pub fn store_lock_batch_size(store: &dyn LockStore) -> usize {
+    store.max_lock_batch().unwrap_or(LOCK_BATCH_SIZE)
+}
 
 /// The tree a lock command reads its paths against, the staged one or the current one where
 /// nothing is staged, and the branch the working tree is on.

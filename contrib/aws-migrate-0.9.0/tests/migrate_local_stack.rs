@@ -24,14 +24,22 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aws_sdk_dynamodb::primitives::Blob;
-use aws_sdk_dynamodb::types::AttributeDefinition;
-use aws_sdk_dynamodb::types::AttributeValue;
-use aws_sdk_dynamodb::types::KeySchemaElement;
-use aws_sdk_dynamodb::types::KeyType;
-use aws_sdk_dynamodb::types::ProvisionedThroughput;
-use aws_sdk_dynamodb::types::ScalarAttributeType;
 use bytes::Bytes;
+use http::HeaderValue;
+use http::Method;
+use lore_aws::aws::ClientCore;
+use lore_aws::aws::creds::CachedCredentials;
+use lore_aws::aws::creds::Credentials;
+use lore_aws::aws::creds::StaticProvider;
+use lore_aws::aws::dynamodb::DynamoProtocol;
+use lore_aws::aws::error::AwsCallError;
+use lore_aws::aws::error::DynamoErrorCode;
+use lore_aws::aws::http::HttpClient;
+use lore_aws::aws::http::HttpRequest;
+use lore_aws::aws::item::AttributeValue;
+use lore_aws::aws::item::ByteStr;
+use lore_aws::aws::item::Item;
+use lore_aws::aws::s3::S3Protocol;
 use lore_aws::clients::AwsClientBuilder;
 use lore_aws::clients::HttpClientSettings;
 use lore_aws::dynamodb::DynamoDb;
@@ -55,7 +63,10 @@ use lore_storage::ImmutableStore;
 use lore_storage::Partition;
 use lore_storage::StoreGetData;
 use lore_storage::TypedBytes;
+use serde_json::Value;
+use serde_json::json;
 use tokio::task::JoinSet;
+use url::Url;
 use zerocopy::IntoBytes;
 
 /// The endpoints and credentials `lore-integration-tests/compose.yaml` brings up.
@@ -112,6 +123,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// clients and scans before it converts anything, and a resumed run re-reads every row it already
 /// converted before it reaches new work.
 const POLL_ATTEMPTS: usize = 12_000;
+
+/// The whole-operation budget of the bare client core the bucket and tables are created through,
+/// retries included.
+const CORE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How a fragment was stored before the migration, and therefore which recovery path it exercises.
 #[derive(Clone, Copy)]
@@ -209,7 +224,7 @@ async fn an_interrupted_migration_finishes_on_the_next_run_and_reads_back_withou
     let dynamodb = dynamodb_client().await;
     let s3 = Arc::new(s3_client().await);
     create_bucket(&s3).await;
-    create_tables(&dynamodb, &tables).await;
+    create_tables(&tables).await;
 
     let partition: Partition = rand::random();
     let fragmented = seed_fragmented();
@@ -509,46 +524,49 @@ async fn write_object_and_row(s3: &S3, dynamodb: &DynamoDb, tables: &Tables, fra
 
 /// The metadata row that era wrote: the whole fragment flattened alongside the hash, and no state
 /// attribute.
-fn legacy_row(fragment: &Seeded) -> HashMap<String, AttributeValue> {
-    HashMap::from([
-        (HASH_ATTRIBUTE.to_owned(), hash_value(fragment.address.hash)),
-        (
-            "flags".to_owned(),
-            AttributeValue::N(fragment.row.flags.to_string()),
-        ),
-        (
-            "size_payload".to_owned(),
-            AttributeValue::N(fragment.row.size_payload.to_string()),
-        ),
-        (
-            "size_content".to_owned(),
-            AttributeValue::N(fragment.row.size_content.to_string()),
-        ),
-    ])
+fn legacy_row(fragment: &Seeded) -> Item {
+    let mut row = Item::with_capacity(4);
+    row.insert(
+        ByteStr::from_static(HASH_ATTRIBUTE),
+        hash_value(fragment.address.hash),
+    );
+    row.insert(
+        ByteStr::from_static("flags"),
+        AttributeValue::number(fragment.row.flags),
+    );
+    row.insert(
+        ByteStr::from_static("size_payload"),
+        AttributeValue::number(fragment.row.size_payload),
+    );
+    row.insert(
+        ByteStr::from_static("size_content"),
+        AttributeValue::number(fragment.row.size_content),
+    );
+    row
 }
 
 /// A row in the fragments table, whose sort key is the partition holding the reference followed by
 /// the address's context.
-fn association(partition: Partition, address: Address) -> HashMap<String, AttributeValue> {
+fn association(partition: Partition, address: Address) -> Item {
     let mut partition_context = Vec::with_capacity(partition.data().len() * 2);
     partition_context.extend_from_slice(partition.data());
     partition_context.extend_from_slice(address.context.data());
 
-    HashMap::from([
-        (
-            FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_owned(),
-            hash_value(address.hash),
-        ),
-        (
-            FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE.to_owned(),
-            AttributeValue::B(Blob::new(partition_context)),
-        ),
-    ])
+    let mut row = Item::with_capacity(2);
+    row.insert(
+        ByteStr::from_static(FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE),
+        hash_value(address.hash),
+    );
+    row.insert(
+        ByteStr::from_static(FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE),
+        AttributeValue::blob(partition_context),
+    );
+    row
 }
 
 /// A hash as the binary attribute every one of these tables keys on.
 fn hash_value(hash: Hash) -> AttributeValue {
-    AttributeValue::B(Blob::new(hash.data().to_vec()))
+    AttributeValue::blob(hash.data())
 }
 
 /// The migrate tool, pointed at the local stack and at the tables this run owns.
@@ -765,9 +783,12 @@ async fn assert_migrated(s3: &S3, dynamodb: &DynamoDb, tables: &Tables, fragment
     let row = get_row(dynamodb, &tables.state, hash)
         .await
         .unwrap_or_else(|| panic!("{hash} should have a state row"));
-    let state = row.get(STATE_ATTRIBUTE).and_then(|value| value.as_n().ok());
+    let state = match row.get(STATE_ATTRIBUTE) {
+        Some(AttributeValue::N(state)) => Some(state.as_str()),
+        _ => None,
+    };
     assert_eq!(
-        state.map(String::as_str),
+        state,
         Some(STORED_STATE),
         "{hash} should have a state row saying its payload is stored, got {row:?}"
     );
@@ -780,7 +801,7 @@ async fn assert_migrated(s3: &S3, dynamodb: &DynamoDb, tables: &Tables, fragment
         .unwrap_or_else(|error| panic!("{hash} should carry its fragment in its header: {error}"));
 
     assert_eq!(
-        i64::from(stored.size_payload),
+        u64::from(stored.size_payload),
         head.content_length()
             .expect("S3 reports the length of an object it heads"),
         "the header on {hash} should describe the bytes it was written with"
@@ -949,11 +970,10 @@ async fn clean_up(s3: &Arc<S3>, dynamodb: &DynamoDb, tables: &Arc<Tables>, writt
 async fn s3_client() -> S3 {
     AwsClientBuilder::builder()
         .with_http_settings(&HttpClientSettings::default())
-        .with_credentials_provider(credentials())
+        .with_static_credentials(credentials())
         .region(REGION)
         .endpoint(S3_ENDPOINT)
         .build_config()
-        .await
         .s3_with_path_style(true)
         .build()
         .await
@@ -963,11 +983,10 @@ async fn s3_client() -> S3 {
 async fn dynamodb_client() -> DynamoDb {
     AwsClientBuilder::builder()
         .with_http_settings(&HttpClientSettings::default())
-        .with_credentials_provider(credentials())
+        .with_static_credentials(credentials())
         .region(REGION)
         .endpoint(DYNAMODB_ENDPOINT)
         .build_config()
-        .await
         .dynamodb()
         .build()
         .await
@@ -975,90 +994,129 @@ async fn dynamodb_client() -> DynamoDb {
 }
 
 /// The credentials the compose file starts both services with.
-fn credentials() -> aws_sdk_dynamodb::config::Credentials {
-    aws_sdk_dynamodb::config::Credentials::new(ACCESS_KEY, SECRET_KEY, None, None, "test")
+fn credentials() -> Credentials {
+    Credentials::new(ACCESS_KEY, SECRET_KEY, None, None)
+}
+
+/// A bare client core pointed at `endpoint`, signing for [`REGION`] with the stack's credentials.
+///
+/// `CreateBucket`, `CreateTable` and `DeleteTable` are not operations the lore-native client has,
+/// so this test sends them through a core like this one, with the request bodies written out by
+/// hand.
+fn client_core(endpoint: &str) -> ClientCore {
+    let http =
+        HttpClient::new(&HttpClientSettings::default()).expect("the HTTP client should build");
+    let credentials = Arc::new(CachedCredentials::new(Arc::new(StaticProvider::new(
+        credentials(),
+    ))));
+
+    ClientCore::new(
+        http,
+        credentials,
+        Arc::from(REGION),
+        Url::parse(endpoint).expect("the endpoint is a URL"),
+        CORE_TIMEOUT,
+        false,
+    )
 }
 
 /// Creates the payload bucket unless it is already there, as it is on every run after the first.
 async fn create_bucket(s3: &S3) {
     if s3
-        .bucket_exists(BUCKET.to_owned())
+        .bucket_exists(BUCKET)
         .await
         .expect("checking the bucket should succeed")
     {
         return;
     }
 
-    s3.sdk_client()
-        .create_bucket()
-        .bucket(BUCKET)
-        .send()
-        .await
-        .expect("creating the bucket should succeed");
+    let core = client_core(S3_ENDPOINT);
+    let created = core
+        .send::<S3Protocol>(|| HttpRequest::new(Method::PUT, core.url(&format!("/{BUCKET}"), None)))
+        .await;
+
+    match created {
+        Ok(_) => {}
+        Err(AwsCallError::Service(error))
+            if matches!(
+                error.code_str(),
+                "BucketAlreadyOwnedByYou" | "BucketAlreadyExists"
+            ) => {}
+        Err(error) => panic!("creating the bucket should succeed: {error:?}"),
+    }
 }
 
 /// Creates the three tables this run owns, in the shapes the store keys them on.
-async fn create_tables(dynamodb: &DynamoDb, tables: &Tables) {
-    create_table(dynamodb, &tables.fragments, true).await;
-    create_table(dynamodb, &tables.state, false).await;
-    create_table(dynamodb, &tables.metadata, false).await;
+async fn create_tables(tables: &Tables) {
+    let core = client_core(DYNAMODB_ENDPOINT);
+    create_table(&core, &tables.fragments, true).await;
+    create_table(&core, &tables.state, false).await;
+    create_table(&core, &tables.metadata, false).await;
 }
 
 /// One table keyed on the hash, with the fragments table's association sort key where `associated`
 /// asks for it.
-async fn create_table(dynamodb: &DynamoDb, name: &Arc<str>, associated: bool) {
-    let mut create = dynamodb
-        .sdk_client()
-        .create_table()
-        .table_name(&**name)
-        .attribute_definitions(binary_attribute(HASH_ATTRIBUTE))
-        .key_schema(key(HASH_ATTRIBUTE, KeyType::Hash))
-        .provisioned_throughput(
-            ProvisionedThroughput::builder()
-                .read_capacity_units(5)
-                .write_capacity_units(5)
-                .build()
-                .expect("the throughput should build"),
-        );
+async fn create_table(core: &ClientCore, name: &Arc<str>, associated: bool) {
+    let mut attributes = vec![binary_attribute(HASH_ATTRIBUTE)];
+    let mut keys = vec![key(HASH_ATTRIBUTE, "HASH")];
 
     if associated {
-        create = create
-            .attribute_definitions(binary_attribute(FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE))
-            .key_schema(key(FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE, KeyType::Range));
+        attributes.push(binary_attribute(FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE));
+        keys.push(key(FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE, "RANGE"));
     }
 
-    create
-        .send()
+    let definition = json!({
+        "TableName": &**name,
+        "AttributeDefinitions": attributes,
+        "KeySchema": keys,
+        "ProvisionedThroughput": { "ReadCapacityUnits": 5, "WriteCapacityUnits": 5 },
+    });
+
+    send_dynamodb(core, "DynamoDB_20120810.CreateTable", &definition)
         .await
         .unwrap_or_else(|error| panic!("creating {name} should succeed: {error:?}"));
 }
 
-fn binary_attribute(name: &str) -> AttributeDefinition {
-    AttributeDefinition::builder()
-        .attribute_name(name)
-        .attribute_type(ScalarAttributeType::B)
-        .build()
-        .expect("the attribute definition should build")
+fn binary_attribute(name: &str) -> Value {
+    json!({ "AttributeName": name, "AttributeType": "B" })
 }
 
-fn key(name: &str, key_type: KeyType) -> KeySchemaElement {
-    KeySchemaElement::builder()
-        .attribute_name(name)
-        .key_type(key_type)
-        .build()
-        .expect("the key schema should build")
+fn key(name: &str, role: &str) -> Value {
+    json!({ "AttributeName": name, "KeyType": role })
+}
+
+/// Sends one `DynamoDB` operation the lore-native client does not have, its body written by the
+/// caller.
+async fn send_dynamodb(
+    core: &ClientCore,
+    target: &'static str,
+    body: &Value,
+) -> Result<(), AwsCallError<DynamoErrorCode>> {
+    let body = Bytes::from(serde_json::to_vec(body).expect("a JSON value serializes"));
+
+    core.send::<DynamoProtocol>(|| {
+        HttpRequest::new(Method::POST, core.url("/", None))
+            .header(
+                "content-type",
+                HeaderValue::from_static("application/x-amz-json-1.0"),
+            )
+            .header("x-amz-target", HeaderValue::from_static(target))
+            .body(body.clone())
+    })
+    .await
+    .map(drop)
 }
 
 /// Deletes a table and waits for it to be gone, so what follows reads a store that no longer has
 /// it rather than one still taking it down.
 async fn drop_table(dynamodb: &DynamoDb, name: &Arc<str>) {
-    dynamodb
-        .sdk_client()
-        .delete_table()
-        .table_name(&**name)
-        .send()
-        .await
-        .unwrap_or_else(|error| panic!("deleting {name} should succeed: {error:?}"));
+    send_dynamodb(
+        &client_core(DYNAMODB_ENDPOINT),
+        "DynamoDB_20120810.DeleteTable",
+        &json!({ "TableName": &**name }),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("deleting {name} should succeed: {error:?}"));
 
     for _ in 0..POLL_ATTEMPTS {
         if !dynamodb
@@ -1074,24 +1132,19 @@ async fn drop_table(dynamodb: &DynamoDb, name: &Arc<str>) {
 }
 
 /// One row, or `None` where the table holds none for that hash.
-async fn get_row(
-    dynamodb: &DynamoDb,
-    table: &Arc<str>,
-    hash: Hash,
-) -> Option<HashMap<String, AttributeValue>> {
+async fn get_row(dynamodb: &DynamoDb, table: &Arc<str>, hash: Hash) -> Option<Item> {
+    let mut key = Item::with_capacity(1);
+    key.insert(ByteStr::from_static(HASH_ATTRIBUTE), hash_value(hash));
+
     dynamodb
-        .get_item(
-            table,
-            HashMap::from([(HASH_ATTRIBUTE.to_owned(), hash_value(hash))]),
-            true,
-        )
+        .get_item(table, key, true)
         .await
         .expect("reading a row should succeed")
         .item
 }
 
 /// Every row in a table, following the scan to the end of it.
-async fn scan(dynamodb: &DynamoDb, table: &Arc<str>) -> Vec<HashMap<String, AttributeValue>> {
+async fn scan(dynamodb: &DynamoDb, table: &Arc<str>) -> Vec<Item> {
     let mut items = Vec::new();
     let mut start_key = None;
 

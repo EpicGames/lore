@@ -56,6 +56,9 @@ message Config {
   // Preferred compression mode for new payloads. Unset means the server
   // has no opinion; the client's local configuration wins.
   optional CompressionMode compression_mode = 2;
+  // Maximum number of resources the server accepts in a single lock, unlock or
+  // lock-status request. `0` or absent means no advertised limit.
+  uint32 max_lock_batch = 3;
 }
 
 // The OpenID Connect provider clients log in at. An empty string means

@@ -1,40 +1,37 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::collections::HashMap;
 use std::ops::Range;
 use std::time::Duration;
 
-#[cfg(test)]
+#[cfg(feature = "test-util")]
 pub use MockS3Impl as S3;
-#[cfg(not(test))]
+#[cfg(not(feature = "test-util"))]
 pub use S3Impl as S3;
-use aws_sdk_s3 as s3;
-use aws_sdk_s3::error::SdkError;
-use aws_sdk_s3::operation::delete_object::DeleteObjectError;
-use aws_sdk_s3::operation::delete_object::DeleteObjectOutput;
-use aws_sdk_s3::operation::get_object::GetObjectError;
-use aws_sdk_s3::operation::get_object::GetObjectOutput;
-use aws_sdk_s3::operation::head_bucket::HeadBucketError;
-use aws_sdk_s3::operation::head_object::HeadObjectError;
-use aws_sdk_s3::operation::head_object::HeadObjectOutput;
-use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsError;
-use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput;
-use aws_sdk_s3::operation::put_object::PutObjectError;
-use aws_sdk_s3::operation::put_object::PutObjectOutput;
-use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
 use lore_telemetry::observe::Observe;
-#[cfg(test)]
+#[cfg(feature = "test-util")]
 use mockall::automock;
 use opentelemetry::metrics::Histogram;
-use s3::operation::list_objects_v2::ListObjectsV2Error;
-use s3::operation::list_objects_v2::ListObjectsV2Output;
 use tracing::warn;
 
+use crate::aws::error::AwsCallError;
+use crate::aws::error::S3ErrorCode;
+use crate::aws::observe::observe_aws_operation_callback;
+use crate::aws::s3::GetObjectOutput;
+use crate::aws::s3::HeadObjectOutput;
+use crate::aws::s3::ListObjectVersionsOutput;
+use crate::aws::s3::ObjectMetadata;
+use crate::aws::s3::S3Client;
+use crate::aws::s3::WriteOutput;
 use crate::aws_error::AwsError;
-use crate::observe_aws_operation_callback;
+
+/// What a call to this facade can fail with.
+///
+/// One alias for every operation: the error code is a typed enum, so the operation it came from is
+/// not part of the type.
+pub type S3Error = AwsError<AwsCallError<S3ErrorCode>>;
 
 #[derive(Clone)]
 struct S3InstrumentProvider;
@@ -68,14 +65,14 @@ impl InstrumentProvider for S3Instruments {
 }
 
 pub struct S3Impl {
-    client: s3::Client,
+    client: S3Client,
     instruments: S3Instruments,
     slow_operation_duration: Duration,
 }
 
-#[cfg_attr(test, automock)]
+#[cfg_attr(feature = "test-util", automock)]
 impl S3Impl {
-    pub fn new(client: s3::Client, slow_operation_duration: Duration) -> Self {
+    pub fn new(client: S3Client, slow_operation_duration: Duration) -> Self {
         Self {
             client,
             instruments: S3Instruments::new(S3InstrumentProvider {}),
@@ -84,15 +81,10 @@ impl S3Impl {
     }
 
     #[tracing::instrument(name = "S3Impl::bucket_exists", skip_all)]
-    pub async fn bucket_exists(
-        &self,
-        bucket: String,
-    ) -> Result<bool, AwsError<SdkError<HeadBucketError>>> {
+    pub async fn bucket_exists(&self, bucket: &str) -> Result<bool, S3Error> {
         match self
             .client
-            .head_bucket()
-            .bucket(bucket)
-            .send()
+            .bucket_exists(bucket)
             .observe(
                 self.instruments.operation_latency_histogram.clone(),
                 self.instruments
@@ -103,53 +95,18 @@ impl S3Impl {
             .await
             .output
         {
-            Ok(_) => Ok(true),
-            Err(SdkError::ServiceError(err)) if err.err().is_not_found() => Ok(false),
+            Ok(exists) => Ok(exists),
             Err(e) => {
                 warn!("Failed to check if bucket exists: {e}");
-                Err(AwsError::sdk_error(e))
+                Err(AwsError::Aws(e))
             }
         }
     }
 
-    #[tracing::instrument(name = "S3Impl::list_objects", skip_all)]
-    pub async fn list_objects(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        max_keys: Option<i32>,
-    ) -> Result<ListObjectsV2Output, AwsError<SdkError<ListObjectsV2Error>>> {
-        let mut request = self.client.list_objects_v2().bucket(bucket).prefix(prefix);
-
-        if let Some(m) = max_keys {
-            request = request.max_keys(m);
-        }
-
-        request
-            .send()
-            .observe(
-                self.instruments.operation_latency_histogram.clone(),
-                self.instruments
-                    .instrument_provider
-                    .get_labels_for_operation_context("list_objects_v2"),
-                observe_aws_operation_callback(self.slow_operation_duration),
-            )
-            .await
-            .output
-            .map_err(AwsError::sdk_error)
-    }
-
     #[tracing::instrument(name = "S3Impl::head_object", skip_all)]
-    pub async fn head_object(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> Result<HeadObjectOutput, AwsError<SdkError<HeadObjectError>>> {
+    pub async fn head_object(&self, bucket: &str, key: &str) -> Result<HeadObjectOutput, S3Error> {
         self.client
-            .head_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
+            .head_object(bucket, key)
             .observe(
                 self.instruments.operation_latency_histogram.clone(),
                 self.instruments
@@ -159,7 +116,7 @@ impl S3Impl {
             )
             .await
             .output
-            .map_err(AwsError::sdk_error)
+            .map_err(AwsError::Aws)
     }
 
     #[tracing::instrument(name = "S3Impl::get_object", skip_all)]
@@ -168,18 +125,11 @@ impl S3Impl {
         bucket: &str,
         key: &str,
         range: Option<Range<usize>>,
-    ) -> Result<GetObjectOutput, AwsError<SdkError<GetObjectError>>> {
-        let mut request = self.client.get_object().bucket(bucket).key(key);
-
-        if let Some(r) = range {
-            // Rust ranges are half-open (bounded inclusively on the lower bound, but exclusively on
-            // the upper), whereas HTTP ranges are inclusive on both bounds, in order to not fetch
-            // an extra byte we subtract 1 from the upper bound.
-            request = request.range(format!("bytes={0}-{1}", r.start, r.end.saturating_sub(1)));
-        }
-
-        request
-            .send()
+    ) -> Result<GetObjectOutput, S3Error> {
+        // Rust ranges are half-open and HTTP ranges are inclusive at both ends; the client does
+        // that conversion, so a caller's range means what it says here.
+        self.client
+            .get_object(bucket, key, range)
             .observe(
                 self.instruments.operation_latency_histogram.clone(),
                 self.instruments
@@ -189,7 +139,7 @@ impl S3Impl {
             )
             .await
             .output
-            .map_err(AwsError::sdk_error)
+            .map_err(AwsError::Aws)
     }
 
     /// Store an object, optionally attaching object metadata carried as `x-amz-meta-*` headers.
@@ -197,24 +147,19 @@ impl S3Impl {
     /// Object metadata is part of the object version rather than a separate record, so a reader
     /// always observes the metadata that was written with the bytes it is reading. Writing the
     /// two together is what makes them impossible to tear apart.
+    ///
+    /// The body is [`Bytes`]: callers already hold the payload in a refcounted buffer, and it
+    /// reaches the socket without being copied — including across a retry, which costs a refcount.
     #[tracing::instrument(name = "S3Impl::put_object", skip_all)]
-    /// The body is [`Bytes`] rather than something convertible to a `Vec<u8>`: callers already hold
-    /// the payload in a refcounted buffer, and `ByteStream` takes one directly, so the bytes reach
-    /// the SDK without being copied on the way.
     pub async fn put_object(
         &self,
         bucket: &str,
         key: &str,
         body: Bytes,
-        metadata: Option<HashMap<String, String>>,
-    ) -> Result<PutObjectOutput, AwsError<SdkError<PutObjectError>>> {
+        metadata: Option<ObjectMetadata>,
+    ) -> Result<WriteOutput, S3Error> {
         self.client
-            .put_object()
-            .bucket(bucket)
-            .key(key)
-            .set_metadata(metadata)
-            .body(ByteStream::from(body))
-            .send()
+            .put_object(bucket, key, body, metadata.as_ref())
             .observe(
                 self.instruments.operation_latency_histogram.clone(),
                 self.instruments
@@ -224,19 +169,20 @@ impl S3Impl {
             )
             .await
             .output
-            .map_err(AwsError::sdk_error)
+            .map_err(AwsError::Aws)
     }
 
+    /// Every version of every key under the prefix `key`, across as many pages as the listing
+    /// takes.
+    ///
+    /// `truncated` on the output is set when the listing stopped short of the end.
     pub async fn list_versions(
         &self,
         bucket: &str,
         key: &str,
-    ) -> Result<ListObjectVersionsOutput, AwsError<SdkError<ListObjectVersionsError>>> {
+    ) -> Result<ListObjectVersionsOutput, S3Error> {
         self.client
-            .list_object_versions()
-            .bucket(bucket)
-            .prefix(key)
-            .send()
+            .list_object_versions(bucket, key)
             .observe(
                 self.instruments.operation_latency_histogram.clone(),
                 self.instruments
@@ -246,22 +192,30 @@ impl S3Impl {
             )
             .await
             .output
-            .map_err(AwsError::sdk_error)
+            .map_err(AwsError::Aws)
     }
 
+    /// Delete one version of `key`, or with no version the key itself.
+    #[allow(
+        clippy::needless_lifetimes,
+        reason = "the generated mock cannot express a lifetime elided inside `Option`"
+    )]
+    #[cfg_attr(
+        feature = "test-util",
+        allow(
+            clippy::ref_option_ref,
+            reason = "the generated mock's matchers borrow each argument"
+        )
+    )]
     #[tracing::instrument(name = "S3Impl::delete_object", skip_all)]
-    pub async fn delete_object(
+    pub async fn delete_object<'v>(
         &self,
         bucket: &str,
         key: &str,
-        version: Option<String>,
-    ) -> Result<DeleteObjectOutput, AwsError<SdkError<DeleteObjectError>>> {
+        version: Option<&'v str>,
+    ) -> Result<WriteOutput, S3Error> {
         self.client
-            .delete_object()
-            .bucket(bucket)
-            .key(key)
-            .set_version_id(version)
-            .send()
+            .delete_object(bucket, key, version)
             .observe(
                 self.instruments.operation_latency_histogram.clone(),
                 self.instruments
@@ -271,10 +225,6 @@ impl S3Impl {
             )
             .await
             .output
-            .map_err(AwsError::sdk_error)
-    }
-
-    pub fn sdk_client(&self) -> &s3::Client {
-        &self.client
+            .map_err(AwsError::Aws)
     }
 }

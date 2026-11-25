@@ -27,10 +27,14 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 # Only the end-to-end test needs these: it writes a store the old way through the same clients the
 # tool reads it through, and interrupts the tool with the signal its handler listens for.
 [dev-dependencies]
-aws-sdk-dynamodb = { version = "1.112.0", default-features = false, features = ["rt-tokio"] }
 bytes = "1.11.1"
+# `CreateBucket`, `CreateTable` and `DeleteTable` are not operations the lore-native client has, so
+# the test sends them through a bare client core, with the request and its JSON body built here.
+http = "1.4.0"
 libc = "0.2.186"
 rand = "0.9.4"
+serde_json = "1.0.149"
+url = "2.5.8"
 # The reference list of a fragmented payload is read back as a slice of `FragmentReference`, so the
 # test builds it the same way the store reads it rather than restating the struct's layout.
 zerocopy = "0.8.48"

@@ -34,7 +34,9 @@ Once the services are up, you can run the tests via the following:
 $ cargo test --package lore-integration-tests --features integration_tests
 ```
 
-This will run *only* the integration tests.
+This will run *only* the integration tests. Name the package rather than passing `--workspace`: a
+workspace build also builds `lore-aws`'s own tests, which turns on its `test-util` mocks for every
+crate in the build, and the suite refuses to compile against them.
 
 #### A Note on Storage
 

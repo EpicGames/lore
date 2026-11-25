@@ -48,6 +48,18 @@ pub const FRAGMENT_SIZE_EXPECTED: usize = 64 * 1024;
 /// Fragment size threshold (256 KiB) above which compression is applied.
 pub const FRAGMENT_SIZE_THRESHOLD: usize = 256 * 1024;
 
+/// The type-name prefix of `lore-aws`'s `DynamoDB` serializer.
+///
+/// Named here so the exception below is one string in one place, and so the crate that has to match
+/// it can assert against the same constant.
+pub const LORE_DYNAMO_SERIALIZER: &str = "lore_aws::aws::serde::";
+
+/// Serialize an identifier as raw bytes for a binary format and as hex text for a human-readable
+/// one.
+///
+/// The `DynamoDB` encoders are the exception, recognised by type name: a row holds an identifier as
+/// binary, yet they report human-readable because `Address::serialize` asks the same question and
+/// needs that answer to write its hex string.
 pub fn serialize_hex<S>(value: &[u8], serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -57,7 +69,7 @@ where
     }
 
     let type_name = std::any::type_name::<S>();
-    if type_name.starts_with("serde_dynamo::") {
+    if type_name.starts_with("serde_dynamo::") || type_name.starts_with(LORE_DYNAMO_SERIALIZER) {
         return serializer.serialize_bytes(value);
     }
 
@@ -134,9 +146,8 @@ impl<'de, const N: usize> de::Visitor<'de> for HexOrBytesVisitor<N> {
 /// A self-describing format is asked what it actually holds, so hex text and raw
 /// bytes both read back — `DynamoDB` stores these as either, and reads have to
 /// take both. A format that cannot answer that question is read as the bytes
-/// [`serialize_hex`] wrote for it: asking bitcode to self-describe fails the read
-/// outright, which is why every value carrying one of these identifiers used to
-/// be unreadable under it.
+/// [`serialize_hex`] wrote for it, because asking bitcode to self-describe fails the
+/// read outright.
 fn deserialize_raw<'de, D, const N: usize>(deserializer: D) -> Result<[u8; N], D::Error>
 where
     D: Deserializer<'de>,

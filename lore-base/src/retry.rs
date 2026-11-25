@@ -4,12 +4,15 @@
 
 use std::time::Duration;
 
-/// Largest deviation jitter may introduce, in milliseconds.
+/// Largest deviation jitter may introduce by default, in milliseconds.
+///
+/// Keeps a long back-off from scattering callers across seconds. It also flattens the spread on
+/// intervals above 200ms, so callers that want the full fraction raise it.
 #[lore_macro::test_pub]
-const JITTER_CLAMP_MS: u64 = 100;
+const DEFAULT_JITTER_CLAMP_MS: u64 = 100;
 
-/// Fractional deviation applied to each interval: half of it either way, subject to
-/// [`JITTER_CLAMP_MS`].
+/// Fractional deviation applied to each interval: half of it either way, by default no more than
+/// 100ms.
 pub const DEFAULT_JITTER: f32 = 0.5;
 
 /// Retry waiter with exponential back-off and jitter.
@@ -18,6 +21,7 @@ pub struct Retry {
     current: u64,
     maximum: u64,
     jitter: f32,
+    jitter_clamp: u64,
     counter: usize,
     limit: usize,
 }
@@ -39,10 +43,24 @@ impl Retry {
         if self.counter >= self.limit {
             return None;
         }
-        let interval = jittered(self.current, self.jitter, rand::random::<f32>());
+        let interval = jittered(
+            self.current,
+            self.jitter,
+            self.jitter_clamp,
+            rand::random::<f32>(),
+        );
         self.current = std::cmp::min(self.current * 2, self.maximum);
         self.counter += 1;
         Some(Duration::from_millis(interval))
+    }
+
+    /// Cap the jitter deviation at `millis` instead of the default 100ms.
+    ///
+    /// Above half the ladder's largest interval the clamp never binds, leaving the full fraction.
+    #[must_use]
+    pub fn with_jitter_clamp(mut self, millis: u64) -> Self {
+        self.jitter_clamp = millis;
+        self
     }
 
     /// Restore all `limit` waits, keeping the current interval so the back-off goes on growing
@@ -61,13 +79,13 @@ impl Retry {
 }
 
 /// `interval` displaced by up to `jitter` of itself in either direction, for a `sample` in
-/// `0.0..=1.0`, and by no more than [`JITTER_CLAMP_MS`] either way.
+/// `0.0..=1.0`, and by no more than `clamp` either way.
 ///
 /// The deviation is symmetric about `interval`, so callers that backed off in step spread across
 /// the interval instead of converging on a single point offset from it.
 #[lore_macro::test_pub]
-fn jittered(interval: u64, jitter: f32, sample: f32) -> u64 {
-    let magnitude = ((interval as f32 * jitter) as u64).min(JITTER_CLAMP_MS);
+fn jittered(interval: u64, jitter: f32, clamp: u64, sample: f32) -> u64 {
+    let magnitude = ((interval as f32 * jitter) as u64).min(clamp);
     let deviation = (magnitude as f32 * (sample.clamp(0.0, 1.0) * 2.0 - 1.0)) as i64;
     interval.saturating_add_signed(deviation)
 }
@@ -84,6 +102,7 @@ pub fn retry_with_jitter(start: u64, maximum: u64, limit: usize, jitter: f32) ->
         current: start,
         maximum,
         jitter,
+        jitter_clamp: DEFAULT_JITTER_CLAMP_MS,
         counter: 0,
         limit,
     }

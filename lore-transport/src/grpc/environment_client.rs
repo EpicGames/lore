@@ -66,6 +66,11 @@ impl From<lore_proto::lore::environment::v1::Environment> for EnvironmentConfig 
                 compression_mode: config
                     .compression_mode
                     .map(|mode| ServerCompressionMode::from_u32(mode as u32)),
+                max_lock_batch: if config.max_lock_batch > 0 {
+                    Some(config.max_lock_batch as usize)
+                } else {
+                    None
+                },
             }),
             oidc: value.oidc.and_then(oidc_from_proto),
         }

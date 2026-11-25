@@ -37,6 +37,12 @@ pub enum LockQuery {
     RepositoryBranchDescription(RepositoryId, BranchId, String),
 }
 
+/// Somewhere resource locks are held.
+///
+/// A resource is identified by its branch and hash; its description is not part of that key, so two
+/// entries differing only in description name one lock. A batch names each resource once. The
+/// outcome of a batch naming one resource more than once is defined by the implementation: it may
+/// apply the repeat, collapse it, or refuse the batch.
 #[async_trait]
 pub trait LockStore: Send + Sync {
     /// Acquire locks for all of the requested resources. If any resource cannot be locked the
@@ -67,4 +73,12 @@ pub trait LockStore: Send + Sync {
         repository: RepositoryId,
         resources: &[LockResource],
     ) -> Result<Vec<LockResource>, LockError>;
+
+    /// The most resources this store applies as one atomic operation, if it has a limit.
+    ///
+    /// A request larger than a `Some` limit is not applied atomically: some of its resources can
+    /// succeed while others fail.
+    fn max_lock_batch(&self) -> Option<usize> {
+        None
+    }
 }

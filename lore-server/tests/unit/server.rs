@@ -531,3 +531,106 @@ mod validate_endpoint_security {
         assert!(message.contains("cert_chain"), "got: {message}");
     }
 }
+
+/// Covers the batch limits the environment advertises once narrowed to the stores behind them.
+mod store_limit_narrowing {
+    use lore_revision::environment::Config;
+    use lore_revision::environment::EnvironmentConfig;
+    use lore_revision::lock::util::LOCK_BATCH_SIZE;
+    use lore_server::lock::store::LocalLockStore;
+    use lore_server::server::narrow_environment_to_stores;
+
+    fn configured(
+        max_query_batch: Option<usize>,
+        max_lock_batch: Option<usize>,
+    ) -> EnvironmentConfig {
+        EnvironmentConfig {
+            config: Some(Config {
+                max_query_batch,
+                max_lock_batch,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn lock_limit(environment: &EnvironmentConfig) -> Option<usize> {
+        environment
+            .config
+            .as_ref()
+            .and_then(|config| config.max_lock_batch)
+    }
+
+    fn query_limit(environment: &EnvironmentConfig) -> Option<usize> {
+        environment
+            .config
+            .as_ref()
+            .and_then(|config| config.max_query_batch)
+    }
+
+    /// A store naming no limit takes [`LOCK_BATCH_SIZE`], so a larger configured limit is
+    /// narrowed to it.
+    #[test]
+    fn a_lock_limit_above_a_store_naming_none_is_narrowed_to_the_default() {
+        let mut environment = configured(None, Some(LOCK_BATCH_SIZE * 2));
+
+        narrow_environment_to_stores(&mut environment, None, Some(&LocalLockStore::default()));
+
+        assert_eq!(lock_limit(&environment), Some(LOCK_BATCH_SIZE));
+    }
+
+    #[test]
+    fn a_lock_limit_below_the_store_limit_is_kept() {
+        let mut environment = configured(None, Some(10));
+
+        narrow_environment_to_stores(&mut environment, None, Some(&LocalLockStore::default()));
+
+        assert_eq!(lock_limit(&environment), Some(10));
+    }
+
+    #[test]
+    fn an_unset_or_zero_lock_limit_takes_the_store_limit() {
+        for mut environment in [
+            EnvironmentConfig::default(),
+            configured(None, None),
+            configured(None, Some(0)),
+        ] {
+            narrow_environment_to_stores(&mut environment, None, Some(&LocalLockStore::default()));
+
+            assert_eq!(lock_limit(&environment), Some(LOCK_BATCH_SIZE));
+        }
+    }
+
+    #[test]
+    fn without_a_lock_store_the_lock_limit_is_left_as_configured() {
+        let mut environment = configured(None, Some(LOCK_BATCH_SIZE * 2));
+
+        narrow_environment_to_stores(&mut environment, None, None);
+
+        assert_eq!(lock_limit(&environment), Some(LOCK_BATCH_SIZE * 2));
+    }
+
+    #[test]
+    fn without_store_limits_no_config_is_added() {
+        let mut environment = EnvironmentConfig::default();
+
+        narrow_environment_to_stores(&mut environment, None, None);
+
+        assert!(environment.config.is_none());
+    }
+
+    #[test]
+    fn the_query_limit_is_narrowed_to_the_store_limit() {
+        let mut above = configured(Some(500), None);
+        narrow_environment_to_stores(&mut above, Some(100), None);
+        assert_eq!(query_limit(&above), Some(100));
+
+        let mut below = configured(Some(50), None);
+        narrow_environment_to_stores(&mut below, Some(100), None);
+        assert_eq!(query_limit(&below), Some(50));
+
+        let mut zero = configured(Some(0), None);
+        narrow_environment_to_stores(&mut zero, Some(100), None);
+        assert_eq!(query_limit(&zero), Some(100));
+    }
+}

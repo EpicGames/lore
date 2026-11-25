@@ -82,7 +82,8 @@ pub(crate) mod net_common {
     /// Waits until a connect's first back-off, its jitter included, has passed.
     pub(crate) async fn wait_out_connect_back_off() {
         tokio::time::sleep(std::time::Duration::from_millis(
-            lore_transport::connection::RECONNECT_START_DELAY + lore_base::retry::JITTER_CLAMP_MS,
+            lore_transport::connection::RECONNECT_START_DELAY
+                + lore_base::retry::DEFAULT_JITTER_CLAMP_MS,
         ))
         .await;
     }
@@ -694,17 +695,23 @@ pub(crate) mod net_common {
 pub(crate) mod aws_common {
     use std::error::Error;
     use std::sync::Arc;
+    use std::time::Duration;
 
-    use aws_sdk_dynamodb::operation::create_table::CreateTableError;
-    use aws_sdk_dynamodb::types::AttributeDefinition;
-    use aws_sdk_dynamodb::types::GlobalSecondaryIndex;
-    use aws_sdk_dynamodb::types::KeySchemaElement;
-    use aws_sdk_dynamodb::types::KeyType;
-    use aws_sdk_dynamodb::types::Projection;
-    use aws_sdk_dynamodb::types::ProjectionType;
-    use aws_sdk_dynamodb::types::ProvisionedThroughput;
-    use aws_sdk_dynamodb::types::ScalarAttributeType;
-    use aws_sdk_s3::operation::create_bucket::CreateBucketError;
+    use bytes::Bytes;
+    use http::HeaderValue;
+    use http::Method;
+    use lore_aws::aws::ClientCore;
+    use lore_aws::aws::creds::CachedCredentials;
+    use lore_aws::aws::creds::Credentials;
+    use lore_aws::aws::creds::StaticProvider;
+    use lore_aws::aws::dynamodb::DynamoProtocol;
+    use lore_aws::aws::error::AwsCallError;
+    use lore_aws::aws::http::HttpClient;
+    use lore_aws::aws::http::HttpRequest;
+    use lore_aws::aws::item::AttributeValue;
+    use lore_aws::aws::item::ByteStr;
+    use lore_aws::aws::item::Item;
+    use lore_aws::aws::s3::S3Protocol;
     use lore_aws::clients::AwsClientBuilder;
     use lore_aws::clients::HttpClientSettings;
     use lore_aws::dynamodb::DynamoDb;
@@ -715,22 +722,169 @@ pub(crate) mod aws_common {
     use lore_aws::store::mutable_store::MUTABLE_STORE_DYNAMO_PARTITION_KEY_ATTRIBUTE;
     use lore_aws::store::mutable_store::MUTABLE_STORE_DYNAMO_SORT_KEY_ATTRIBUTE;
     use lore_revision::util::time::RetryPolicy;
+    use serde_json::Value;
+    use serde_json::json;
     use tracing::info;
     use tracing::warn;
+    use url::Url;
 
     pub const LOCKS_TABLE_NAME: &str = "locks-local";
     pub const STORE_BUCKET_NAME: &str = "lore-immutable-store-local";
+    pub const VERSIONED_BUCKET_NAME: &str = "lore-versioned-store-local";
     pub const MUTABLE_STORE_TABLE_NAME: &str = "lore-mutable-store-local";
     pub const FRAGMENTS_TABLE_NAME: &str = "lore-fragments-local";
     pub const FRAGMENT_STATE_TABLE_NAME: &str = "lore-fragment-state-local";
     pub const FRAGMENT_METADATA_TABLE_NAME: &str = "lore-fragment-metadata-local";
 
+    pub(crate) const S3_ENDPOINT: &str = "http://127.0.0.1:9000";
+    pub(crate) const DYNAMODB_ENDPOINT: &str = "http://127.0.0.1:9090";
+
     // NOTE: these credentials are just hardcoded in lore-integration-tests/compose.yaml
     const AWS_ACCESS_KEY_ID: &str = "lorelocal";
     const AWS_SECRET_ACCESS_KEY: &str = "lorelocal";
 
-    /// The endpoint of `DynamoDB` Local, as `lore-integration-tests/compose.yaml` runs it.
-    const DYNAMODB_ENDPOINT: &str = "http://127.0.0.1:9090";
+    /// The region the fixtures and the clients under test sign for.
+    ///
+    /// Without `-sharedDb`, `DynamoDB` Local keeps a separate database for each access key and
+    /// region, so a client signing for another region than the fixture that created a table does
+    /// not see the table.
+    const REGION: &str = "us-east-1";
+
+    /// The whole-operation budget of a client core built here, retries included.
+    const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Read and write capacity every fixture table is created with. `DynamoDB` Local ignores the
+    /// numbers, and provisioned mode requires them.
+    const FIXTURE_CAPACITY: u32 = 5000;
+
+    /// Credentials for the lore-native client under test.
+    fn credentials() -> Credentials {
+        Credentials::new(AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, None, None)
+    }
+
+    /// A bare client core pointed at `endpoint_url`, signing for [`REGION`] with the stack's
+    /// credentials. `capture_request_id` keeps the request id of a successful response.
+    ///
+    /// `CreateTable`, `CreateBucket` and `PutBucketVersioning` are not operations the lore-native
+    /// client has, so the fixtures send them through a core like this one, with the request bodies
+    /// written out by hand.
+    pub(crate) fn client_core(
+        endpoint_url: &str,
+        capture_request_id: bool,
+    ) -> Result<Arc<ClientCore>, Box<dyn Error + 'static>> {
+        let http = HttpClient::new(&HttpClientSettings::default())?;
+        let credentials = Arc::new(CachedCredentials::new(Arc::new(StaticProvider::new(
+            credentials(),
+        ))));
+
+        Ok(Arc::new(ClientCore::new(
+            http,
+            credentials,
+            Arc::from(REGION),
+            Url::parse(endpoint_url)?,
+            CLIENT_TIMEOUT,
+            capture_request_id,
+        )))
+    }
+
+    /// A fragment-association row, shaped as the immutable store writes one.
+    pub(crate) fn fragments_item(hash: &[u8], repository_context: &[u8]) -> Item {
+        let mut item = Item::new();
+        item.insert(
+            ByteStr::from_static(FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE),
+            AttributeValue::blob(hash),
+        );
+        item.insert(
+            ByteStr::from_static(FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE),
+            AttributeValue::blob(repository_context),
+        );
+        item
+    }
+
+    fn throughput() -> Value {
+        json!({
+            "ReadCapacityUnits": FIXTURE_CAPACITY,
+            "WriteCapacityUnits": FIXTURE_CAPACITY,
+        })
+    }
+
+    /// One `DynamoDB` attribute definition. Every key this suite defines is binary except the two
+    /// the lock table sorts and filters as text.
+    fn attribute(name: &str, kind: &str) -> Value {
+        json!({ "AttributeName": name, "AttributeType": kind })
+    }
+
+    fn key(name: &str, role: &str) -> Value {
+        json!({ "AttributeName": name, "KeyType": role })
+    }
+
+    /// Send a `CreateTable` built by the caller.
+    ///
+    /// Losing the race to create a table is success: the tests run in parallel against one stack, and
+    /// all the caller wanted was for the table to exist.
+    async fn create_table(core: &ClientCore, definition: Value) -> Result<(), Box<dyn Error>> {
+        let body = Bytes::from(serde_json::to_vec(&definition)?);
+        let send = core.send::<DynamoProtocol>(|| {
+            HttpRequest::new(Method::POST, core.url("/", None))
+                .header(
+                    "content-type",
+                    HeaderValue::from_static("application/x-amz-json-1.0"),
+                )
+                .header(
+                    "x-amz-target",
+                    HeaderValue::from_static("DynamoDB_20120810.CreateTable"),
+                )
+                .body(body.clone())
+        });
+
+        match send.await {
+            Ok(_) => Ok(()),
+            Err(AwsCallError::Service(error)) if error.code_str() == "ResourceInUseException" => {
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Delete the table `name`.
+    pub(crate) async fn delete_table(core: &ClientCore, name: &str) -> Result<(), Box<dyn Error>> {
+        let body = Bytes::from(serde_json::to_vec(&json!({ "TableName": name }))?);
+        core.send::<DynamoProtocol>(|| {
+            HttpRequest::new(Method::POST, core.url("/", None))
+                .header(
+                    "content-type",
+                    HeaderValue::from_static("application/x-amz-json-1.0"),
+                )
+                .header(
+                    "x-amz-target",
+                    HeaderValue::from_static("DynamoDB_20120810.DeleteTable"),
+                )
+                .body(body.clone())
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    /// Create a bucket, path-style, tolerating one that is already there.
+    async fn create_bucket(core: &ClientCore, bucket: &str) -> Result<(), Box<dyn Error>> {
+        let send = core.send::<S3Protocol>(|| {
+            HttpRequest::new(Method::PUT, core.url(&format!("/{bucket}"), None))
+        });
+
+        match send.await {
+            Ok(_) => Ok(()),
+            Err(AwsCallError::Service(error))
+                if matches!(
+                    error.code_str(),
+                    "BucketAlreadyOwnedByYou" | "BucketAlreadyExists"
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
 
     pub async fn setup(
         tables: Vec<&str>,
@@ -738,7 +892,7 @@ pub(crate) mod aws_common {
         let _ = tracing_subscriber::fmt::try_init();
 
         Ok((
-            s3_client("http://127.0.0.1:9000".to_string()).await?,
+            s3_client(S3_ENDPOINT.to_string()).await?,
             dynamodb_client(DYNAMODB_ENDPOINT.to_string(), tables.clone()).await?,
             dynamodb_client(DYNAMODB_ENDPOINT.to_string(), tables).await?,
         ))
@@ -750,55 +904,51 @@ pub(crate) mod aws_common {
         dynamodb_client(DYNAMODB_ENDPOINT.to_string(), tables).await
     }
 
-    async fn create_store_bucket(client: &aws_sdk_s3::Client) -> Result<(), Box<dyn Error>> {
-        match client
-            .create_bucket()
-            .bucket(STORE_BUCKET_NAME)
-            .send()
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let err = e.as_service_error().unwrap();
-                if let CreateBucketError::BucketAlreadyOwnedByYou(_) = err {
-                    // Since tests run in parallel there can be a race condition trying to create
-                    // the bucket, if it turns out the bucket exists, just ignore the failure.
-                    return Ok(());
-                }
+    /// Make sure the store bucket exists, for a test that does not want the facade.
+    pub(crate) async fn s3_bucket(endpoint_url: String) -> Result<(), Box<dyn Error + 'static>> {
+        s3_client(endpoint_url).await.map(|_client| ())
+    }
 
-                Err(e.into())
-            }
-        }
+    /// Make sure [`VERSIONED_BUCKET_NAME`] exists with versioning enabled.
+    pub(crate) async fn versioned_bucket() -> Result<(), Box<dyn Error + 'static>> {
+        let core = client_core(S3_ENDPOINT, false)?;
+        create_bucket(&core, VERSIONED_BUCKET_NAME).await?;
+
+        let body = Bytes::from_static(
+            b"<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+              <Status>Enabled</Status></VersioningConfiguration>",
+        );
+        core.send::<S3Protocol>(|| {
+            HttpRequest::new(
+                Method::PUT,
+                core.url(&format!("/{VERSIONED_BUCKET_NAME}"), Some("versioning")),
+            )
+            .body(body.clone())
+        })
+        .await?;
+
+        Ok(())
     }
 
     async fn s3_client(endpoint_url: String) -> Result<S3, Box<dyn Error + 'static>> {
         let http_settings = HttpClientSettings::default();
 
-        // Set up AWS client.
-        let creds = aws_sdk_s3::config::Credentials::new(
-            AWS_ACCESS_KEY_ID,
-            AWS_SECRET_ACCESS_KEY,
-            None,
-            None,
-            "test",
-        );
-
         let client = AwsClientBuilder::builder()
             .with_http_settings(&http_settings)
-            .with_credentials_provider(creds)
-            .region("us-east-1")
-            .endpoint(endpoint_url)
+            .with_static_credentials(credentials())
+            .region(REGION)
+            .endpoint(endpoint_url.clone())
             .build_config()
-            .await
             .s3()
             .build()
             .await?;
 
-        match client.bucket_exists(STORE_BUCKET_NAME.to_string()).await {
+        match client.bucket_exists(STORE_BUCKET_NAME).await {
             Ok(exists) => {
                 if !exists {
                     info!("Bucket {STORE_BUCKET_NAME} does not exist, creating...");
-                    create_store_bucket(client.sdk_client()).await?;
+                    let core = client_core(&endpoint_url, false)?;
+                    create_bucket(&core, STORE_BUCKET_NAME).await?;
                 }
 
                 Ok(client)
@@ -810,352 +960,94 @@ pub(crate) mod aws_common {
         }
     }
 
-    async fn create_locks_table(client: &aws_sdk_dynamodb::Client) -> Result<(), Box<dyn Error>> {
-        let result = client
-            .create_table()
-            .table_name(LOCKS_TABLE_NAME)
-            .attribute_definitions(
-                AttributeDefinition::builder()
-                    .attribute_name(HASH_KEY)
-                    .set_attribute_type(Some(ScalarAttributeType::B))
-                    .build()?,
-            )
-            .attribute_definitions(
-                AttributeDefinition::builder()
-                    .attribute_name(REPO_KEY)
-                    .set_attribute_type(Some(ScalarAttributeType::B))
-                    .build()?,
-            )
-            .attribute_definitions(
-                AttributeDefinition::builder()
-                    .attribute_name(BRANCH_KEY)
-                    .set_attribute_type(Some(ScalarAttributeType::B))
-                    .build()?,
-            )
-            .attribute_definitions(
-                AttributeDefinition::builder()
-                    .attribute_name(REPO_BRANCH_KEY)
-                    .set_attribute_type(Some(ScalarAttributeType::B))
-                    .build()?,
-            )
-            .attribute_definitions(
-                AttributeDefinition::builder()
-                    .attribute_name(OWNER_KEY)
-                    .set_attribute_type(Some(ScalarAttributeType::S))
-                    .build()?,
-            )
-            .attribute_definitions(
-                AttributeDefinition::builder()
-                    .attribute_name(DESC_KEY)
-                    .set_attribute_type(Some(ScalarAttributeType::S))
-                    .build()?,
-            )
-            .key_schema(
-                KeySchemaElement::builder()
-                    .attribute_name(HASH_KEY)
-                    .set_key_type(Some(KeyType::Hash))
-                    .build()?,
-            )
-            .key_schema(
-                KeySchemaElement::builder()
-                    .attribute_name(REPO_BRANCH_KEY)
-                    .set_key_type(Some(KeyType::Range))
-                    .build()?,
-            )
-            .global_secondary_indexes(
-                GlobalSecondaryIndex::builder()
-                    .index_name(OWNER_REPO_BRANCH_GSI)
-                    .key_schema(
-                        KeySchemaElement::builder()
-                            .attribute_name(OWNER_KEY)
-                            .set_key_type(Some(KeyType::Hash))
-                            .build()?,
-                    )
-                    .key_schema(
-                        KeySchemaElement::builder()
-                            .attribute_name(REPO_BRANCH_KEY)
-                            .set_key_type(Some(KeyType::Range))
-                            .build()?,
-                    )
-                    .projection(
-                        Projection::builder()
-                            .projection_type(ProjectionType::All)
-                            .build(),
-                    )
-                    .provisioned_throughput(
-                        ProvisionedThroughput::builder()
-                            .set_read_capacity_units(Some(5000))
-                            .set_write_capacity_units(Some(5000))
-                            .build()?,
-                    )
-                    .build()?,
-            )
-            .global_secondary_indexes(
-                GlobalSecondaryIndex::builder()
-                    .index_name(REPO_BRANCH_GSI)
-                    .key_schema(
-                        KeySchemaElement::builder()
-                            .attribute_name(REPO_KEY)
-                            .set_key_type(Some(KeyType::Hash))
-                            .build()?,
-                    )
-                    .key_schema(
-                        KeySchemaElement::builder()
-                            .attribute_name(BRANCH_KEY)
-                            .set_key_type(Some(KeyType::Range))
-                            .build()?,
-                    )
-                    .projection(
-                        Projection::builder()
-                            .projection_type(ProjectionType::All)
-                            .build(),
-                    )
-                    .provisioned_throughput(
-                        ProvisionedThroughput::builder()
-                            .set_read_capacity_units(Some(5000))
-                            .set_write_capacity_units(Some(5000))
-                            .build()?,
-                    )
-                    .build()?,
-            )
-            .global_secondary_indexes(
-                GlobalSecondaryIndex::builder()
-                    .index_name(REPO_BRANCH_DESC_GSI)
-                    .key_schema(
-                        KeySchemaElement::builder()
-                            .attribute_name(REPO_BRANCH_KEY)
-                            .set_key_type(Some(KeyType::Hash))
-                            .build()?,
-                    )
-                    .key_schema(
-                        KeySchemaElement::builder()
-                            .attribute_name(DESC_KEY)
-                            .set_key_type(Some(KeyType::Range))
-                            .build()?,
-                    )
-                    .projection(
-                        Projection::builder()
-                            .projection_type(ProjectionType::All)
-                            .build(),
-                    )
-                    .provisioned_throughput(
-                        ProvisionedThroughput::builder()
-                            .set_read_capacity_units(Some(5000))
-                            .set_write_capacity_units(Some(5000))
-                            .build()?,
-                    )
-                    .build()?,
-            )
-            .provisioned_throughput(
-                ProvisionedThroughput::builder()
-                    .set_read_capacity_units(Some(5000))
-                    .set_write_capacity_units(Some(5000))
-                    .build()?,
-            )
-            .send()
-            .await;
+    async fn create_locks_table(core: &ClientCore) -> Result<(), Box<dyn Error>> {
+        // Every index projects everything: the lock store reads whole rows off each of them.
+        let index = |name: &str, partition: &str, sort: &str| {
+            json!({
+                "IndexName": name,
+                "KeySchema": [key(partition, "HASH"), key(sort, "RANGE")],
+                "Projection": { "ProjectionType": "ALL" },
+                "ProvisionedThroughput": throughput(),
+            })
+        };
 
-        match result {
-            Err(e) => {
-                let err = e.as_service_error().unwrap();
-                if let CreateTableError::ResourceInUseException(_) = err {
-                    // Since tests run in parallel there can be a race condition trying to create
-                    // the table, if it turns out the table exists, just ignore the failure.
-                    return Ok(());
-                }
-
-                Err(e.into())
-            }
-            _ => Ok(()),
-        }
+        create_table(
+            core,
+            json!({
+                "TableName": LOCKS_TABLE_NAME,
+                "AttributeDefinitions": [
+                    attribute(HASH_KEY, "B"),
+                    attribute(REPO_KEY, "B"),
+                    attribute(BRANCH_KEY, "B"),
+                    attribute(REPO_BRANCH_KEY, "B"),
+                    attribute(OWNER_KEY, "S"),
+                    attribute(DESC_KEY, "S"),
+                ],
+                "KeySchema": [key(HASH_KEY, "HASH"), key(REPO_BRANCH_KEY, "RANGE")],
+                "GlobalSecondaryIndexes": [
+                    index(OWNER_REPO_BRANCH_GSI, OWNER_KEY, REPO_BRANCH_KEY),
+                    index(REPO_BRANCH_GSI, REPO_KEY, BRANCH_KEY),
+                    index(REPO_BRANCH_DESC_GSI, REPO_BRANCH_KEY, DESC_KEY),
+                ],
+                "ProvisionedThroughput": throughput(),
+            }),
+        )
+        .await
     }
 
-    async fn create_store_table(client: &aws_sdk_dynamodb::Client) -> Result<(), Box<dyn Error>> {
-        let result = client
-            .create_table()
-            .table_name(MUTABLE_STORE_TABLE_NAME)
-            .attribute_definitions(
-                AttributeDefinition::builder()
-                    .attribute_name(MUTABLE_STORE_DYNAMO_PARTITION_KEY_ATTRIBUTE)
-                    .set_attribute_type(Some(ScalarAttributeType::B))
-                    .build()?,
-            )
-            .attribute_definitions(
-                AttributeDefinition::builder()
-                    .attribute_name(MUTABLE_STORE_DYNAMO_SORT_KEY_ATTRIBUTE)
-                    .set_attribute_type(Some(ScalarAttributeType::B))
-                    .build()?,
-            )
-            .key_schema(
-                KeySchemaElement::builder()
-                    .attribute_name(MUTABLE_STORE_DYNAMO_PARTITION_KEY_ATTRIBUTE)
-                    .set_key_type(Some(KeyType::Hash))
-                    .build()?,
-            )
-            .key_schema(
-                KeySchemaElement::builder()
-                    .attribute_name(MUTABLE_STORE_DYNAMO_SORT_KEY_ATTRIBUTE)
-                    .set_key_type(Some(KeyType::Range))
-                    .build()?,
-            )
-            .provisioned_throughput(
-                ProvisionedThroughput::builder()
-                    .set_read_capacity_units(Some(5000))
-                    .set_write_capacity_units(Some(5000))
-                    .build()?,
-            )
-            .send()
-            .await;
-
-        match result {
-            Err(e) => {
-                let err = e.as_service_error().unwrap();
-                if let CreateTableError::ResourceInUseException(_) = err {
-                    // Since tests run in parallel there can be a race condition trying to create
-                    // the table, if it turns out the table exists, just ignore the failure.
-                    return Ok(());
-                }
-
-                Err(e.into())
-            }
-            _ => Ok(()),
-        }
+    async fn create_store_table(core: &ClientCore) -> Result<(), Box<dyn Error>> {
+        create_table(
+            core,
+            json!({
+                "TableName": MUTABLE_STORE_TABLE_NAME,
+                "AttributeDefinitions": [
+                    attribute(MUTABLE_STORE_DYNAMO_PARTITION_KEY_ATTRIBUTE, "B"),
+                    attribute(MUTABLE_STORE_DYNAMO_SORT_KEY_ATTRIBUTE, "B"),
+                ],
+                "KeySchema": [
+                    key(MUTABLE_STORE_DYNAMO_PARTITION_KEY_ATTRIBUTE, "HASH"),
+                    key(MUTABLE_STORE_DYNAMO_SORT_KEY_ATTRIBUTE, "RANGE"),
+                ],
+                "ProvisionedThroughput": throughput(),
+            }),
+        )
+        .await
     }
 
-    async fn create_fragments_table(
-        client: &aws_sdk_dynamodb::Client,
+    async fn create_fragments_table(core: &ClientCore) -> Result<(), Box<dyn Error>> {
+        create_table(
+            core,
+            json!({
+                "TableName": FRAGMENTS_TABLE_NAME,
+                "AttributeDefinitions": [
+                    attribute(FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE, "B"),
+                    attribute(FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE, "B"),
+                ],
+                "KeySchema": [
+                    key(FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE, "HASH"),
+                    key(FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE, "RANGE"),
+                ],
+                "ProvisionedThroughput": throughput(),
+            }),
+        )
+        .await
+    }
+
+    /// The state table and the legacy metadata table have the same shape: one binary hash.
+    pub(crate) async fn create_hash_keyed_table(
+        core: &ClientCore,
+        name: &str,
     ) -> Result<(), Box<dyn Error>> {
-        let result = client
-            .create_table()
-            .table_name(FRAGMENTS_TABLE_NAME)
-            .attribute_definitions(
-                AttributeDefinition::builder()
-                    .attribute_name(FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE)
-                    .set_attribute_type(Some(ScalarAttributeType::B))
-                    .build()?,
-            )
-            .attribute_definitions(
-                AttributeDefinition::builder()
-                    .attribute_name(FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE)
-                    .set_attribute_type(Some(ScalarAttributeType::B))
-                    .build()?,
-            )
-            .key_schema(
-                KeySchemaElement::builder()
-                    .attribute_name(FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE)
-                    .set_key_type(Some(KeyType::Hash))
-                    .build()?,
-            )
-            .key_schema(
-                KeySchemaElement::builder()
-                    .attribute_name(FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE)
-                    .set_key_type(Some(KeyType::Range))
-                    .build()?,
-            )
-            .provisioned_throughput(
-                ProvisionedThroughput::builder()
-                    .set_read_capacity_units(Some(5000))
-                    .set_write_capacity_units(Some(5000))
-                    .build()?,
-            )
-            .send()
-            .await;
-
-        match result {
-            Err(e) => {
-                let err = e.as_service_error().unwrap();
-                if let CreateTableError::ResourceInUseException(_) = err {
-                    // Since tests run in parallel there can be a race condition trying to create
-                    // the table, if it turns out the table exists, just ignore the failure.
-                    return Ok(());
-                }
-
-                Err(e.into())
-            }
-            _ => Ok(()),
-        }
-    }
-
-    async fn create_fragment_state_table(
-        client: &aws_sdk_dynamodb::Client,
-    ) -> Result<(), Box<dyn Error>> {
-        let result = client
-            .create_table()
-            .table_name(FRAGMENT_STATE_TABLE_NAME)
-            .attribute_definitions(
-                AttributeDefinition::builder()
-                    .attribute_name("hash")
-                    .set_attribute_type(Some(ScalarAttributeType::B))
-                    .build()?,
-            )
-            .key_schema(
-                KeySchemaElement::builder()
-                    .attribute_name("hash")
-                    .set_key_type(Some(KeyType::Hash))
-                    .build()?,
-            )
-            .provisioned_throughput(
-                ProvisionedThroughput::builder()
-                    .set_read_capacity_units(Some(5000))
-                    .set_write_capacity_units(Some(5000))
-                    .build()?,
-            )
-            .send()
-            .await;
-
-        match result {
-            Err(e) => {
-                let err = e.as_service_error().unwrap();
-                if let CreateTableError::ResourceInUseException(_) = err {
-                    return Ok(());
-                }
-
-                Err(e.into())
-            }
-            _ => Ok(()),
-        }
-    }
-
-    async fn create_fragment_metadata_table(
-        client: &aws_sdk_dynamodb::Client,
-    ) -> Result<(), Box<dyn Error>> {
-        let result = client
-            .create_table()
-            .table_name(FRAGMENT_METADATA_TABLE_NAME)
-            .attribute_definitions(
-                AttributeDefinition::builder()
-                    .attribute_name("hash")
-                    .set_attribute_type(Some(ScalarAttributeType::B))
-                    .build()?,
-            )
-            .key_schema(
-                KeySchemaElement::builder()
-                    .attribute_name("hash")
-                    .set_key_type(Some(KeyType::Hash))
-                    .build()?,
-            )
-            .provisioned_throughput(
-                ProvisionedThroughput::builder()
-                    .set_read_capacity_units(Some(5000))
-                    .set_write_capacity_units(Some(5000))
-                    .build()?,
-            )
-            .send()
-            .await;
-
-        match result {
-            Err(e) => {
-                let err = e.as_service_error().unwrap();
-                if let CreateTableError::ResourceInUseException(_) = err {
-                    // Since tests run in parallel there can be a race condition trying to create
-                    // the table, if it turns out the table exists, just ignore the failure.
-                    return Ok(());
-                }
-
-                Err(e.into())
-            }
-            _ => Ok(()),
-        }
+        create_table(
+            core,
+            json!({
+                "TableName": name,
+                "AttributeDefinitions": [attribute("hash", "B")],
+                "KeySchema": [key("hash", "HASH")],
+                "ProvisionedThroughput": throughput(),
+            }),
+        )
+        .await
     }
 
     pub(crate) async fn dynamodb_client(
@@ -1175,21 +1067,12 @@ pub(crate) mod aws_common {
     ) -> Result<DynamoDb, Box<dyn Error + 'static>> {
         let http_settings = HttpClientSettings::default();
 
-        let creds = aws_sdk_dynamodb::config::Credentials::new(
-            AWS_ACCESS_KEY_ID,
-            AWS_SECRET_ACCESS_KEY,
-            None,
-            None,
-            "test",
-        );
-
         let client = AwsClientBuilder::builder()
             .with_http_settings(&http_settings)
-            .with_credentials_provider(creds)
-            .region("us-east-2")
-            .endpoint(endpoint_url)
+            .with_static_credentials(credentials())
+            .region(REGION)
+            .endpoint(endpoint_url.clone())
             .build_config()
-            .await
             .maybe_unprocessed_keys_retry(unprocessed_keys_retry)
             .dynamodb()
             .build()
@@ -1199,20 +1082,18 @@ pub(crate) mod aws_common {
             match client.table_exists(&Arc::from(table_name)).await {
                 Ok(exists) => {
                     if !exists {
+                        let core = client_core(&endpoint_url, false)?;
                         match table_name {
-                            MUTABLE_STORE_TABLE_NAME => {
-                                create_store_table(client.sdk_client()).await?;
-                            }
-                            FRAGMENTS_TABLE_NAME => {
-                                create_fragments_table(client.sdk_client()).await?;
-                            }
+                            MUTABLE_STORE_TABLE_NAME => create_store_table(&core).await?,
+                            FRAGMENTS_TABLE_NAME => create_fragments_table(&core).await?,
                             FRAGMENT_STATE_TABLE_NAME => {
-                                create_fragment_state_table(client.sdk_client()).await?;
+                                create_hash_keyed_table(&core, FRAGMENT_STATE_TABLE_NAME).await?;
                             }
                             FRAGMENT_METADATA_TABLE_NAME => {
-                                create_fragment_metadata_table(client.sdk_client()).await?;
+                                create_hash_keyed_table(&core, FRAGMENT_METADATA_TABLE_NAME)
+                                    .await?;
                             }
-                            LOCKS_TABLE_NAME => create_locks_table(client.sdk_client()).await?,
+                            LOCKS_TABLE_NAME => create_locks_table(&core).await?,
                             _ => {
                                 return Err(
                                     anyhow::anyhow!("Invalid table name: {table_name}").into()

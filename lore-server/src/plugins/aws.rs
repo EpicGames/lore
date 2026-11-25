@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use lore_aws::clients::AwsClientBuilder;
 use lore_aws::clients::HttpClientSettings;
+use lore_aws::clients::StoreKind;
 use lore_aws::clients::TimeoutConfig;
 use lore_aws::store::immutable_store::AwsImmutableStore;
 use lore_aws::store::immutable_store::AwsImmutableStoreSettings;
@@ -61,7 +62,8 @@ pub struct AwsImmutableStorePluginConfig {
     /// S3 bucket name for storing fragment payloads.
     pub s3_bucket: String,
 
-    /// Optional S3 endpoint URL (for `LocalStack` or other S3-compatible services).
+    /// Optional S3 endpoint URL (for `LocalStack` or other S3-compatible services). When unset,
+    /// `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL` applies.
     #[serde(default)]
     pub s3_endpoint_url: Option<String>,
 
@@ -95,6 +97,7 @@ pub struct AwsImmutableStorePluginConfig {
     pub dynamodb_fragment_metadata_table: Option<String>,
 
     /// Optional `DynamoDB` endpoint URL (for `LocalStack` or other `DynamoDB`-compatible services).
+    /// When unset, `AWS_ENDPOINT_URL_DYNAMODB` or `AWS_ENDPOINT_URL` applies.
     #[serde(default)]
     pub dynamodb_endpoint_url: Option<String>,
 
@@ -111,8 +114,8 @@ pub struct AwsImmutableStorePluginConfig {
     pub dynamodb_slow_operation_threshold_millis: u64,
 
     /// Backoff for resending the keys a `DynamoDB` batch read leaves unprocessed. `max_attempts`
-    /// counts resends; a read with keys still unprocessed after them fails. Unset, the client's
-    /// default applies.
+    /// counts resends; a read with keys still unprocessed after them fails as a back-off. Unset,
+    /// the client's default applies.
     #[serde(default)]
     pub dynamodb_unprocessed_keys_retry: Option<RetrySettings>,
 
@@ -145,6 +148,7 @@ pub struct AwsMutableStorePluginConfig {
     pub dynamodb_table: String,
 
     /// Optional `DynamoDB` endpoint URL (for `LocalStack` or other `DynamoDB`-compatible services).
+    /// When unset, `AWS_ENDPOINT_URL_DYNAMODB` or `AWS_ENDPOINT_URL` applies.
     #[serde(default)]
     pub dynamodb_endpoint_url: Option<String>,
 
@@ -159,10 +163,6 @@ pub struct AwsMutableStorePluginConfig {
     /// Timeout in milliseconds for AWS operations.
     #[serde(default = "default_timeout")]
     pub timeout_millis: u64,
-
-    /// Force write mode (bypasses some safety checks).
-    #[serde(default)]
-    pub force_write: bool,
 }
 
 /// Configuration for the AWS lock store plugin.
@@ -180,6 +180,7 @@ pub struct AwsLockStorePluginConfig {
     pub dynamodb_table: String,
 
     /// Optional `DynamoDB` endpoint URL (for `LocalStack` or other `DynamoDB`-compatible services).
+    /// When unset, `AWS_ENDPOINT_URL_DYNAMODB` or `AWS_ENDPOINT_URL` applies.
     #[serde(default)]
     pub dynamodb_endpoint_url: Option<String>,
 
@@ -192,8 +193,8 @@ pub struct AwsLockStorePluginConfig {
     pub dynamodb_slow_operation_threshold_millis: u64,
 
     /// Backoff for resending the keys a `DynamoDB` batch read leaves unprocessed. `max_attempts`
-    /// counts resends; a read with keys still unprocessed after them fails. Unset, the client's
-    /// default applies.
+    /// counts resends; a read with keys still unprocessed after them fails as a back-off. Unset,
+    /// the client's default applies.
     #[serde(default)]
     pub dynamodb_unprocessed_keys_retry: Option<RetrySettings>,
 
@@ -266,61 +267,53 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
         let (s3_client, dynamodb_client) = tokio::task::block_in_place(|| {
             runtime().block_on(Box::pin(async {
                 // Build S3 client
-                let s3_client = Box::pin(
-                    AwsClientBuilder::builder()
-                        .with_http_settings(&plugin_config.http)
-                        .maybe_endpoint(plugin_config.s3_endpoint_url.clone())
-                        .maybe_region(plugin_config.s3_region.clone())
-                        .with_timeout_config(
-                            TimeoutConfig::builder()
-                                .operation_timeout(Duration::from_millis(
-                                    plugin_config.timeout_millis,
-                                ))
-                                .build(),
-                        )
-                        .build_config(),
-                )
-                .await
-                .with_slow_operation_threshold(plugin_config.s3_slow_operation_threshold_millis)
-                .s3_with_path_style(plugin_config.s3_force_path_style)
-                .ensure_bucket(&plugin_config.s3_bucket)
-                .build()
-                .await
-                .map_err(|e| {
-                    PluginError::from(PluginInitError {
-                        plugin_name: plugin_name.to_string(),
-                        message: format!("Failed to create S3 client: {e}"),
-                    })
-                })?;
+                let s3_client = AwsClientBuilder::builder()
+                    .with_http_settings(&plugin_config.http)
+                    .for_store(StoreKind::Immutable)
+                    .maybe_endpoint(plugin_config.s3_endpoint_url.clone())
+                    .maybe_region(plugin_config.s3_region.clone())
+                    .with_timeout_config(
+                        TimeoutConfig::builder()
+                            .operation_timeout(Duration::from_millis(plugin_config.timeout_millis))
+                            .build(),
+                    )
+                    .build_config()
+                    .with_slow_operation_threshold(plugin_config.s3_slow_operation_threshold_millis)
+                    .s3_with_path_style(plugin_config.s3_force_path_style)
+                    .ensure_bucket(&plugin_config.s3_bucket)
+                    .build()
+                    .await
+                    .map_err(|e| {
+                        PluginError::from(PluginInitError {
+                            plugin_name: plugin_name.to_string(),
+                            message: format!("Failed to create S3 client: {e}"),
+                        })
+                    })?;
 
                 // Build DynamoDB client
-                let dynamodb_client_builder = Box::pin(
-                    AwsClientBuilder::builder()
-                        .with_http_settings(&plugin_config.http)
-                        .maybe_endpoint(plugin_config.dynamodb_endpoint_url.clone())
-                        .maybe_region(plugin_config.dynamodb_region.clone())
-                        .with_timeout_config(
-                            TimeoutConfig::builder()
-                                .operation_timeout(Duration::from_millis(
-                                    plugin_config.timeout_millis,
-                                ))
-                                .build(),
-                        )
-                        .build_config(),
-                )
-                .await
-                .with_slow_operation_threshold(
-                    plugin_config.dynamodb_slow_operation_threshold_millis,
-                )
-                .maybe_unprocessed_keys_retry(
-                    plugin_config
-                        .dynamodb_unprocessed_keys_retry
-                        .as_ref()
-                        .map(RetryPolicy::from),
-                )
-                .dynamodb()
-                .ensure_table(&plugin_config.dynamodb_fragments_table)
-                .ensure_table(&plugin_config.dynamodb_fragment_state_table);
+                let dynamodb_client_builder = AwsClientBuilder::builder()
+                    .with_http_settings(&plugin_config.http)
+                    .for_store(StoreKind::Immutable)
+                    .maybe_endpoint(plugin_config.dynamodb_endpoint_url.clone())
+                    .maybe_region(plugin_config.dynamodb_region.clone())
+                    .with_timeout_config(
+                        TimeoutConfig::builder()
+                            .operation_timeout(Duration::from_millis(plugin_config.timeout_millis))
+                            .build(),
+                    )
+                    .build_config()
+                    .with_slow_operation_threshold(
+                        plugin_config.dynamodb_slow_operation_threshold_millis,
+                    )
+                    .maybe_unprocessed_keys_retry(
+                        plugin_config
+                            .dynamodb_unprocessed_keys_retry
+                            .as_ref()
+                            .map(RetryPolicy::from),
+                    )
+                    .dynamodb()
+                    .ensure_table(&plugin_config.dynamodb_fragments_table)
+                    .ensure_table(&plugin_config.dynamodb_fragment_state_table);
 
                 let dynamodb_client =
                     Box::pin(dynamodb_client_builder.build())
@@ -395,7 +388,7 @@ impl MutableStorePluginFactory for AwsMutableStorePluginFactory {
     fn create(
         &self,
         config: &toml::Value,
-        immutable_store: Arc<dyn ImmutableStore>,
+        _immutable_store: Arc<dyn ImmutableStore>,
     ) -> Result<Arc<dyn MutableStore>, PluginError> {
         let plugin_name = self.name();
 
@@ -419,26 +412,22 @@ impl MutableStorePluginFactory for AwsMutableStorePluginFactory {
         #[allow(clippy::disallowed_methods)]
         let dynamodb_client = tokio::task::block_in_place(|| {
             runtime().block_on(Box::pin(async {
-                let builder = Box::pin(
-                    AwsClientBuilder::builder()
-                        .with_http_settings(&plugin_config.http)
-                        .maybe_endpoint(plugin_config.dynamodb_endpoint_url.clone())
-                        .maybe_region(plugin_config.dynamodb_region.clone())
-                        .with_timeout_config(
-                            TimeoutConfig::builder()
-                                .operation_timeout(Duration::from_millis(
-                                    plugin_config.timeout_millis,
-                                ))
-                                .build(),
-                        )
-                        .build_config(),
-                )
-                .await
-                .with_slow_operation_threshold(
-                    plugin_config.dynamodb_slow_operation_threshold_millis,
-                )
-                .dynamodb()
-                .ensure_table(&plugin_config.dynamodb_table);
+                let builder = AwsClientBuilder::builder()
+                    .with_http_settings(&plugin_config.http)
+                    .for_store(StoreKind::Mutable)
+                    .maybe_endpoint(plugin_config.dynamodb_endpoint_url.clone())
+                    .maybe_region(plugin_config.dynamodb_region.clone())
+                    .with_timeout_config(
+                        TimeoutConfig::builder()
+                            .operation_timeout(Duration::from_millis(plugin_config.timeout_millis))
+                            .build(),
+                    )
+                    .build_config()
+                    .with_slow_operation_threshold(
+                        plugin_config.dynamodb_slow_operation_threshold_millis,
+                    )
+                    .dynamodb()
+                    .ensure_table(&plugin_config.dynamodb_table);
 
                 Box::pin(builder.build()).await.map_err(|e| {
                     PluginError::from(PluginInitError {
@@ -458,10 +447,9 @@ impl MutableStorePluginFactory for AwsMutableStorePluginFactory {
             timeout_millis: plugin_config.timeout_millis,
         };
 
-        let store_settings =
-            AwsMutableStoreSettings::new(dynamodb_settings, plugin_config.force_write);
+        let store_settings = AwsMutableStoreSettings::new(dynamodb_settings);
 
-        let store = AwsMutableStore::new(dynamodb_client, &store_settings, immutable_store);
+        let store = AwsMutableStore::new(dynamodb_client, &store_settings);
 
         Ok(Arc::new(store))
     }
@@ -513,32 +501,28 @@ impl LockStorePluginFactory for AwsLockStorePluginFactory {
         #[allow(clippy::disallowed_methods)]
         let dynamodb_client = tokio::task::block_in_place(|| {
             runtime().block_on(async {
-                let builder = Box::pin(
-                    AwsClientBuilder::builder()
-                        .with_http_settings(&plugin_config.http)
-                        .maybe_endpoint(plugin_config.dynamodb_endpoint_url.clone())
-                        .maybe_region(plugin_config.dynamodb_region.clone())
-                        .with_timeout_config(
-                            TimeoutConfig::builder()
-                                .operation_timeout(Duration::from_millis(
-                                    plugin_config.timeout_millis,
-                                ))
-                                .build(),
-                        )
-                        .build_config(),
-                )
-                .await
-                .with_slow_operation_threshold(
-                    plugin_config.dynamodb_slow_operation_threshold_millis,
-                )
-                .maybe_unprocessed_keys_retry(
-                    plugin_config
-                        .dynamodb_unprocessed_keys_retry
-                        .as_ref()
-                        .map(RetryPolicy::from),
-                )
-                .dynamodb()
-                .ensure_table(&plugin_config.dynamodb_table);
+                let builder = AwsClientBuilder::builder()
+                    .with_http_settings(&plugin_config.http)
+                    .for_store(StoreKind::Lock)
+                    .maybe_endpoint(plugin_config.dynamodb_endpoint_url.clone())
+                    .maybe_region(plugin_config.dynamodb_region.clone())
+                    .with_timeout_config(
+                        TimeoutConfig::builder()
+                            .operation_timeout(Duration::from_millis(plugin_config.timeout_millis))
+                            .build(),
+                    )
+                    .build_config()
+                    .with_slow_operation_threshold(
+                        plugin_config.dynamodb_slow_operation_threshold_millis,
+                    )
+                    .maybe_unprocessed_keys_retry(
+                        plugin_config
+                            .dynamodb_unprocessed_keys_retry
+                            .as_ref()
+                            .map(RetryPolicy::from),
+                    )
+                    .dynamodb()
+                    .ensure_table(&plugin_config.dynamodb_table);
 
                 Box::pin(builder.build()).await.map_err(|e| {
                     PluginError::from(PluginInitError {

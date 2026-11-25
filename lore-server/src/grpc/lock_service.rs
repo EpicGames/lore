@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use lore_base::error::InvalidArguments;
 use lore_base::runtime::LORE_CONTEXT;
+use lore_base::types::BranchId;
+use lore_base::types::Hash;
 use lore_base::types::LockResource;
 use lore_proto::LockService;
 use lore_proto::lock::AdminLockRequest;
@@ -21,6 +24,7 @@ use lore_proto::lock::UnlockResponse;
 use lore_revision::lock::LockError;
 use lore_revision::lock::LockQuery;
 use lore_revision::lock::LockStore;
+use lore_revision::lock::util::store_lock_batch_size;
 use lore_revision::lore::RepositoryId;
 use lore_revision::notification::NotificationSender;
 use lore_telemetry::InstrumentProvider;
@@ -44,8 +48,6 @@ use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::no_repository_access_status;
 use crate::grpc::require_action;
 use crate::util::setup_execution;
-
-const STATUS_MAX_RESOURCE_LEN: usize = 100;
 
 #[derive(Clone)]
 struct LoreLockServiceInstrumentProvider {}
@@ -130,6 +132,47 @@ async fn forward_query(
     Ok(response)
 }
 
+/// Refuse a request `lock_store` cannot apply as one operation.
+///
+/// **Too many resources.** A request naming more resources than [`store_lock_batch_size`] gives
+/// for the store is refused with `OUT_OF_RANGE`.
+///
+/// **The same resource twice.** A resource is keyed by its branch and hash as the store reads
+/// them; the description is not part of that key, so two resources differing only there name
+/// one lock. A request naming one key more than once is refused with `INVALID_ARGUMENT`.
+///
+/// The count is checked before the keys. A server forwarding a request checks it first, against
+/// the store whose limit it advertises, and the peer checks it again against its own store, whose
+/// limit may be lower.
+fn check_resources(
+    lock_store: &dyn LockStore,
+    resources: &[lore_proto::lock::Resource],
+) -> Result<(), Status> {
+    let limit = store_lock_batch_size(lock_store);
+
+    if resources.len() > limit {
+        return Err(Status::out_of_range(format!(
+            "Resource count {} exceeds limit {limit}",
+            resources.len()
+        )));
+    }
+
+    let mut seen = HashSet::with_capacity(resources.len());
+    if let Some(duplicate) = resources.iter().find(|resource| {
+        !seen.insert((
+            BranchId::from(resource.branch.as_ref()),
+            Hash::from(resource.hash.as_ref()),
+        ))
+    }) {
+        return Err(Status::invalid_argument(format!(
+            "Resource {} is named more than once",
+            duplicate.description
+        )));
+    }
+
+    Ok(())
+}
+
 /// Locks resources for the caller in this server's own lock store, and
 /// announces the new locks.
 pub async fn lock_implementation(
@@ -141,6 +184,8 @@ pub async fn lock_implementation(
     if request.resources.is_empty() {
         return Ok(Response::new(LockResponse { locks: vec![] }));
     }
+
+    check_resources(lock_store, &request.resources)?;
 
     let execution = setup_execution(
         module_path!(),
@@ -183,26 +228,17 @@ async fn forward_lock(
     Ok(response)
 }
 
-fn check_status_resource_count(request: &StatusRequest) -> Result<(), Status> {
-    if request.resources.len() > STATUS_MAX_RESOURCE_LEN {
-        return Err(Status::invalid_argument("Resource count exceeds limit"));
-    }
-    Ok(())
-}
-
 /// Answers a lock status request from this server's own lock store.
 pub async fn status_implementation(
     request: StatusRequest,
     caller_context: CallerContext,
     lock_store: &dyn LockStore,
 ) -> Result<Response<StatusResponse>, Status> {
-    // The peer of a forwarding server checks the count again: the store reads
-    // one item per resource, and the request reaching it is still the client's.
-    check_status_resource_count(&request)?;
-
     if request.resources.is_empty() {
         return Ok(Response::new(StatusResponse { locks: vec![] }));
     }
+
+    check_resources(lock_store, &request.resources)?;
 
     info!(
         num_items = request.resources.len(),
@@ -263,6 +299,8 @@ pub async fn unlock_implementation(
     if resources.is_empty() {
         return Ok(Response::new(UnlockResponse { resources: vec![] }));
     }
+
+    check_resources(lock_store, &resources)?;
 
     let resources: Vec<LockResource> = resources.iter().map(Into::into).collect();
     let repository = caller_context.repository_id;
@@ -455,6 +493,7 @@ impl LoreLockService {
         if let Some(forwarded_requests) = &self.forwarded_requests
             && forwarded_requests.rpc_flags().lock_lock
         {
+            check_resources(self.lock_store.as_ref(), &lock_request.resources)?;
             forward_lock(lock_request, caller_context, forwarded_requests).await
         } else {
             lock_implementation(
@@ -490,8 +529,6 @@ impl LoreLockService {
         let caller_context = CallerContext::from_original_request(&request)?;
         let status_request = request.into_inner();
 
-        check_status_resource_count(&status_request)?;
-
         self.status_histogram.record(
             status_request.resources.len() as u64,
             &self
@@ -507,6 +544,7 @@ impl LoreLockService {
         if let Some(forwarded_requests) = &self.forwarded_requests
             && forwarded_requests.rpc_flags().lock_status
         {
+            check_resources(self.lock_store.as_ref(), &status_request.resources)?;
             forward_status(status_request, caller_context, forwarded_requests).await
         } else {
             status_implementation(status_request, caller_context, self.lock_store.as_ref()).await
@@ -545,6 +583,7 @@ impl LoreLockService {
         if let Some(forwarded_requests) = &self.forwarded_requests
             && forwarded_requests.rpc_flags().lock_unlock
         {
+            check_resources(self.lock_store.as_ref(), &unlock_request.resources)?;
             let request = ForwardedUnlockRequest {
                 resources: unlock_request.resources,
                 elevated_caller,
@@ -586,6 +625,8 @@ impl LoreLockService {
                 .instrument_provider
                 .get_labels_for_operation_context("admin_lock"),
         );
+
+        check_resources(self.lock_store.as_ref(), &lock_request.resources)?;
 
         if lock_request.resources.is_empty() {
             return Ok(Response::new(AdminLockResponse { locks: vec![] }));

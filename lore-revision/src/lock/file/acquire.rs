@@ -19,9 +19,9 @@ use crate::interface::LoreString;
 use crate::lock;
 use crate::lock::file::release::ReleaseOptions;
 use crate::lock::file::release::release;
-use crate::lock::util::LOCK_BATCH_SIZE;
 use crate::lock::util::assemble_resource_for_path;
 use crate::lock::util::fold_batch_results;
+use crate::lock::util::lock_batch_size;
 use crate::lock::util::lock_path_node;
 use crate::lock::util::lock_tree;
 use crate::lore::execution_context;
@@ -202,7 +202,7 @@ pub async fn acquire(
         .forward::<AcquireError>("Unable to acquire lock while offline")?;
 
     let resources_values = resources.values().cloned().collect::<Vec<_>>();
-    let batch_iterator = resources_values.chunks(LOCK_BATCH_SIZE);
+    let batch_iterator = resources_values.chunks(lock_batch_size(&remote.environment));
     let num_batches = batch_iterator.len();
 
     let mut batches: JoinSet<Result<Vec<LockData>, AcquireError>> = JoinSet::new();

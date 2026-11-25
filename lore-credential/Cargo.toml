@@ -19,7 +19,6 @@ ring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 serde_with = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 url = { workspace = true }

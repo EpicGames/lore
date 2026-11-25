@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use aws_sdk_dynamodb::types::CancellationReason;
+use crate::aws::error::CancellationReason;
 
 /// A filter that only returns cancellation reasons that have a 'Code' that isn't the str literal "None".
 /// AWS HTTP `CancellationReason` array can have dummy/blank reasons if some Items in a transaction were cancelled
@@ -15,27 +15,4 @@ pub fn interesting_cancellation_reason_filter(item: &&CancellationReason) -> boo
     }
 
     false
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn no_code_is_not_interesting() {
-        let reason = CancellationReason::builder().build();
-        assert!(!interesting_cancellation_reason_filter(&&reason));
-    }
-
-    #[test]
-    fn none_code_is_not_interesting() {
-        let reason = CancellationReason::builder().code("None").build();
-        assert!(!interesting_cancellation_reason_filter(&&reason));
-    }
-
-    #[test]
-    fn a_code_is_interesting() {
-        let reason = CancellationReason::builder().code("Hello").build();
-        assert!(interesting_cancellation_reason_filter(&&reason));
-    }
 }

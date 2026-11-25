@@ -34,3 +34,28 @@ fn the_provider_is_advertised_only_when_resolved() {
         })
     );
 }
+
+#[test]
+fn the_lock_batch_limit_is_advertised_and_zero_when_unset() {
+    let mut environment = lore_revision::environment::EnvironmentConfig {
+        config: Some(lore_revision::environment::Config {
+            max_lock_batch: Some(42),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        environment_to_proto(&environment)
+            .config
+            .map(|config| config.max_lock_batch),
+        Some(42)
+    );
+
+    environment.config = Some(lore_revision::environment::Config::default());
+    assert_eq!(
+        environment_to_proto(&environment)
+            .config
+            .map(|config| config.max_lock_batch),
+        Some(0)
+    );
+}

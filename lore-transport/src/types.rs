@@ -23,6 +23,13 @@ impl EnvironmentConfig {
         self.config.as_ref().and_then(|c| c.max_query_batch)
     }
 
+    /// The most resources the server takes in one lock, unlock or status request.
+    ///
+    /// `None` when the server advertises no limit.
+    pub fn max_lock_batch(&self) -> Option<usize> {
+        self.config.as_ref().and_then(|c| c.max_lock_batch)
+    }
+
     /// The compression mode the server states it prefers, as the number it sent. The codec that
     /// number names is `lore_storage::CompressionMode`, which this crate does not depend on.
     pub fn compression_mode(&self) -> Option<u32> {
@@ -144,6 +151,7 @@ impl ServerCompressionMode {
 pub struct EnvironmentServerConfig {
     pub max_query_batch: Option<usize>,
     pub compression_mode: Option<ServerCompressionMode>,
+    pub max_lock_batch: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------

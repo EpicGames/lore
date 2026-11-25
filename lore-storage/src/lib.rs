@@ -209,16 +209,35 @@ pub use write_stats::FragmentWriteStats;
 pub use write_tracker::WriteContext;
 pub use write_tracker::WriteTracker;
 
-/// Back-off for store operations, including every `SlowDown` retry path. Tops out at one second
-/// so a caller that can recompute is not held for minutes.
+/// First wait of the store ladder, in milliseconds.
+#[lore_macro::test_pub]
+const STORE_RETRY_START_MS: u64 = 50;
+/// Ceiling on any single wait of the store ladder, in milliseconds.
+#[lore_macro::test_pub]
+const STORE_RETRY_MAX_MS: u64 = 1_000;
+/// Waits an operation gets where nothing has narrowed it.
+#[lore_macro::test_pub]
+const STORE_RETRY_ATTEMPTS_DEFAULT: usize = 60;
+/// Waits an operation gets inside a request handler.
+#[lore_macro::test_pub]
+const STORE_RETRY_ATTEMPTS_SERVER: usize = 9;
+
+/// Back-off for store operations, including every `SlowDown` retry path.
+///
+/// Waits start at 50ms and double up to a ceiling of one second, for as many waits as
+/// [`STORE_RETRY_ATTEMPTS`] holds: sixty, about a minute in total, unless the process set another
+/// count first, as [`assume_server_policies`] does.
+///
+/// The jitter clamp is raised to the ceiling, so each wait may deviate by half its interval either
+/// way. Callers shed at the same instant hold the same back-off, and the spread keeps their retries
+/// apart.
 pub fn store_retry() -> Retry {
     retry(
-        50,
-        1_000,
-        *STORE_RETRY_ATTEMPTS.get_or_init(|| {
-            60 //default try 60 times
-        }),
+        STORE_RETRY_START_MS,
+        STORE_RETRY_MAX_MS,
+        *STORE_RETRY_ATTEMPTS.get_or_init(|| STORE_RETRY_ATTEMPTS_DEFAULT),
     )
+    .with_jitter_clamp(STORE_RETRY_MAX_MS)
 }
 
 /// Store interactions use a retry policy to retry failures.
@@ -226,10 +245,15 @@ pub fn store_retry() -> Retry {
 /// and this var lets each customize the behavior
 pub static STORE_RETRY_ATTEMPTS: OnceLock<usize> = OnceLock::new();
 
-/// In a server side context - assume store behaviors that make sense for this environment
+/// Sets the store ladder to nine waits, for a process that answers requests.
+///
+/// The nine waits total about five and a half seconds, not counting the time each attempt itself
+/// takes, so an operation fails inside a request handler's budget rather than holding the handler
+/// for the default minute. Has no effect once [`store_retry`] has read the attempt count or an
+/// earlier call has set it.
 pub fn assume_server_policies() {
     lore_info!("Assume server store policies");
     let _ = STORE_RETRY_ATTEMPTS
-        .set(7)
+        .set(STORE_RETRY_ATTEMPTS_SERVER)
         .inspect_err(|_e| lore_warn!("Could not set store retry attempts"));
 }

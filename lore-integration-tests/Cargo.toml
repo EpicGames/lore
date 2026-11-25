@@ -35,21 +35,19 @@ path = "tests/store_retention_test.rs"
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
-aws-sdk-dynamodb = { version = "1.92.0", default-features = false, features = ["rt-tokio"] }
-aws-sdk-s3 = { version = "1.104.0", default-features = false, features = ["rt-tokio"] }
 bytes = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 ring = { workspace = true }
 serde_json = { workspace = true }
+smallvec = { workspace = true }
 rs-consul = "0.13.0"
-rustls = { workspace = true, optional = true }
-serde_dynamo = { version = "4.2.14", features = ["aws-sdk-dynamodb+1"] }
 tokio = { workspace = true }
 tokio-stream = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+url = { workspace = true }
 zerocopy = { workspace = true }
 lore = { workspace = true }
 lore-base = { workspace = true }
@@ -72,6 +70,8 @@ lore-storage = { workspace = true, features = ["test-util"] }
 lore-revision = { workspace = true, features = ["test-util"] }
 lore-transport = { workspace = true, features = ["test-util"] }
 rcgen = { workspace = true }
+# The header and method types of the requests the fixtures send through `ClientCore`.
+http = { workspace = true }
 serde = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

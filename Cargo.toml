@@ -136,6 +136,7 @@ clap = { version = "4.5.47", features = ["derive", "string", "unicode"] }
 clap-markdown = "0.1.5"
 config = { version = "0.15.15", features = ["toml"], default-features = false }
 ctor = "0.2"
+crc32fast = "1.5.3"
 crossbeam-epoch = "0.9.21"
 crossbeam-queue = "0.3.14"
 crossbeam-utils = "0.8.23"
@@ -196,7 +197,6 @@ rcgen = "0.14.4"
 reqwest = { version = "0.12.23", default-features = false, features = [
     "rustls-tls-webpki-roots",
     "rustls-tls-native-roots",
-    "charset",
     "http2",
     "macos-system-configuration",
 ] }
@@ -214,7 +214,7 @@ serde = { version = "1.0.219", default-features = false, features = ["derive"] }
 serde_bytes = "0.11.17"
 serde_json = { version = "1.0.143", default-features = false }
 serde_with = { version = "3.14.0", default-features = false, features = ["alloc", "macros"] }
-serial_test = { version = "3.2.0" }
+serial_test = { version = "3.3.1" }
 socket2 = "0.6.0"
 syn = "2.0.106"
 sysinfo = { version = "0.39.6", default-features = false, features = ["disk", "system", "linux-tmpfs"] }
@@ -246,7 +246,6 @@ tower = { version = "0.5.2", default-features = false }
 tower-http = { version = "0.6.11", default-features = false }
 tracing = { version = "0.1.41", features = ["release_max_level_debug"] }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
-tracing-test = "0.2.5"
 url = "2.5.7"
 urlencoding = "2.1.3"
 uuid = { version = "1.18.1", default-features = false, features = ["v4", "v7"] }

@@ -29,6 +29,7 @@ fn endpoint_to_proto(endpoint: &Option<lore_transport::Endpoint>) -> Option<Endp
 fn config_to_proto(config: &Option<lore_revision::environment::Config>) -> Option<Config> {
     config.as_ref().map(|config| Config {
         max_query_batch: config.max_query_batch.unwrap_or_default() as u32,
+        max_lock_batch: config.max_lock_batch.unwrap_or_default() as u32,
         compression_mode: config.compression_mode.as_ref().map(|mode| {
             let v1_mode = match mode {
                 CompressionMode::NotSpecified => {

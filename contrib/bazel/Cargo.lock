@@ -521,12 +521,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
-name = "core_detect"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
-
-[[package]]
 name = "cpufeatures"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -730,20 +724,6 @@ name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
-
-[[package]]
-name = "encoding_rs"
-version = "0.8.42"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e985e0451871ad22fb8d2b6b076e2028a502a0d3950998c2c5c0a4f9b5d9679"
-dependencies = [
- "cfg-if",
- "core_detect",
- "multiversion_no_op",
- "rustversion",
- "scopeguard",
- "simdutf8",
-]
 
 [[package]]
 name = "equivalent"
@@ -1605,7 +1585,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
- "thiserror",
  "tokio",
  "toml",
  "url",
@@ -1675,7 +1654,6 @@ dependencies = [
  "lore-macro",
  "lore-proto",
  "lore-revision",
- "lore-storage",
  "lore-transport",
  "tokio",
  "tokio-util",
@@ -1699,7 +1677,6 @@ name = "lore-revision"
 version = "0.14.1-nightly"
 dependencies = [
  "arc-swap",
- "async-stream",
  "async-trait",
  "base64 0.22.1",
  "bitcode",
@@ -1711,14 +1688,11 @@ dependencies = [
  "crossbeam-utils",
  "dashmap",
  "diffy",
- "fastcdc",
  "futures",
  "glob-match",
  "governor",
  "hex",
- "http",
  "infer",
- "jsonwebtoken",
  "libc",
  "lore-base",
  "lore-credential",
@@ -1734,22 +1708,15 @@ dependencies = [
  "opentelemetry",
  "parking_lot",
  "pin-project",
- "prost-types",
- "quinn",
  "rand 0.9.5",
  "ring",
  "rustls",
- "rustls-native-certs",
  "serde",
- "serde_with",
  "smallvec",
- "thiserror",
  "tokio",
  "tokio-stream",
  "tokio-util",
  "toml",
- "tonic",
- "tower",
  "url",
  "uuid",
  "windows-sys 0.61.2",
@@ -1763,14 +1730,12 @@ version = "0.14.1-nightly"
 dependencies = [
  "async-trait",
  "bitcode",
- "bitflags 2.13.2",
  "blake3",
  "bytes",
  "crossbeam-queue",
  "dashmap",
  "fastcdc",
  "futures",
- "hex",
  "libc",
  "lore-base",
  "lore-error-set",
@@ -1785,11 +1750,9 @@ dependencies = [
  "rand 0.9.5",
  "serde",
  "smallvec",
- "thiserror",
  "tokio",
  "tokio-stream",
  "tokio-util",
- "uuid",
  "windows-sys 0.61.2",
  "xxhash-rust",
  "zerocopy",
@@ -1842,10 +1805,8 @@ dependencies = [
  "lore-macro",
  "lore-proto",
  "parking_lot",
- "prost-types",
  "quinn",
  "quinn-proto",
- "rand 0.9.5",
  "rcgen",
  "reqwest",
  "rustls",
@@ -1940,12 +1901,6 @@ name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
-
-[[package]]
-name = "multiversion_no_op"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "nom"
@@ -2587,7 +2542,6 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64 0.22.1",
  "bytes",
- "encoding_rs",
  "futures-core",
  "h2",
  "http",
@@ -2598,7 +2552,6 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
- "mime",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -2906,12 +2859,6 @@ dependencies = [
  "errno",
  "libc",
 ]
-
-[[package]]
-name = "simdutf8"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "siphasher"
