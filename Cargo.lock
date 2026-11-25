@@ -2280,6 +2280,7 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "parking_lot",
+ "percent-encoding",
  "pin-project",
  "prost-types",
  "quinn",

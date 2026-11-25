@@ -35,6 +35,7 @@ use crate::grpc::forwarded_lock_service::LoreForwardedLockService;
 use crate::grpc::forwarded_repository::v1::service::LoreForwardedRepositoryV1Service;
 use crate::grpc::forwarded_revision::v1::service::LoreForwardedRevisionV1Service;
 use crate::grpc::replication_service::LoreReplicationService;
+use crate::grpc::tower::grpc_response_trace::GrpcResponseTraceLayer;
 use crate::grpc::tower::tracing::LoreTracingLayer;
 use crate::hooks::HookDispatcher;
 
@@ -43,27 +44,30 @@ use crate::hooks::HookDispatcher;
 // Copy and paste from the rust compiler for sanity
 type GrpcRouter = tonic::transport::server::Router<
     tower::layer::util::Stack<
-        tower::ServiceBuilder<
-            tower::layer::util::Stack<
-                lore_telemetry::grpc_tower_layer::GrpcMetricsLayer,
-                tower::layer::util::Identity,
-            >,
-        >,
+        grpc::tower::grpc_response_trace::GrpcResponseTraceLayer,
         tower::layer::util::Stack<
-            grpc::tower::tracing::LoreTracingLayer,
-            tower::layer::util::Stack<
+            tower::ServiceBuilder<
                 tower::layer::util::Stack<
-                    tower_http::trace::TraceLayer<
-                        tower_http::classify::SharedClassifier<
-                            tower_http::classify::GrpcErrorsAsFailures,
-                        >,
-                        crate::correlation::span::MakeCorrelationIdSpan,
-                    >,
-                    crate::correlation::layer::CorrelationIdLayer,
-                >,
-                tower::layer::util::Stack<
-                    crate::util::core_hop::CoreHopLayer,
+                    lore_telemetry::grpc_tower_layer::GrpcMetricsLayer,
                     tower::layer::util::Identity,
+                >,
+            >,
+            tower::layer::util::Stack<
+                grpc::tower::tracing::LoreTracingLayer,
+                tower::layer::util::Stack<
+                    tower::layer::util::Stack<
+                        tower_http::trace::TraceLayer<
+                            tower_http::classify::SharedClassifier<
+                                tower_http::classify::GrpcErrorsAsFailures,
+                            >,
+                            crate::correlation::span::MakeCorrelationIdSpan,
+                        >,
+                        crate::correlation::layer::CorrelationIdLayer,
+                    >,
+                    tower::layer::util::Stack<
+                        crate::util::core_hop::CoreHopLayer,
+                        tower::layer::util::Identity,
+                    >,
                 >,
             >,
         >,
@@ -225,6 +229,7 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
             )
             .layer(LoreTracingLayer {})
             .layer(metrics_layer)
+            .layer(GrpcResponseTraceLayer {})
             .add_service(ReplicationServiceServer::new(LoreReplicationService::new(
                 self.0.local_immutable_store,
             )?));

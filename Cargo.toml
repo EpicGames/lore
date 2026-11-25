@@ -183,6 +183,7 @@ opentelemetry-otlp = { version = "0.31.0", default-features = false, features = 
 opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"] }
 opentelemetry-semantic-conventions = { version = "0.31.0", features = ["semconv_experimental"] }
 parking_lot = { version = "0.12.4", features = ["arc_lock"] }
+percent-encoding = "2.3.2"
 pin-project = "1.1.10"
 proc-macro2 = "1"
 prost = "0.14.1"

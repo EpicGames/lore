@@ -5,8 +5,10 @@ use std::task::Context;
 use std::task::Poll;
 use std::time::Instant;
 
+use http::HeaderMap;
 use http::Request;
 use http::Response;
+use percent_encoding::percent_decode;
 use pin_project::pin_project;
 use pin_project::pinned_drop;
 use tonic::Code;
@@ -17,6 +19,7 @@ use crate::grpc::is_code_considered_server_error;
 use crate::grpc::rpc_code_to_str;
 
 const GRPC_STATUS_HEADER: &str = "grpc-status";
+const GRPC_MESSAGE_HEADER: &str = "grpc-message";
 
 #[derive(Clone)]
 pub struct GrpcResponseTraceLayer;
@@ -107,8 +110,10 @@ where
                             tracing::debug!(rpc_status_code, elapsed_ms, "Lore success response");
                         }
                         _ if is_code_considered_server_error(&code) => {
+                            let rpc_status_message = status_message(response.headers());
                             tracing::warn!(
                                 rpc_status_code,
+                                rpc_status_message = rpc_status_message.as_deref(),
                                 elapsed_ms,
                                 "Lore server error response"
                             );
@@ -150,4 +155,14 @@ impl<F> PinnedDrop for GrpcMetricsFuture<F> {
             tracing::info!(elapsed_ms, "Lore server dropped request");
         }
     }
+}
+
+/// The response's `grpc-message`, which is percent-encoded on the wire, decoded with any invalid
+/// UTF-8 replaced.
+fn status_message(headers: &HeaderMap) -> Option<String> {
+    headers.get(GRPC_MESSAGE_HEADER).map(|value| {
+        percent_decode(value.as_bytes())
+            .decode_utf8_lossy()
+            .into_owned()
+    })
 }

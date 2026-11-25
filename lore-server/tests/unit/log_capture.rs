@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::fmt::format::FmtSpan;
 
-/// The JSON lines an INFO-level subscriber wrote, span creations included.
+/// The JSON lines a subscriber wrote, span creations included.
 #[derive(Clone, Default)]
 pub(crate) struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
 
@@ -18,11 +18,16 @@ impl CapturedLogs {
     /// emitted on another thread, as by a request served through the full HTTP router,
     /// are not captured.
     pub(crate) fn start() -> (Self, DefaultGuard) {
+        Self::start_at(tracing::Level::INFO)
+    }
+
+    /// As [`Self::start`], capturing events up to `max_level` rather than INFO.
+    pub(crate) fn start_at(max_level: tracing::Level) -> (Self, DefaultGuard) {
         let logs = Self::default();
         let writer = logs.clone();
         let subscriber = tracing_subscriber::fmt()
             .json()
-            .with_max_level(tracing::Level::INFO)
+            .with_max_level(max_level)
             .with_span_events(FmtSpan::NEW)
             .with_writer(move || writer.clone())
             .finish();

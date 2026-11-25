@@ -30,6 +30,7 @@ jsonwebtoken = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
 parking_lot = { workspace = true }
+percent-encoding = { workspace = true }
 pin-project = { workspace = true }
 prost-types = { workspace = true }
 quinn = { workspace = true }
