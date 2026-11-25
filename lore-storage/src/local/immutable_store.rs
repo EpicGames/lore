@@ -1423,10 +1423,19 @@ impl ImmutableStoreBucket {
 
         let path = format_bucket_path(path, group_index, bucket_index);
 
-        let mut file = Self::deserialize_files(path).await?;
-        let cleared = group
-            .clear_lost_payloads(&mut file, group_index, bucket_index)
-            .await?;
+        let (file, cleared) = Result::from(timed!(
+            BUCKET_LOAD_LATENCY,
+            &ImmutableStoreInstrumentProvider::default()
+                .get_labels_for_operation_context("load_bucket"),
+            async {
+                let mut file = Self::deserialize_files(path).await?;
+                let cleared = group
+                    .clear_lost_payloads(&mut file, group_index, bucket_index)
+                    .await?;
+                Ok::<_, LocalImmutableStoreError>((file, cleared))
+            }
+            .await
+        ))?;
 
         self.sorted_index = file.sorted_index;
         self.entry = file.entry;
@@ -6716,6 +6725,14 @@ static STORE_ATTRIBUTES: LazyLock<[KeyValue; 1]> =
 
 #[derive(Default)]
 struct ImmutableStoreInstrumentProvider {}
+
+/// How long loading an index bucket from disk takes, the read and the clearing of entries whose
+/// payloads are lost, recorded with the store's other operation latencies. The load runs inside
+/// the operation that needed the bucket, whose own latency includes it.
+static BUCKET_LOAD_LATENCY: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    ImmutableStoreInstrumentProvider::default()
+        .latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME)
+});
 
 impl InstrumentProvider for ImmutableStoreInstrumentProvider {
     fn namespace(&self) -> &'static str {

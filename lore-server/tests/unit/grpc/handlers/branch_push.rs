@@ -27,6 +27,7 @@ use lore_revision::state;
 use lore_revision::state::Mark;
 use lore_revision::state::State;
 use lore_revision::state::allow_all_repositories;
+use lore_revision::util::request_tracker::CollectStep;
 use lore_revision::util::request_tracker::StoreRequestTracker;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push::*;
@@ -1162,6 +1163,15 @@ mod push {
                 collect + exist <= verify,
                 "{collect:?} + {exist:?} within {verify:?}"
             );
+            let steps = summary
+                .verify_collect_steps
+                .expect("the walk's steps are timed");
+            for step in CollectStep::ALL {
+                let finished = steps
+                    .finished(step)
+                    .unwrap_or_else(|| panic!("{} finished in {steps}", step.label()));
+                assert!(finished <= collect, "{} within the walk", step.label());
+            }
             let commit = summary
                 .phase_duration(PushPhase::Commit)
                 .expect("the head is stored");

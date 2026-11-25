@@ -34,6 +34,9 @@ use lore_revision::repository::prefetch::prefetch_changed_node_blocks;
 use lore_revision::state;
 use lore_revision::state::State;
 use lore_revision::state::allow_all_repositories;
+use lore_revision::util::request_tracker::CollectStep;
+use lore_revision::util::request_tracker::CollectSteps;
+use lore_revision::util::request_tracker::StepState;
 use lore_revision::util::request_tracker::StoreRequestTracker;
 use lore_storage::StoreError;
 use lore_storage::StoreMatch;
@@ -138,6 +141,14 @@ static VERIFY_COLLECT_DURATION: LazyLock<Histogram<f64>> =
 
 static VERIFY_EXIST_DURATION: LazyLock<Histogram<f64>> =
     LazyLock::new(|| push_duration_histogram("verify_exist_duration"));
+
+// The time from the start of the verification's tree walk to the end of each of its steps, which
+// run beside one another.
+static VERIFY_COLLECT_STEP_FINISHED: LazyLock<Histogram<f64>> =
+    LazyLock::new(|| push_duration_histogram("verify_collect_step_finished_after"));
+
+static VERIFY_COLLECT_RUNNING_STEP: LazyLock<Counter<u64>> =
+    LazyLock::new(|| BranchPushInstrumentProvider.counter("verify_collect_running_step"));
 
 static FAST_FORWARD_MERGE_CHANGES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
     BranchPushInstrumentProvider.length_histogram(
@@ -387,6 +398,8 @@ pub struct PushSummary {
     /// The time the verification's existence checks took, counted up to the snapshot while they
     /// run. `None` if they never started.
     pub verify_exist: Option<Duration>,
+    /// When each step of the verification's tree walk finished. `None` if it never started.
+    pub verify_collect_steps: Option<CollectSteps>,
     /// What the prefetch beside the verification's walk did. A fetch still running at the snapshot
     /// is counted only once it ends.
     pub verify_prefetch: PrefetchCounts,
@@ -498,6 +511,7 @@ impl PushReport {
             peak_metadata_reads_in_flight: self.store_requests.peak_metadata_reads_in_flight(),
             verify_collect,
             verify_exist,
+            verify_collect_steps: self.store_requests.collect_steps(),
             verify_prefetch: self.verify_prefetch.counts(),
             merge_prefetch: self.merge_prefetch.counts(),
         }
@@ -571,6 +585,7 @@ impl Drop for PushReport {
                 verify_ms = millis(PushPhase::Verify),
                 verify_collect_ms = summary.verify_collect.map(|d| d.as_millis()),
                 verify_exist_ms = summary.verify_exist.map(|d| d.as_millis()),
+                verify_collect_steps = summary.verify_collect_steps.map(tracing::field::display),
                 fast_forward_merge_ms = millis(PushPhase::FastForwardMerge),
                 commit_ms = millis(PushPhase::Commit),
                 respond_ms = millis(PushPhase::Respond),
@@ -648,6 +663,9 @@ impl PushReport {
             if let Some(collect) = summary.verify_collect {
                 VERIFY_COLLECT_DURATION.record(collect.as_secs_f64() * 1000., &attributes);
             }
+            if let Some(steps) = &summary.verify_collect_steps {
+                record_collect_steps(steps, &attributes);
+            }
             // A verification that completed without collecting an address asked the store nothing.
             if let Some(exist) = summary.verify_exist
                 && !completed_with_nothing_collected
@@ -674,6 +692,27 @@ impl PushReport {
         }
         if let Some(concurrent_query_batches) = self.concurrent_query_batches {
             CONCURRENT_QUERY_BATCHES.record(concurrent_query_batches, &[]);
+        }
+    }
+}
+
+/// Records when each step of the verification's tree walk finished, and counts those still running
+/// when it ended, which name where a walk that was cut off spent its time.
+fn record_collect_steps(steps: &CollectSteps, handler_and_outcome: &[KeyValue; 2]) {
+    let [handler, outcome] = handler_and_outcome.clone();
+    for step in CollectStep::ALL {
+        let attributes = [
+            KeyValue::new("step", step.label()),
+            handler.clone(),
+            outcome.clone(),
+        ];
+        match steps.state(step) {
+            StepState::Finished(finished) => {
+                VERIFY_COLLECT_STEP_FINISHED.record(finished.as_secs_f64() * 1000., &attributes);
+            }
+            StepState::Running => VERIFY_COLLECT_RUNNING_STEP.add(1, &attributes),
+            // A step the walk never reached took none of its time.
+            StepState::Waiting => (),
         }
     }
 }
@@ -1803,6 +1842,7 @@ async fn collect_new_addresses(
         Ok(())
     };
 
+    store_requests.expect_collections(1 + u64::from(other_parent_state.is_some()));
     let mut collect_tasks = JoinSet::default();
     lore_spawn!(
         collect_tasks,

@@ -208,6 +208,7 @@ use crate::store::KeyType;
 use crate::store::StoreMatch;
 use crate::util::path::RelativePath;
 use crate::util::path::RelativePathBuf;
+use crate::util::request_tracker::CollectStep;
 use crate::util::request_tracker::StoreRequestTracker;
 
 /// Data for an event summarizing a dumped repository state.
@@ -12560,17 +12561,24 @@ pub async fn collect_fragments(
     collection: Collection,
     tracker: Arc<StoreRequestTracker>,
 ) -> Result<Vec<Address>, StateError> {
+    tracker.start_collection();
     let from_state_address = lore_spawn!({
         let repository = repository.clone();
         let state = state_from.clone();
         let tracker = tracker.clone();
         async move {
-            let addresses = collect_state_fragments(repository.clone(), state).await?;
-            // Collect all from block addresses, even uploaded, as we want to diff against these
-            let mut addresses =
-                collect_new_addresses(repository, &addresses, Collection::All, tracker).await?;
-            addresses.sort_unstable();
-            Ok(addresses)
+            tracker
+                .clone()
+                .time_step(CollectStep::FromState, async move {
+                    let addresses = collect_state_fragments(repository.clone(), state).await?;
+                    // Collect all from block addresses, even uploaded, as we want to diff against these
+                    let mut addresses =
+                        collect_new_addresses(repository, &addresses, Collection::All, tracker)
+                            .await?;
+                    addresses.sort_unstable();
+                    Ok(addresses)
+                })
+                .await
         }
     });
 
@@ -12579,53 +12587,78 @@ pub async fn collect_fragments(
         let state = state_to.clone();
         let tracker = tracker.clone();
         async move {
-            let addresses = collect_state_fragments(repository.clone(), state).await?;
-            let mut addresses =
-                collect_new_addresses(repository, &addresses, collection, tracker).await?;
-            addresses.sort_unstable();
-            Ok(addresses)
+            tracker
+                .clone()
+                .time_step(CollectStep::ToState, async move {
+                    let addresses = collect_state_fragments(repository.clone(), state).await?;
+                    let mut addresses =
+                        collect_new_addresses(repository, &addresses, collection, tracker).await?;
+                    addresses.sort_unstable();
+                    Ok(addresses)
+                })
+                .await
         }
     });
 
     let from_block_address = lore_spawn!({
         let repository = repository.clone();
         let state = state_from.clone();
+        let tracker = tracker.clone();
         async move {
-            // Blocks are never fragmented, safe to not call collect_new_addresses
-            let mut addresses = collect_node_blocks(repository, state).await?;
-            addresses.sort_unstable();
-            Ok(addresses)
+            tracker
+                .time_step(CollectStep::FromNodeBlocks, async move {
+                    // Blocks are never fragmented, safe to not call collect_new_addresses
+                    let mut addresses = collect_node_blocks(repository, state).await?;
+                    addresses.sort_unstable();
+                    Ok(addresses)
+                })
+                .await
         }
     });
 
     let to_block_address = lore_spawn!({
         let repository = repository.clone();
         let state = state_to.clone();
+        let tracker = tracker.clone();
         async move {
-            // Blocks are never fragmented, safe to not call collect_new_addresses
-            let mut addresses = collect_node_blocks(repository, state).await?;
-            addresses.sort_unstable();
-            Ok(addresses)
+            tracker
+                .time_step(CollectStep::ToNodeBlocks, async move {
+                    // Blocks are never fragmented, safe to not call collect_new_addresses
+                    let mut addresses = collect_node_blocks(repository, state).await?;
+                    addresses.sort_unstable();
+                    Ok(addresses)
+                })
+                .await
         }
     });
 
     let from_file_metadata_block_address = lore_spawn!({
         let repository = repository.clone();
         let state = state_from.clone();
+        let tracker = tracker.clone();
         async move {
             // Collect all from metadata block addresses, even uploaded, as we want to diff against these
-            let addresses = collect_file_metadata_blocks(repository, state).await?;
-            Ok(addresses)
+            tracker
+                .time_step(
+                    CollectStep::FromFileMetadataBlocks,
+                    collect_file_metadata_blocks(repository, state),
+                )
+                .await
         }
     });
 
     let to_file_metadata_block_address = lore_spawn!({
         let repository = repository.clone();
         let state = state_to.clone();
+        let tracker = tracker.clone();
         async move {
             // Collect all to metadata block addresses, even uploaded, as we want to inspect and load these
-            let addresses = collect_file_metadata_blocks(repository, state).await?;
-            Ok(addresses)
+            tracker
+                .time_step(
+                    CollectStep::ToFileMetadataBlocks,
+                    collect_file_metadata_blocks(repository, state),
+                )
+                .await
         }
     });
 
@@ -12637,10 +12670,15 @@ pub async fn collect_fragments(
         async move {
             // Safe to filter these directly to only contain not uploaded fragments, we don't
             // use it as input to any other collection
-            collect_new_file_fragments(
-                repository, state_from, state_to, ROOT_NODE, ROOT_NODE, collection, tracker,
-            )
-            .await
+            tracker
+                .clone()
+                .time_step(
+                    CollectStep::NewFiles,
+                    collect_new_file_fragments(
+                        repository, state_from, state_to, ROOT_NODE, ROOT_NODE, collection, tracker,
+                    ),
+                )
+                .await
         }
     });
 
@@ -12649,7 +12687,17 @@ pub async fn collect_fragments(
         let metadata_hash = state_to.metadata_hash();
         let tracker = tracker.clone();
         async move {
-            collect_new_revision_metadata_fragments(repository, metadata_hash, collection, tracker)
+            tracker
+                .clone()
+                .time_step(
+                    CollectStep::RevisionMetadata,
+                    collect_new_revision_metadata_fragments(
+                        repository,
+                        metadata_hash,
+                        collection,
+                        tracker,
+                    ),
+                )
                 .await
         }
     });
@@ -12683,7 +12731,10 @@ pub async fn collect_fragments(
     };
     let from_len = from_block_address.len();
     let to_len = to_block_address.len();
-    let diff_block_address = if failure.is_none() {
+    // A failed node block list leaves nothing to diff, so the steps that work on the diff are
+    // skipped and stay waiting.
+    let diff_reached = failure.is_none();
+    let diff_block_address = if diff_reached {
         collect_diff_addresses(from_block_address, to_block_address)
     } else {
         vec![]
@@ -12699,11 +12750,19 @@ pub async fn collect_fragments(
         let blocks = diff_block_address.clone();
         let tracker = tracker.clone();
         async move {
-            let addresses = collect_name_fragments(repository.clone(), blocks).await?;
-            let mut addresses =
-                collect_new_addresses(repository, &addresses, collection, tracker).await?;
-            addresses.sort_unstable();
-            Ok(addresses)
+            if !diff_reached {
+                return Ok(vec![]);
+            }
+            tracker
+                .clone()
+                .time_step(CollectStep::NewNames, async move {
+                    let addresses = collect_name_fragments(repository.clone(), blocks).await?;
+                    let mut addresses =
+                        collect_new_addresses(repository, &addresses, collection, tracker).await?;
+                    addresses.sort_unstable();
+                    Ok(addresses)
+                })
+                .await
         }
     });
 
@@ -12713,10 +12772,19 @@ pub async fn collect_fragments(
         let repository = repository.clone();
         let tracker = tracker.clone();
         async move {
-            let mut addresses =
-                collect_new_addresses(repository, &diff_block_address, collection, tracker).await?;
-            addresses.sort_unstable();
-            Ok(addresses)
+            if !diff_reached {
+                return Ok(vec![]);
+            }
+            tracker
+                .clone()
+                .time_step(CollectStep::NewNodeBlocks, async move {
+                    let mut addresses =
+                        collect_new_addresses(repository, &diff_block_address, collection, tracker)
+                            .await?;
+                    addresses.sort_unstable();
+                    Ok(addresses)
+                })
+                .await
         }
     });
 
@@ -12783,41 +12851,52 @@ pub async fn collect_fragments(
 
     let from_file_metadata_block_len = from_file_metadata_block_address.len();
     let to_file_metadata_block_len = to_file_metadata_block_address.len();
-    let (mut new_file_metadata_block_address, mut new_file_metadata_blob_address_tasks) = if failure
-        .is_none()
-    {
-        let mut new_file_metadata_address = vec![];
-        let mut tasks = JoinSet::new();
-        for (block_index, to_block_address) in to_file_metadata_block_address.iter().enumerate() {
-            if to_block_address.hash.is_zero() {
-                continue;
-            }
+    // Once any earlier step has failed, the blobs are skipped and their step stays waiting.
+    let (mut new_file_metadata_block_address, mut new_file_metadata_blob_address_tasks, blob_tasks) =
+        if failure.is_none() {
+            let blob_tasks = tracker.start_tasks(CollectStep::FileMetadataBlobs);
+            let mut new_file_metadata_address = vec![];
+            let mut tasks = JoinSet::new();
+            for (block_index, to_block_address) in to_file_metadata_block_address.iter().enumerate()
+            {
+                if to_block_address.hash.is_zero() {
+                    continue;
+                }
 
-            let from_block_address = from_file_metadata_block_address.get(block_index).cloned();
-            if from_block_address != Some(*to_block_address) {
-                new_file_metadata_address.push(*to_block_address);
+                let from_block_address = from_file_metadata_block_address.get(block_index).cloned();
+                if from_block_address != Some(*to_block_address) {
+                    new_file_metadata_address.push(*to_block_address);
 
-                // Check which metadata is new
-                let repository = repository.clone();
-                let state_to = state_to.clone();
-                lore_spawn!(
-                    tasks,
-                    collect_new_node_metadata_fragments(
-                        repository,
-                        state_to,
-                        from_block_address,
-                        *to_block_address,
-                        block_index,
-                        collection,
-                        tracker.clone(),
-                    )
-                );
+                    // Check which metadata is new
+                    let repository = repository.clone();
+                    let state_to = state_to.clone();
+                    let to_block_address = *to_block_address;
+                    let tracker = tracker.clone();
+                    let blob_tasks = blob_tasks.clone();
+                    blob_tasks.add();
+                    lore_spawn!(tasks, async move {
+                        let addresses = collect_new_node_metadata_fragments(
+                            repository,
+                            state_to,
+                            from_block_address,
+                            to_block_address,
+                            block_index,
+                            collection,
+                            tracker,
+                        )
+                        .await;
+                        blob_tasks.done();
+                        addresses
+                    });
+                }
             }
-        }
-        (new_file_metadata_address, tasks)
-    } else {
-        (vec![], JoinSet::new())
-    };
+            (new_file_metadata_address, tasks, Some(blob_tasks))
+        } else {
+            (vec![], JoinSet::new(), None)
+        };
+    if let Some(blob_tasks) = &blob_tasks {
+        blob_tasks.done();
+    }
     lore_debug!(
         "Collecting fragments, from file metadata {from_file_metadata_block_len} blocks, to file metadata new {to_file_metadata_block_len} blocks -> {} new blocks",
         new_file_metadata_block_address.len()
@@ -12893,26 +12972,36 @@ pub async fn collect_fragments(
     lore_debug!("Collected {} new addresses from state", fragments.len());
 
     // Add branch metadata
-    if let Ok((_current_revision, current_branch)) =
-        crate::instance::load_current_anchor(&repository).await
-        && let Ok(metadata_hash) = branch::metadata_hash(repository.clone(), current_branch).await
-    {
-        let metadata_fragments = collect_new_addresses(
-            repository.clone(),
-            &[Address::zero_context_hash(metadata_hash)],
-            collection,
-            tracker,
-        )
+    let branch_metadata_fragments = tracker
+        .time_step(CollectStep::BranchMetadata, async {
+            let (_current_revision, current_branch) =
+                crate::instance::load_current_anchor(&repository)
+                    .await
+                    .ok()?;
+            let metadata_hash = branch::metadata_hash(repository.clone(), current_branch)
+                .await
+                .ok()?;
+            Some(
+                collect_new_addresses(
+                    repository.clone(),
+                    &[Address::zero_context_hash(metadata_hash)],
+                    collection,
+                    tracker.clone(),
+                )
+                .await,
+            )
+        })
         .await;
-        if let Ok(mut metadata_fragments) = metadata_fragments {
+    match branch_metadata_fragments {
+        Some(Ok(mut metadata_fragments)) => {
             lore_debug!(
                 "Collected {} new addresses from branch metadata",
                 metadata_fragments.len()
             );
             fragments.append(&mut metadata_fragments);
-        } else {
-            failure = failure.or(metadata_fragments.err());
         }
+        Some(Err(err)) => failure = failure.or(Some(err)),
+        None => (),
     }
 
     // Collect new file node fragments
