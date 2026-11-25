@@ -804,11 +804,10 @@ LINK_MOVES = {
 }
 
 
-#: Two links reaching one repository: nested in two linked repositories, held by the main
-#: repository twice, or held by it at two folders of the repository.
+#: Two links reaching one repository: nested in two linked repositories, or held by the main
+#: repository at two folders of the repository.
 LINKS_TO_ONE_REPOSITORY = {
     "nested": ("vendor/b/deps/d", "vendor/c/deps/d"),
-    "top-level": ("libs/d", "libs/d-again"),
     "subtrees": ("libs/a", "libs/b"),
 }
 

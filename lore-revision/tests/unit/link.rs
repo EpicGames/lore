@@ -1777,7 +1777,7 @@ async fn a_commit_refuses_a_staged_revision_lacking_a_folder_another_mount_expos
 
             for state in [top_level, nested] {
                 let refused =
-                    lore_revision::commit::reject_unmovable_link_mounts(&repository, &state)
+                    lore_revision::commit::reject_unmovable_link_mounts(&repository, &state, None)
                         .await
                         .expect_err("bar is gone from the staged revision");
                 assert!(refused.is_invalid_arguments(), "{refused:?}");

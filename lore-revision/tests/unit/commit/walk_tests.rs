@@ -160,6 +160,46 @@ async fn a_commit_from_a_mount_takes_the_staged_content_outside_it() {
     .expect("Test task failed");
 }
 
+/// A commit from two mounts of one linked tree commits the file staged under each from the working
+/// tree, once each, and a commit from two mounts of one subtree is refused.
+#[tokio::test]
+async fn a_commit_from_several_mounts_commits_each_once() {
+    let dir = lore_base::test_util::TempDir::new("lore-commit-walk-several-mounts-");
+    let root = dir.to_path_buf();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Making test stores");
+
+    lore_spawn!(LORE_CONTEXT.scope(execution, async move {
+        let fixture = WalkFixture::new(root, immutable_store, mutable_store).await;
+        let assets = fixture.add(ROOT_NODE, directory("assets"), "assets").await;
+        let config = fixture.add(ROOT_NODE, directory("config"), "config").await;
+        let in_assets = fixture.file_at_mount(assets, "a/lib", "a.bin").await;
+        let in_config = fixture.file_at_mount(config, "b/lib", "b.bin").await;
+
+        let shared = fixture
+            .commit_from_mounts(&[("a/lib", assets), ("c/lib", assets)])
+            .await
+            .expect_err("two mounts of one subtree must be refused");
+        assert!(shared.is_invalid_arguments(), "{shared:?}");
+        fixture
+            .commit_from_mounts(&[("a/lib", assets), ("b/lib", config)])
+            .await
+            .expect("The commit must take each mount from the working tree");
+
+        for committed in [in_assets, in_config] {
+            let node = fixture.node(committed).await;
+            assert!(!node.address.is_zero() && !node.is_staged());
+        }
+        assert_eq!(
+            fixture.stats.complete.file_count.load(Ordering::Relaxed),
+            2,
+            "each file must be committed once"
+        );
+    }))
+    .await
+    .expect("Test task failed");
+}
+
 /// Outside a link's mount the commit refuses an unresolved conflict, a file or a link whose
 /// content is not stored yet, which only a working tree could supply, and the deletion of a
 /// directory holding the mount.
@@ -310,12 +350,18 @@ impl WalkFixture {
 
     /// Stages `a.bin` in `mounted` with no content stored, as a file staged from the working tree
     /// is, and writes it to the working tree at the mount `linked/repo`.
-    #[allow(clippy::disallowed_methods)] // A test fixture in its own temporary directory.
     async fn mounted_file(&self, mounted: NodeID) -> NodeID {
-        let mount = self.root.join("linked/repo");
+        self.file_at_mount(mounted, "linked/repo", "a.bin").await
+    }
+
+    /// Stages `name` in `mounted` with no content stored, as a file staged from the working tree
+    /// is, and writes it to the working tree at `mount`.
+    #[allow(clippy::disallowed_methods)] // A test fixture in its own temporary directory.
+    async fn file_at_mount(&self, mounted: NodeID, mount: &str, name: &str) -> NodeID {
+        let mount = self.root.join(mount);
         std::fs::create_dir_all(&mount).expect("creating the mount");
-        std::fs::write(mount.join("a.bin"), b"0123456789").expect("writing the mounted file");
-        self.add(mounted, file("a.bin"), "a.bin").await
+        std::fs::write(mount.join(name), b"0123456789").expect("writing the mounted file");
+        self.add(mounted, file(name), name).await
     }
 
     /// A walk of the fixture's tree, over an operation on its working tree.
@@ -339,12 +385,20 @@ impl WalkFixture {
 
     /// Commits the tree from `mounted`, the subtree a link mounts at `linked/repo`.
     async fn commit_from_mount(&self, mounted: NodeID) -> Result<(), CommitError> {
+        self.commit_from_mounts(&[("linked/repo", mounted)]).await
+    }
+
+    /// Commits the tree from each of `mounts`, a subtree and the path a link mounts it at.
+    async fn commit_from_mounts(&self, mounts: &[(&str, NodeID)]) -> Result<(), CommitError> {
         let (walk, file_rx) = self.commit_walk().await;
+        let roots: Vec<_> = mounts
+            .iter()
+            .map(|(path, node)| (RelativePath::from_str(path).expect("a valid path"), *node))
+            .collect();
         commit_walks(
             walk,
             file_rx,
-            RelativePath::from_str("linked/repo").expect("a valid path"),
-            mounted,
+            &roots,
             BasedOn::FirstParent,
             Arc::new(RecordedModifiedTimes::below(0)),
             false,
@@ -387,6 +441,7 @@ impl WalkFixture {
             tracker: Arc::new(WriteTracker::new()),
             dir_semaphore: Arc::new(Semaphore::new(0)),
             root: ROOT_NODE,
+            roots: Arc::new([(RelativePath::new(), ROOT_NODE)]),
             committed_links: Arc::default(),
             link_commits: Arc::default(),
         });

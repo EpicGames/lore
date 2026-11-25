@@ -2680,10 +2680,12 @@ back to a repository the merge is already inside is left out. A repository sever
 is merged once, and every one of them pins the result. That needs the links to pin it at one
 revision on one branch, and its merge to be free of conflicts; otherwise the merge is refused
 before it writes anything. A link the merged branch adds to such a repository is still merged on
-its own. A commit commits a staged linked revision only a merge staged once for all the links
-pinning it, which therefore take one per-link message. Before it writes anything, it refuses
-changes made in the working tree under several links to one repository, two staged revisions of
-one repository on one branch, and a commit of one of the links alone.
+its own. A commit commits a staged linked revision once for all the links pinning it, which
+therefore take one per-link message, reading the working tree under every mount of it the
+repository holding them has. Before it writes anything, it refuses two staged revisions of one
+repository on one branch, and changes made in the working tree under links to one repository that
+different repositories hold. A repository mounts each folder of a linked repository once, so the
+working tree holds each linked file at one path.
 
 A link's row, its pin, the branch it follows, its flags and the folder it mounts, is merged
 three ways against the common ancestor. A row only the merged branch changed lands whole. A
@@ -2702,8 +2704,8 @@ By default, committing and merging in Lore cascade through the parent and any li
 repositories that have changes. Two operations are scoped to a single link:
 
 - *Link-scoped committing.* `commit --link <path>` commits staged changes in one
-  linked repository only, advancing that link's pin in the parent's staged state
-  without touching the parent's other links or content. The parent itself is not
+  linked repository only, under every mount of it, advancing the pin of every mount in
+  the parent's staged state without touching the parent's other links or content. The parent itself is not
   committed; the new pin shows up in the parent's next revision. This is useful when
   resolving conflicts in one linked repository, or when making incremental progress
   on a link before committing at the parent level.

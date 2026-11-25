@@ -4,7 +4,7 @@
 pins the same revision."""
 
 import pytest
-from error_types import ImproperArgumentsError, LocalChanges, NotSupportedError
+from error_types import ImproperArgumentsError, LocalChanges
 from link_helpers import assert_link_holds, make_repo
 from lore_parsers import parse_jsonl
 from test_utils import status_by_path, unstaged_entries, working_tree_files
@@ -23,8 +23,6 @@ LINKED_FILES = {
 FOO = "a/lib"
 BAR = "b/lib"
 BAZ = "c/lib"
-FOO_AGAIN = "d/lib"
-FOO_THIRD = "e/lib"
 
 
 def _mapped(new_lore_repo) -> tuple[Lore, Lore]:
@@ -76,38 +74,35 @@ def test_mapped_link_added_later_joins_the_pin_of_its_mounts(new_lore_repo):
 
 @pytest.mark.smoke
 def test_mapped_link_commit_through_one_mount_moves_every_mount(new_lore_repo):
-    """On a branch created over the mounts, a commit of a change staged under one mount pins the
-    revision it commits at every mount and shows the change at another mount of the same folder,
-    where a commit of that mount alone is refused; the pushed revision clones and verifies with
-    every mount, and main keeps its pin."""
+    """On a branch created over the mounts, a commit of one mount alone pins the revision it
+    commits at every mount; the pushed revision clones and verifies with every mount, and main
+    keeps its pin."""
     parent, linked = _mapped(new_lore_repo)
-    parent.link_add(FOO_AGAIN, linked.get_id(), "/foo")
-    parent.commit("Mount foo again")
+    parent.link_add(BAZ, linked.get_id(), "/baz")
+    parent.commit("Mount baz")
     parent.push()
     pinned = _pins(parent)[FOO]
 
     parent.branch_create("feature")
     branched = _pins(parent)[FOO]
-    assert _pins(parent) == {FOO: branched, BAR: branched, FOO_AGAIN: branched}
+    assert _pins(parent) == {FOO: branched, BAR: branched, BAZ: branched}
     parent.write_files({f"{FOO}/f1.txt": "edited through a\n"})
     parent.stage([f"{FOO}/f1.txt"])
-    with pytest.raises(NotSupportedError):
-        parent.commit("Edit through one mount alone", link=FOO)
-    parent.commit("Edit through one mount")
+    parent.commit("Edit through one mount alone", link=FOO)
+    parent.commit("Pin every mount")
     parent.push()
 
     committed = _pins(parent)[FOO]
-    mounts = {FOO: committed, BAR: committed, FOO_AGAIN: committed}
+    mounts = {FOO: committed, BAR: committed, BAZ: committed}
     assert _pins(parent) == mounts
     assert committed not in (pinned, branched)
-    assert_link_holds(parent, FOO_AGAIN, {"f1.txt": "edited through a\n"})
     parent.repository_verify()
     clone = parent.clone(branch="feature")
     assert _pins(clone) == mounts
     assert_link_holds(clone, FOO, {"f1.txt": "edited through a\n"})
     assert_link_holds(clone, BAR, {"b1.txt": "bar 1\n"})
     parent.branch_switch("main")
-    assert _pins(parent) == {FOO: pinned, BAR: pinned, FOO_AGAIN: pinned}
+    assert _pins(parent) == {FOO: pinned, BAR: pinned, BAZ: pinned}
 
 
 @pytest.mark.smoke
@@ -179,46 +174,6 @@ def test_mapped_link_stage_unstage_and_dirty_pin_one_revision(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_mapped_link_folder_mounted_three_times(new_lore_repo):
-    """An edit through one of three mounts of one folder stays marked dirty where another copy is
-    unchanged. A commit of it that the third mount refuses to realize leaves the second copy
-    and the linked branch as they were, so a push publishes nothing of the linked repository, and
-    the commit goes through once the third mount's local change is gone."""
-    parent, linked = _mapped(new_lore_repo)
-    for mount in (FOO_AGAIN, FOO_THIRD):
-        parent.link_add(mount, linked.get_id(), "/foo")
-    parent.commit("Mount foo twice more")
-    parent.push()
-    pinned = _pins(parent)[FOO]
-    parent.write_files({f"{FOO}/f1.txt": "edited through a\n"})
-    parent.dirty([f"{FOO}/f1.txt", f"{FOO_AGAIN}/f1.txt"])
-
-    assert f"{FOO}/f1.txt" in status_by_path(parent, check_dirty=True)
-    assert f"{FOO}/f1.txt" in status_by_path(parent)
-
-    parent.stage([f"{FOO}/f1.txt"])
-    parent.write_files({f"{FOO_THIRD}/f1.txt": "edited through e\n"})
-    with pytest.raises(LocalChanges):
-        parent.commit("Edit through one mount")
-    with parent.open_file(f"{FOO_AGAIN}/f1.txt") as foo:
-        assert foo.read() == "foo 1\n"
-    parent.push()
-    linked.sync()
-    assert linked.branch_info().local_latest == pinned
-
-    parent.write_files({f"{FOO_THIRD}/f1.txt": "foo 1\n"})
-    parent.commit("Edit through one mount")
-    parent.push()
-    linked.sync()
-    committed = linked.branch_info().local_latest
-    mounts = (FOO, BAR, FOO_AGAIN, FOO_THIRD)
-    assert _pins(parent) == dict.fromkeys(mounts, committed)
-    assert linked.revision_info(committed).parent == pinned
-    with parent.open_file(f"{FOO_AGAIN}/f1.txt") as foo:
-        assert foo.read() == "edited through a\n"
-
-
-@pytest.mark.smoke
 def test_mapped_link_change_in_a_nested_link_moves_the_mount_holding_it(new_lore_repo):
     """A change staged in a repository linked inside one of two mounts, staged with a path through
     the other mount, moves the mount holding it, which commits it, and leaves the other mount at
@@ -249,3 +204,115 @@ def test_mapped_link_change_in_a_nested_link_moves_the_mount_holding_it(new_lore
     clone = parent.clone()
     with clone.open_file(f"{BAR}/nested/n1.txt") as edited:
         assert edited.read() == "edited in the nested link\n"
+
+
+EDITED_THROUGH_BOTH = {
+    f"{FOO}/f1.txt": "edited through a\n",
+    f"{BAR}/b1.txt": "edited through b\n",
+}
+
+
+@pytest.mark.smoke
+def test_mapped_link_commit_of_edits_under_two_mounts_commits_them_once(new_lore_repo):
+    """Changes staged under two mounts commit as one revision of the linked repository holding
+    both, which every mount pins and a clone holds: an edit, and a staged edit gone from the
+    working tree, which commits as deleted."""
+    parent, linked = _mapped(new_lore_repo)
+    pinned = _pins(parent)[FOO]
+    parent.write_files(EDITED_THROUGH_BOTH)
+    parent.stage(list(EDITED_THROUGH_BOTH))
+    parent.remove_file(f"{BAR}/b1.txt")
+
+    parent.commit("Edit through both mounts")
+    parent.push()
+
+    linked.sync()
+    committed = linked.branch_info().local_latest
+    assert _pins(parent) == {FOO: committed, BAR: committed}
+    assert linked.revision_info(committed).parent == pinned
+    clone = parent.clone()
+    assert_link_holds(clone, FOO, {"f1.txt": "edited through a\n"})
+    assert_link_holds(clone, BAR, {})
+
+
+@pytest.mark.smoke
+def test_mapped_link_commit_of_one_mount_commits_every_mount(new_lore_repo):
+    """A commit of one mount alone commits the edits staged under every mount as one revision,
+    which every mount pins. A commit of the other mount alone then records a deletion on top of
+    it, and a commit of the parent continues the same line of the linked branch."""
+    parent, linked = _mapped(new_lore_repo)
+    pinned = _pins(parent)[FOO]
+    parent.write_files(EDITED_THROUGH_BOTH)
+    parent.stage(list(EDITED_THROUGH_BOTH))
+
+    parent.commit("Edit through both mounts", link=FOO)
+    first = _pins(parent)[FOO]
+    assert _pins(parent) == {FOO: first, BAR: first}
+    parent.remove_file(f"{BAR}/b1.txt")
+    parent.stage([f"{BAR}/b1.txt"])
+    parent.commit("Delete a file through one mount", link=BAR)
+    second = _pins(parent)[BAR]
+    assert _pins(parent) == {FOO: second, BAR: second}
+    parent.write_files({f"{BAR}/b2.txt": "added through b\n"})
+    parent.stage([f"{BAR}/b2.txt"])
+    parent.commit("Add through one mount")
+    parent.push()
+
+    linked.sync()
+    third = linked.branch_info().local_latest
+    assert _pins(parent) == {FOO: third, BAR: third}
+    parents = [
+        linked.revision_info(revision).parent for revision in (first, second, third)
+    ]
+    assert parents == [pinned, first, second]
+    clone = parent.clone()
+    assert_link_holds(clone, FOO, {"f1.txt": "edited through a\n"})
+    assert_link_holds(clone, BAR, {"b2.txt": "added through b\n"})
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("link", [None, f"{FOO}/nested"])
+def test_mapped_link_commit_of_a_repository_linked_under_two_mounts(
+    new_lore_repo, link
+):
+    """Edits staged in a repository that the linked repository links under both of its mounts
+    commit as one revision of it, which both of its mounts pin, whether the commit is of the
+    parent or of one of the nested links alone."""
+    nested = make_repo(
+        new_lore_repo, {"x/n1.txt": "x\n", "y/n2.txt": "y\n"}, "Nested initial"
+    )
+    nested_pinned = nested.branch_info().local_latest
+    linked = make_repo(new_lore_repo, LINKED_FILES, "Linked initial")
+    linked.link_add("foo/nested", nested.get_id(), "/x")
+    linked.link_add("bar/nested", nested.get_id(), "/y")
+    linked.commit("Link the nested repository twice")
+    linked.push()
+    parent = make_repo(new_lore_repo, {"README.txt": "baseline\n"}, "Baseline")
+    parent.link_add(FOO, linked.get_id(), "/foo")
+    parent.link_add(BAR, linked.get_id(), "/bar")
+    parent.commit("Mount the linked repository twice")
+    parent.push()
+    edits = {
+        f"{FOO}/nested/n1.txt": "edited through a\n",
+        f"{BAR}/nested/n2.txt": "edited through b\n",
+    }
+    parent.write_files(edits)
+    parent.stage(list(edits))
+
+    if link:
+        parent.commit("Edit the nested repository alone", link=link)
+    parent.commit("Edit the nested repository")
+    parent.push()
+
+    nested.sync()
+    committed = nested.branch_info().local_latest
+    assert nested.revision_info(committed).parent == nested_pinned
+    linked.sync()
+    assert _pins(linked) == {"foo/nested": committed, "bar/nested": committed}
+    linked_latest = linked.branch_info().local_latest
+    assert {mount: _pins(parent)[mount] for mount in (FOO, BAR)} == dict.fromkeys(
+        (FOO, BAR), linked_latest
+    )
+    clone = parent.clone()
+    assert_link_holds(clone, f"{FOO}/nested", {"n1.txt": "edited through a\n"})
+    assert_link_holds(clone, f"{BAR}/nested", {"n2.txt": "edited through b\n"})

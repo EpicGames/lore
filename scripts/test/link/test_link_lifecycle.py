@@ -725,10 +725,10 @@ def test_link_with_url(new_lore_repo):
     link_repo = new_lore_repo()
 
     # Generate content in the link repository
-    link_file = "data/content.txt"
-    link_repo.make_dirs(os.path.dirname(link_file))
-    with link_repo.open_file(link_file, "w+") as output_file:
-        output_file.writelines(["Content from linked repository\n"])
+    for link_file in ("data/content.txt", "more/content.txt"):
+        link_repo.make_dirs(os.path.dirname(link_file))
+        with link_repo.open_file(link_file, "w+") as output_file:
+            output_file.writelines(["Content from linked repository\n"])
 
     link_repo.stage(scan=True)
     link_repo.commit("Initial content")
@@ -754,7 +754,7 @@ def test_link_with_url(new_lore_repo):
     # Test 2: Use remote URL with repo ID appended instead of repository name
     url_with_repo_id = f"{base_url}/{link_repo_id}"
     link_path_repo_url = "link_by_repo_id_url"
-    repo.link_add(link_path_repo_url, url_with_repo_id, "data")
+    repo.link_add(link_path_repo_url, url_with_repo_id, "more")
 
     # Verify the link was created and files are accessible
     expected_file_repo_url = os.path.join(link_path_repo_url, "content.txt")

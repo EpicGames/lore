@@ -511,11 +511,17 @@ def test_link_branch_create_reports_each_mount_of_same_repo(new_lore_repo):
     parent.write_commit_push("Initial parent", {"parent.txt": "parent content\n"})
 
     link_repo: Lore = new_lore_repo()
-    link_repo.write_commit_push("Initial link", {"linked.txt": "linked content\n"})
+    link_repo.write_commit_push(
+        "Initial link",
+        {
+            "first/linked.txt": "linked content\n",
+            "second/linked.txt": "linked content\n",
+        },
+    )
 
     mounts = ["vendor/first", "vendor/second"]
     for mount in mounts:
-        parent.link_add(mount, link_repo.get_id(), "/")
+        parent.link_add(mount, link_repo.get_id(), "/" + mount.rsplit("/", 1)[1])
         parent.commit(f"Add link at {mount}")
         parent.push()
 
@@ -1176,22 +1182,64 @@ def make_parent_reaching_shared_twice(new_lore_repo) -> tuple[Lore, Lore]:
 
 
 @pytest.mark.smoke
-def test_link_push_of_diverged_revisions_of_one_branch_pushes_nothing(new_lore_repo):
-    """Edits made through two mounts of one linked branch, each on the revision
-    its mount pins, are diverged revisions of that branch: the push fails as a
-    diverged link before it pushes either."""
+@pytest.mark.parametrize("link", [None, "second/shared"])
+def test_link_commit_onto_a_linked_branch_moved_since_its_pin_is_refused(
+    new_lore_repo, link
+):
+    """An edit made through a mount pinning a revision its linked branch has moved on from fails
+    the commit, of the parent or of the link alone, as advanced, leaving the branch at the revision
+    the other mount committed, which a push publishes. Forced, the commit stores its revision over
+    the branch's latest, a diverged revision of it, which a push refuses."""
     parent, shared = make_parent_reaching_shared_twice(new_lore_repo)
-    pushed = shared.branch_info().remote_latest
-    for name in ("first", "second"):
-        mounted_file = f"{name}/shared/{name}-edit.txt"
-        parent.write_files({mounted_file: f"edited through {name}\n"})
-        parent.stage(mounted_file)
-        parent.commit(f"Edit the shared repository through {name}")
+    parent.write_files({"first/shared/first-edit.txt": "edited through first\n"})
+    parent.stage("first/shared/first-edit.txt")
+    parent.commit("Edit the shared repository through first")
+    committed = link_pin_at(parent, "first/shared")
+    parent.write_files({"second/shared/second-edit.txt": "edited through second\n"})
+    parent.stage("second/shared/second-edit.txt")
 
+    with pytest.raises(LoreException) as refused:
+        parent.commit("Edit the shared repository through second", link=link)
+
+    assert refused.value.returncode == 41, "the commit exits with BranchAdvanced"
+    parent.push()
+    shared.sync()
+    assert shared.branch_info().local_latest == committed
+
+    parent.commit("Edit the shared repository through second", link=link, force=True)
+    assert link_pin_at(parent, "second/shared") != committed
     with pytest.raises(LinkDivergedError):
         parent.push()
 
-    assert shared.branch_info().remote_latest == pushed
+
+@pytest.mark.smoke
+def test_link_merge_brings_a_mount_up_to_its_linked_branch(new_lore_repo):
+    """A merge of its branch into a mount whose linked branch moved on from its pin, through
+    another mount, commits the merge, and an edit made under the mount then commits on top of it,
+    which a push publishes."""
+    parent, shared = make_parent_reaching_shared_twice(new_lore_repo)
+    parent.write_files({"first/shared/first-edit.txt": "edited through first\n"})
+    parent.stage("first/shared/first-edit.txt")
+    parent.commit("Edit the shared repository through first")
+    parent.push()
+    parent.write_files({"second/shared/second-edit.txt": "edited through second\n"})
+
+    parent.branch_merge_start(
+        "main", link="second/shared", message="Merge main into second"
+    )
+    parent.stage("second/shared/second-edit.txt")
+    parent.commit("Edit the shared repository through second")
+    parent.push()
+
+    assert_link_holds(
+        parent.clone(),
+        "second/shared",
+        {
+            "shared.txt": "shared content\n",
+            "first-edit.txt": "edited through first\n",
+            "second-edit.txt": "edited through second\n",
+        },
+    )
 
 
 @pytest.mark.smoke
@@ -1578,10 +1626,12 @@ def test_link_branch_archive_repository_linked_twice(new_lore_repo):
     link_repo: Lore = new_lore_repo(repo.name + "_link")
 
     repo.write_commit_push(None, {"main.txt": b"main content"})
-    link_repo.write_commit_push(None, {"link.txt": b"link content"})
+    link_repo.write_commit_push(
+        None, {"first/link.txt": b"link content", "second/link.txt": b"link content"}
+    )
 
-    repo.link_add("first", link_repo.get_id(), "/")
-    repo.link_add("second", link_repo.get_id(), "/")
+    repo.link_add("first", link_repo.get_id(), "/first")
+    repo.link_add("second", link_repo.get_id(), "/second")
     repo.commit("add links")
     repo.push()
 

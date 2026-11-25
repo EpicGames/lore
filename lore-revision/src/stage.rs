@@ -334,11 +334,10 @@ pub struct StageOptions {
 pub(crate) async fn process_link_updates(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
-    state_current: Arc<State>,
     state: Arc<State>,
     link_tracker: Arc<link::LinkTracker>,
 ) -> Result<(), StageError> {
-    link::drain_link_tracker(repository, token, state_current, state, &link_tracker, true)
+    link::drain_link_tracker(repository, token, state, &link_tracker, true)
         .await
         .forward::<StageError>("Failed to update link")
 }

@@ -328,14 +328,7 @@ pub async fn add(
         link.clone(),
         resolved_source_path,
         crate::node::INVALID_NODE,
-        Some((
-            LinkReference {
-                branch: stored_branch,
-                flags: link_flags.into(),
-                ..Default::default()
-            },
-            current_branch,
-        )),
+        link::SameFolder::Refuse,
     )
     .await
     .forward::<LinkError>("Failed checking link source paths")?;

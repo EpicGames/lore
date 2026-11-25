@@ -1475,8 +1475,7 @@ pub(crate) async fn repin_staged_mounts(
 
 /// Selects the mounts a change to `linked`, the state its mounts share, moves: those of `holding`,
 /// and those pinning the revision it was opened at where that is uncommitted. The others keep the
-/// committed pin until a commit moves them, as a commit refuses two mounts pinning one revision that
-/// holds a change made through the working tree.
+/// committed pin until a commit moves them.
 #[lore_macro::test_pub]
 pub(crate) fn sharing_mounts<'a>(
     linked: &State,
@@ -2103,7 +2102,6 @@ async fn drain_promoted_moves(
 pub async fn drain_link_tracker(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
-    state_current: Arc<State>,
     state: Arc<State>,
     link_tracker: &LinkTracker,
     mark_staged: bool,
@@ -2190,23 +2188,10 @@ pub async fn drain_link_tracker(
             )
             .await?;
 
-        // Parent-self is the committed pin for the top level, else the staged pin.
-        let parent_signature = if link_context.parent_repository_id == repository.id {
-            state_current
-                .link_find(
-                    repository.clone(),
-                    link_context.link_repository_id,
-                    link_context.link_node_id,
-                )
-                .await
-                .map_or(staged_ref.signature, |reference| reference.signature)
-        } else {
-            staged_ref.signature
-        };
-
+        let linked_state = &link_context.link_state;
+        let parent_signature = linked_state.committed_revision();
         lore_debug!("Setting link parent to {}", parent_signature);
 
-        let linked_state = &link_context.link_state;
         let linked_repository = parent_repository
             .to_link_context(link_context.link_repository_id)
             .await;
@@ -3031,14 +3016,9 @@ pub async fn describe_link(
     })
 }
 
-/// Two mounts of one repository whose source subtrees strictly nest place the
-/// same content at both mount paths under separate pins, so an edit through one
-/// is invisible to the other and whichever mount the stage walk reaches last
-/// decides the content. Identical subtrees resolve to one shared linked state
-/// and advance together, so they are left alone.
-///
-/// Rejects an incoming mount whose source subtree nests with one `state_target`
-/// already holds, or with another mount arriving in the same set of changes.
+/// Rejects an incoming mount whose source subtree nests with one `state_target` already holds, or
+/// with another mount arriving in the same set of changes. A mount of the same folder is left to
+/// the merge: one moving a link holds the mount it removes beside the one it adds.
 ///
 /// Runs before realization: the realize loop clones a mount's content and stages
 /// its node before the registry write that would reject it, so rejecting there
@@ -3073,12 +3053,12 @@ pub async fn check_incoming_mount_overlaps(
             link_context,
             source_path.clone(),
             change.from.mapping.node,
-            None,
+            SameFolder::Allow,
         )
         .await?;
 
         if let Some((_, other)) = incoming.iter().find(|(other_id, other_path)| {
-            *other_id == link_id && source_paths_nest(&source_path, other_path)
+            *other_id == link_id && SameFolder::Allow.overlap(&source_path, other_path)
         }) {
             return Err(InvalidArguments {
                 reason: format!(
@@ -3097,28 +3077,39 @@ pub async fn check_incoming_mount_overlaps(
     Ok(())
 }
 
-/// Whether two source subtrees overlap without being the same subtree.
-///
-/// Compared case-insensitively: the two paths are read from the revisions their
-/// own mounts pin, so a case-only rename between those revisions leaves one
-/// spelling of a subtree both still address.
-pub fn source_paths_nest(left: &RelativePath, right: &RelativePath) -> bool {
-    left.as_lowercase_str() != right.as_lowercase_str() && left.overlaps_ignore_case(right)
+/// Whether [`check_source_path_overlap`] refuses a mount of the same folder as another.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SameFolder {
+    Refuse,
+    Allow,
 }
 
+impl SameFolder {
+    /// Whether two source subtrees overlap as this refuses. Compared case-insensitively: the two
+    /// paths are read from the revisions their own mounts pin, so a case-only rename between
+    /// those revisions leaves one spelling of a subtree both still address.
+    fn overlap(self, left: &RelativePath, right: &RelativePath) -> bool {
+        left.overlaps_ignore_case(right)
+            && (self == Self::Refuse || left.as_lowercase_str() != right.as_lowercase_str())
+    }
+}
+
+/// Refuses `source_path` of the repository of `link_context` where another mount of it in `state`
+/// exposes a folder inside or above it, or, unless `same_folder` allows it, the same folder: the
+/// working tree would hold the nodes they share twice, and a commit can read each of them from
+/// only one place.
+///
 /// `source_path` must be the path as stored in the linked repository, so that it
 /// compares directly against what the existing mounts resolve to.
 /// `exclude_node` is the mount being written, which must not be compared against
-/// itself. With `row`, the row the mount is to hold under a parent on the given
-/// branch, a mount of the same folder also has to resolve to the same branch with
-/// the same flags, since both expose one subtree.
+/// itself.
 pub async fn check_source_path_overlap(
     state: &State,
     repository: Arc<RepositoryContext>,
     link_context: Arc<RepositoryContext>,
     source_path: RelativePath,
     exclude_node: NodeID,
-    row: Option<(LinkReference, BranchId)>,
+    same_folder: SameFolder,
 ) -> Result<(), StateError> {
     let link_list = state
         .link_list(repository.clone())
@@ -3141,13 +3132,7 @@ pub async fn check_source_path_overlap(
 
         let mounted_source = pinned_source_path(link_context.clone(), &link_node).await?;
 
-        let disagrees = source_path.as_lowercase_str() == mounted_source.as_lowercase_str()
-            && row.is_some_and(|(row, parent_branch)| {
-                row.flags != link_reference.flags
-                    || row.resolve_branch(parent_branch)
-                        != link_reference.resolve_branch(parent_branch)
-            });
-        if !disagrees && !source_paths_nest(&source_path, &mounted_source) {
+        if !same_folder.overlap(&source_path, &mounted_source) {
             continue;
         }
 
@@ -3155,18 +3140,6 @@ pub async fn check_source_path_overlap(
             .node_path(repository.clone(), link_reference.local_node)
             .await
             .forward::<StateError>("Failed resolving link node")?;
-
-        if disagrees {
-            return Err(InvalidArguments {
-                reason: format!(
-                    "source path {} is already mounted at {} on another branch or with other \
-                     flags; mounts of the same folder have to agree on both",
-                    display_path(source_path.as_str()),
-                    display_path(&link_path),
-                ),
-            }
-            .into());
-        }
 
         return Err(InvalidArguments {
             reason: format!(

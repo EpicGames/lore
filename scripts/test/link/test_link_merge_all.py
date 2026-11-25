@@ -3209,7 +3209,7 @@ def test_link_merge_all_merges_a_repository_two_links_reach_once(new_lore_repo, 
 def test_link_merge_abort_of_a_repository_two_links_reach(new_lore_repo):
     """An abort of a merge that pins two links at one merge of their repository restores both
     links' pins and mounts."""
-    shape = "top-level"
+    shape = "subtrees"
     urc, _, _ = links_to_one_repository(new_lore_repo, shape)
     mounts = LINKS_TO_ONE_REPOSITORY[shape]
     diverge_one_repository_two_links_reach(urc, shape, a_conflict=True)
@@ -3223,8 +3223,8 @@ def test_link_merge_abort_of_a_repository_two_links_reach(new_lore_repo):
 
     assert [link_pin_at(urc, mount) for mount in mounts] == pins
     assert parse_status_json(urc.status(json=True)) == []
-    for mount in mounts:
-        assert_link_holds(urc, mount, {"d.txt": "base\n", "main.txt": "main\n"})
+    assert_link_holds(urc, mounts[0], {"d.txt": "base\n", "main.txt": "main\n"})
+    assert_link_holds(urc, mounts[1], {"d.txt": "base\n"})
 
 
 @pytest.mark.smoke
@@ -3288,44 +3288,20 @@ def test_link_merge_all_of_a_repository_two_links_reach_takes_one_message_for_bo
 
 
 @pytest.mark.smoke
-@pytest.mark.parametrize("shape", ["subtrees", "top-level"])
-def test_link_commit_of_edits_under_two_links_to_one_repository_is_refused(
-    new_lore_repo, shape
-):
-    """A commit of edits staged under two links to one repository, at one pin, is refused before
-    it writes anything: both edits stay staged, and a push leaves every branch as it was."""
-    urc, d, _ = links_to_one_repository(new_lore_repo, shape)
-    first, second = LINKS_TO_ONE_REPOSITORY[shape]
-    edits = {f"{first}/d.txt": "first\n", f"{second}/second.txt": "second\n"}
-    urc.write_files(edits)
-    urc.stage(list(edits))
-    latests = [urc.branch_info().remote_latest, d.branch_info("main").remote_latest]
-
-    with pytest.raises(NotSupportedError):
-        urc.commit("Edit d through both links")
-
-    assert set(edits) <= {entry["path"] for entry in parse_status_json(urc.status(json=True))}
-    urc.push()
-    assert [urc.branch_info().remote_latest, d.branch_info("main").remote_latest] == latests
-
-
-@pytest.mark.smoke
-def test_link_commit_of_one_link_to_a_repository_two_links_reach_is_refused(new_lore_repo):
-    """A commit of one link alone, of two links that pin one merge of their repository, is
-    refused, and the commit of the whole merge commits the repository once for both."""
-    shape = "top-level"
+def test_link_commit_of_one_link_to_a_repository_two_links_reach_commits_both(new_lore_repo):
+    """A commit of one link alone, of two links that pin one merge of their repository, commits
+    the merge once, which both links pin."""
+    shape = "subtrees"
     urc, d, _ = links_to_one_repository(new_lore_repo, shape)
     first, second = LINKS_TO_ONE_REPOSITORY[shape]
     diverge_one_repository_two_links_reach(urc, shape)
     d_main = d.branch_info("main").remote_latest
     urc.branch_merge_start("feature", message="Merge feature", no_commit=True)
 
-    with pytest.raises(NotSupportedError):
-        urc.commit("Merge d alone", link=first)
-    assert d.branch_info("main").remote_latest == d_main
-
+    urc.commit("Merge d alone", link=first)
     urc.commit("Merge feature")
     urc.push()
+
     d.branch_switch("main")
     merged = d.revision_info()
     assert merged.merge.split()[0] == d_main

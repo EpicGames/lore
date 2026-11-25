@@ -353,7 +353,6 @@ async fn unstage_parent(
         process_link_unstage_updates(
             repository.clone(),
             token,
-            state_current.clone(),
             state_staged.clone(),
             link_tracker.clone(),
         )
@@ -462,7 +461,6 @@ async fn unstage_from_layer(
     process_link_unstage_updates(
         layer_state.repository.clone(),
         token,
-        layer_state.state_current.clone(),
         layer_state.state_staged.clone(),
         link_tracker,
     )
@@ -1675,20 +1673,12 @@ async fn unstage_replacement(
 async fn process_link_unstage_updates(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
-    state_current: Arc<State>,
     state_staged: Arc<State>,
     link_tracker: Arc<LinkTracker>,
 ) -> Result<(), UnstageError> {
-    link::drain_link_tracker(
-        repository,
-        token,
-        state_current,
-        state_staged,
-        &link_tracker,
-        false,
-    )
-    .await
-    .forward::<UnstageError>("Failed to unstage link nodes")
+    link::drain_link_tracker(repository, token, state_staged, &link_tracker, false)
+        .await
+        .forward::<UnstageError>("Failed to unstage link nodes")
 }
 
 /// Puts the pin and the mounted node of `current`, the current revision's link, back on `node`, the

@@ -1073,7 +1073,6 @@ pub async fn stage(
         stage::process_link_updates(
             repository.clone(),
             token,
-            state_current.clone(),
             state.clone(),
             link_tracker.clone(),
         )

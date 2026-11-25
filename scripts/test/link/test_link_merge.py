@@ -346,18 +346,24 @@ def _link_holding_a_link_added_on_branch(
     feature_edit: str,
     linked_main_edit: dict,
     mounts: dict[str, str] | None = None,
-    inner_mounts: tuple[str, ...] = ("deps/c",),
+    inner_mounts: dict[str, str] | None = None,
 ) -> tuple[Lore, Lore, Lore]:
     """Returns (repo, outer, inner) once `feature-branch` adds following links to `outer`, at each
     of `mounts` mounting its source path (`vendor/b` mounting `/` by default). `outer` holds
-    `sub/s.txt` and links `inner`, whose `c.txt` holds `_LINK_FILE`'s base, at each of
-    `inner_mounts`, where `outer`'s `feature-branch` committed `feature_edit` to `c.txt`.
+    `sub/s.txt` and links `inner` at each of `inner_mounts` mounting its source path (`deps/c`
+    mounting `/` by default), each of which holds `c.txt` at `_LINK_FILE`'s base. `outer`'s
+    `feature-branch` committed `feature_edit` to the `c.txt` at `deps/c`.
     `outer`'s `main` then commits `linked_main_edit` inside `inner`, and the parent's `main`, left
     checked out, a change of its own."""
-    inner = make_repo(new_lore_repo, {"c.txt": _LINK_FILE[0]})
+    inner_mounts = inner_mounts or {"deps/c": "/"}
+    inner_files = {
+        f"{source.strip('/')}/c.txt".lstrip("/"): _LINK_FILE[0]
+        for source in inner_mounts.values()
+    }
+    inner = make_repo(new_lore_repo, inner_files)
     outer = make_repo(new_lore_repo, {"b.txt": "b base\n", "sub/s.txt": "s\n"})
-    for inner_mount in inner_mounts:
-        outer.link_add(inner_mount, inner.get_id(), "/")
+    for inner_mount, source in inner_mounts.items():
+        outer.link_add(inner_mount, inner.get_id(), source)
     outer.commit("Link the inner repository")
     outer.push()
     repo = make_repo(new_lore_repo, {"main-file.txt": "initial content\n"})
@@ -434,21 +440,17 @@ def test_link_added_on_branch_merges_the_links_it_holds(new_lore_repo, case):
 
 
 @pytest.mark.smoke
-@pytest.mark.parametrize("finish", ["resolve", "two mounts", "subtree", "merge into"])
+@pytest.mark.parametrize("finish", ["resolve", "subtree", "merge into"])
 def test_link_added_on_branch_with_conflicting_edits_in_a_link_it_holds(
     new_lore_repo, finish
 ):
-    """A conflict inside a link nested in a link the merged branch adds is marked at its mount,
-    at each mount of the added repository. Resolved, the merge
-    commits and pushes every level; aborted, it removes the added links and leaves the linked
-    repositories' branches. `merge into` refuses it, as does a merge whose added link mounts a
-    subtree that leaves out the conflict."""
+    """A conflict inside a link nested in a link the merged branch adds is marked at its mount.
+    Resolved, the merge commits and pushes every level. `merge into` refuses it, as does a merge
+    whose added link mounts a subtree that leaves out the conflict, leaving the linked
+    repositories' branches."""
     main_edit = {"c.txt": "edited on linked main\n"}
     merge_into = finish == "merge into"
-    mounts = {
-        "two mounts": {"vendor/b": "/", "vendor/b2": "/"},
-        "subtree": {"vendor/b": "sub"},
-    }.get(finish)
+    mounts = {"subtree": {"vendor/b": "sub"}}.get(finish)
     repo, outer, inner = _link_holding_a_link_added_on_branch(
         new_lore_repo, "edited on feature\n", {} if merge_into else main_edit, mounts
     )
@@ -460,7 +462,6 @@ def test_link_added_on_branch_with_conflicting_edits_in_a_link_it_holds(
 
     def assert_nothing_merged():
         assert not repo.path_exists("vendor/b")
-        assert not repo.path_exists("vendor/b2")
         assert parse_status_json(repo.status(json=True)) == []
         assert [_sorted_by_name(remote_branch_entries(r)) for r in (outer, inner)] == (
             branches
@@ -481,12 +482,6 @@ def test_link_added_on_branch_with_conflicting_edits_in_a_link_it_holds(
 
     repo.branch_merge_start("feature-branch", message="Merge feature-branch")
     _assert_conflict_marked(repo, conflicted)
-    if finish == "two mounts":
-        _assert_conflict_marked(repo, "vendor/b2/deps/c/c.txt")
-        repo.branch_merge_abort()
-        assert registered_links(repo) == {}
-        assert_nothing_merged()
-        return
 
     repo.write_files({conflicted: "resolved\n"})
     repo.branch_merge_resolve(conflicted)
@@ -538,7 +533,7 @@ def test_links_in_a_link_added_on_branch_reaching_one_repository(new_lore_repo, 
         new_lore_repo,
         _LINK_FILE[1],
         {},
-        inner_mounts=("deps/c", "deps/c2"),
+        inner_mounts={"deps/c": "/x", "deps/c2": "/y"},
     )
     if merge_into:
         _merge_main_into_feature(repo)
@@ -554,10 +549,12 @@ def test_links_in_a_link_added_on_branch_reaching_one_repository(new_lore_repo, 
     repo.branch_merge_start("feature-branch", message="Merge feature-branch")
     repo.push()
 
-    merged = {"c.txt": _LINK_FILE[1], "c-main.txt": "main\n"}
     _assert_mains_hold_the_merge(repo, outer, inner)
-    for inner_mount in ("deps/c", "deps/c2"):
-        assert mounted_files(repo, f"vendor/b/{inner_mount}") == merged
+    assert mounted_files(repo, "vendor/b/deps/c") == {
+        "c.txt": _LINK_FILE[1],
+        "c-main.txt": "main\n",
+    }
+    assert mounted_files(repo, "vendor/b/deps/c2") == {"c.txt": _LINK_FILE[0]}
 
 
 @pytest.mark.smoke
@@ -723,10 +720,15 @@ def test_link_added_on_branch_to_a_repository_linked_already_shares_its_pin(
     """A following link a merged branch adds to a repository the target links already lands at
     the pin of the target's link, which one repository's links share, however the repository's
     own branch moved on."""
-    repo, source_repo = make_parent_with_link(new_lore_repo, "linked/a")
+    repo, source_repo = make_parent_with_link(
+        new_lore_repo,
+        "linked/a",
+        link_files={"a/linked.txt": "linked content\n", "b/linked.txt": "linked content\n"},
+        source_path="/a",
+    )
     pin = link_pin(repo, source_repo.get_id())
     repo.branch_create("feature-branch")
-    repo.link_add("linked/b", source_repo.get_id(), "/")
+    repo.link_add("linked/b", source_repo.get_id(), "/b")
     repo.commit("Add a second link on feature branch")
     repo.push()
     source_repo.write_commit_push("Linked main moves on", {"main-only.txt": "main\n"})
@@ -2786,19 +2788,21 @@ def test_resolving_mount_conflicts_of_links_to_one_repository_merges_it_once(new
     parent = make_repo(
         new_lore_repo, {"root.txt": "root\n", "one/a.txt": "a\n", "two/a.txt": "a\n"}
     )
-    source = make_repo(new_lore_repo, {"a.txt": "a\n"})
+    source = make_repo(new_lore_repo, {"one/a.txt": "a\n", "two/a.txt": "a\n"})
     parent.branch_create("feature")
     for folder in ["one", "two"]:
         parent.rmtree(folder)
         parent.stage(folder, scan=True)
-        parent.link_add(folder, source.get_id(), "/")
+        parent.link_add(folder, source.get_id(), f"/{folder}")
     parent.commit("Replace both folders with links")
     parent.push()
     parent.branch_switch("main")
     parent.write_commit_push(
         "Change both folders", {"one/a.txt": "one\n", "two/a.txt": "two\n"}
     )
-    source.write_commit_push("Move the linked repository on", {"b.txt": "b\n"})
+    source.write_commit_push(
+        "Move the linked repository on", {"one/b.txt": "b\n", "two/b.txt": "b\n"}
+    )
     latest = source.branch_info().local_latest
     parent.branch_merge_start("feature", message="Merge feature", check=False)
     assert parent.unresolved_paths() == {"one", "two"}

@@ -26,8 +26,18 @@ use crate::fs::filesystem_provider::setup_test_execution;
 use crate::fs::filesystem_provider::test_store_create;
 use crate::helper::in_memory;
 
+/// A link at `mount_path` to one repository, pinning `pin` on `branch`, held by the repository
+/// linked where the path leads to `deps/`, else by the instance's own.
 fn pin(mount_path: &str, pin: u8, branch: u8) -> UncommittedPin {
+    let mut holder = [0; 16];
+    let holder_path = mount_path
+        .rsplit_once("/deps/")
+        .map_or("", |(path, _)| path);
+    for (i, byte) in holder_path.bytes().enumerate() {
+        holder[i % 16] ^= byte;
+    }
     UncommittedPin {
+        holder: RepositoryId::from(holder),
         repository: RepositoryId::from([1; 16]),
         branch: BranchId::from([branch; 16]),
         pin: Hash::from([pin; 32]),
@@ -46,43 +56,52 @@ fn messages(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         .collect()
 }
 
-/// Links to one repository on one branch commit one revision once where only a merge staged it
-/// and they take the same per-link messages, at them and below them. A link on another branch
-/// commits apart.
+/// Links to one repository on one branch, held by different repositories, commit one revision
+/// once where only a merge staged it and they take the same per-link messages, at them and below
+/// them. A link on another branch commits apart, and the links one repository holds pinning one
+/// revision commit together.
 #[test]
 fn links_sharing_a_merged_revision_commit_it_once() {
     let none = HashSet::new();
-    let shared = [pin("vendor/b", 1, 1), pin("vendor/c", 1, 1)];
+    let shared = [pin("vendor/b/deps/d", 1, 1), pin("vendor/c/deps/d", 1, 1)];
     for alike in [
         messages(&[]),
-        messages(&[("vendor/b", "one"), ("vendor/c", "one")]),
-        messages(&[("vendor/b/deps/d", "two"), ("vendor/c/deps/d", "two")]),
+        messages(&[("vendor/b/deps/d", "one"), ("vendor/c/deps/d", "one")]),
+        messages(&[("vendor/b/deps/d/e", "two"), ("vendor/c/deps/d/e", "two")]),
         messages(&[("vendor/a", "own"), ("vendor/bb", "own")]),
     ] {
         refuse_link_commits(&shared, &none, &alike).expect("the links share one commit");
     }
     refuse_link_commits(
-        &[pin("vendor/b", 1, 1), pin("vendor/c", 2, 2)],
+        &[pin("vendor/b/deps/d", 1, 1), pin("vendor/c/deps/d", 2, 2)],
         &none,
         &messages(&[]),
     )
     .expect("links on two branches commit apart");
+    refuse_link_commits(
+        &[pin("libs/d", 1, 1), pin("libs/d-again", 1, 1)],
+        &HashSet::from([Hash::from([1; 32])]),
+        &messages(&[]),
+    )
+    .expect("the links of one repository commit together");
 }
 
-/// Links to one repository on one branch are refused where they pin two revisions, pin one that
-/// holds a file staged from the working tree, or are given different per-link messages.
+/// Links to one repository on one branch are refused where they pin two revisions, or, held by
+/// different repositories, pin one that holds a file staged from the working tree, and where they
+/// are given different per-link messages.
 #[test]
 fn links_to_one_repository_that_would_lose_work_are_refused() {
     let none = HashSet::new();
-    let shared = [pin("vendor/b", 1, 1), pin("vendor/c", 1, 1)];
-    assert!(matches!(
-        refuse_link_commits(
-            &[pin("vendor/b", 1, 1), pin("vendor/c", 2, 1)],
-            &none,
-            &messages(&[])
-        ),
-        Err(CommitError::NotSupported(_))
-    ));
+    let shared = [pin("vendor/b/deps/d", 1, 1), pin("vendor/c/deps/d", 1, 1)];
+    for pins in [
+        [pin("vendor/b/deps/d", 1, 1), pin("vendor/c/deps/d", 2, 1)],
+        [pin("libs/d", 1, 1), pin("libs/d-again", 2, 1)],
+    ] {
+        assert!(matches!(
+            refuse_link_commits(&pins, &none, &messages(&[])),
+            Err(CommitError::NotSupported(_))
+        ));
+    }
     assert!(matches!(
         refuse_link_commits(
             &shared,
@@ -91,35 +110,49 @@ fn links_to_one_repository_that_would_lose_work_are_refused() {
         ),
         Err(CommitError::NotSupported(_))
     ));
-    for diverging in [
-        messages(&[("vendor/b", "one"), ("vendor/c", "other")]),
-        messages(&[("vendor/c", "one")]),
-        messages(&[("vendor/c/deps/d", "two")]),
+    for (pins, diverging) in [
+        (
+            &shared,
+            messages(&[("vendor/b/deps/d", "one"), ("vendor/c/deps/d", "other")]),
+        ),
+        (&shared, messages(&[("vendor/c/deps/d", "one")])),
+        (
+            &[pin("libs/d", 1, 1), pin("libs/d-again", 1, 1)],
+            messages(&[("libs/d-again/e", "two")]),
+        ),
     ] {
         assert!(matches!(
-            refuse_link_commits(&shared, &none, &diverging),
+            refuse_link_commits(pins, &none, &diverging),
             Err(CommitError::InvalidArguments(_))
         ));
     }
 }
 
 /// A commit of one link alone, and the links below it, is refused where a link outside it to one
-/// of their repositories on the same branch pins an uncommitted revision too.
+/// of their repositories on the same branch pins an uncommitted revision too, other than a mount
+/// pinning the same revision in the repository holding the link, which commits with it.
 #[test]
 fn a_link_committed_alone_is_refused_while_another_link_pins_its_repository() {
-    let pins = [pin("libs/d", 1, 1), pin("libs/d-again", 1, 1)];
-    assert!(matches!(
-        refuse_scoped_link_commit(&pins, &path("libs/d")),
-        Err(CommitError::NotSupported(_))
-    ));
-    assert!(matches!(
-        refuse_scoped_link_commit(
-            &[pin("vendor/b/deps/d", 1, 1), pin("vendor/c", 1, 1)],
-            &path("vendor/b")
-        ),
-        Err(CommitError::NotSupported(_))
-    ));
     for (pins, scope) in [
+        (
+            vec![pin("libs/d", 1, 1), pin("libs/d-again", 2, 1)],
+            "libs/d",
+        ),
+        (
+            vec![pin("vendor/b/deps/d", 1, 1), pin("vendor/c", 1, 1)],
+            "vendor/b",
+        ),
+    ] {
+        assert!(matches!(
+            refuse_scoped_link_commit(&pins, &path(scope)),
+            Err(CommitError::NotSupported(_))
+        ));
+    }
+    for (pins, scope) in [
+        (
+            vec![pin("libs/d", 1, 1), pin("libs/d-again", 1, 1)],
+            "libs/d",
+        ),
         (
             vec![pin("libs/d", 1, 1), pin("libs/d/deps/d", 1, 1)],
             "libs/d",
@@ -131,7 +164,7 @@ fn a_link_committed_alone_is_refused_while_another_link_pins_its_repository() {
         (vec![pin("libs/d", 1, 1)], "libs/d"),
     ] {
         refuse_scoped_link_commit(&pins, &path(scope))
-            .expect("no link outside the scope shares it");
+            .expect("no link outside the scope commits apart from it");
     }
 }
 
@@ -198,11 +231,50 @@ async fn a_commit_refuses_a_staged_repository_whose_mounts_carry_different_flags
                 .await
                 .expect("changing one mount's flags");
 
-            let refused = reject_unmovable_link_mounts(&repository, &state)
+            let refused = reject_unmovable_link_mounts(&repository, &state, None)
                 .await
                 .expect_err("the mounts carry different flags");
 
             assert!(refused.is_link_pins_diverge(), "{refused:?}");
+        })
+        .await;
+}
+
+/// A commit through a staged link node refuses where the mounts of its repository follow different
+/// branches, as rows written before one pin per repository can. A commit of one link checks only
+/// the repository it goes through.
+#[tokio::test]
+async fn a_commit_refuses_a_staged_repository_whose_mounts_follow_different_branches() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let (state, linked, _, b) =
+                in_memory::linking_twice(&repository, Hash::from_u64(1)).await;
+            let row = state
+                .link_find(repository.clone(), linked, b)
+                .await
+                .expect("finding the mount's row");
+            state
+                .link_replace(
+                    repository.clone(),
+                    LinkReference {
+                        branch: BranchId::from([7; 16]),
+                        ..row
+                    },
+                )
+                .await
+                .expect("changing one mount's branch");
+
+            let refused = reject_unmovable_link_mounts(&repository, &state, Some(linked))
+                .await
+                .expect_err("the mounts follow different branches");
+            assert!(refused.is_link_pins_diverge(), "{refused:?}");
+
+            reject_unmovable_link_mounts(&repository, &state, Some(RepositoryId::from([9; 16])))
+                .await
+                .expect("a commit of another link moves none of these mounts");
         })
         .await;
 }
