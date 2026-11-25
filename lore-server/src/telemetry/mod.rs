@@ -11,8 +11,14 @@
 
 mod guard;
 mod io_pool;
+#[cfg(not(feature = "test-util"))]
 mod log;
+#[cfg(feature = "test-util")]
+pub mod log;
+#[cfg(not(feature = "test-util"))]
 mod metrics;
+#[cfg(feature = "test-util")]
+pub mod metrics;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod process;
 #[cfg(not(feature = "test-util"))]
@@ -76,6 +82,16 @@ fn log_filter(directives: &str) -> EnvFilter {
         .parse_lossy(directives)
 }
 
+/// Builds an OTLP exporter with the net runtime current.
+///
+/// An exporter's tonic channel runs its connection tasks on the runtime current when it is built,
+/// and every reconnect resolves the collector's address on that runtime's blocking pool. Built on
+/// net, export keeps working while long-running work holds the core blocking pool.
+fn on_net_runtime<T>(build: impl FnOnce() -> T) -> T {
+    let _net = lore_base::runtime::net_runtime().enter();
+    build()
+}
+
 fn is_filtered_otel_name(name: &str) -> bool {
     matches!(
         name,
@@ -110,6 +126,9 @@ pub struct TelemetryInitializer {
 
 impl TelemetryInitializer {
     /// Creates a new telemetry initializer from configuration.
+    ///
+    /// Building the OTLP exporters builds the net runtime, whose size is fixed from then on, so a
+    /// process sizes its runtimes before calling this.
     ///
     /// # Arguments
     ///

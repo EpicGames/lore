@@ -13,8 +13,23 @@ use opentelemetry_sdk::logs::BatchLogProcessor;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use tokio::runtime::Handle;
 
+use super::on_net_runtime;
 use super::resource::resource;
 use super::resource_provider::ResourceDetectorProvider;
+
+/// Builds the OTLP log exporter, on the net runtime.
+#[lore_macro::test_pub]
+fn log_exporter(exporter_config: &ExporterConfig) -> Result<LogExporter, TelemetryError> {
+    let exporter = on_net_runtime(|| {
+        LogExporter::builder()
+            .with_tonic()
+            .with_endpoint(exporter_config.endpoint.clone())
+            .with_timeout(Duration::from_millis(exporter_config.timeout))
+            .build()
+    })
+    .internal("Failed to build OTLP log exporter")?;
+    Ok(exporter)
+}
 
 /// Initializes an OTLP logger provider for exporting logs.
 ///
@@ -28,12 +43,7 @@ pub fn init_logger_provider(
     runtime_handle: Handle,
     resource_detector_provider: Option<&dyn ResourceDetectorProvider>,
 ) -> Result<SdkLoggerProvider, TelemetryError> {
-    let exporter = LogExporter::builder()
-        .with_tonic()
-        .with_endpoint(exporter_config.endpoint.clone())
-        .with_timeout(Duration::from_millis(exporter_config.timeout))
-        .build()
-        .internal("Failed to build OTLP log exporter")?;
+    let exporter = log_exporter(exporter_config)?;
 
     let processor = BatchLogProcessor::builder(exporter)
         .with_batch_config(

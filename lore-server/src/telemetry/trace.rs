@@ -29,6 +29,7 @@ use tokio::runtime::Handle;
 use tracing::debug;
 use tracing::error;
 
+use super::on_net_runtime;
 use super::resource::resource;
 use super::resource_provider::ResourceDetectorProvider;
 
@@ -99,6 +100,20 @@ impl ShouldSample for PerOpSampler {
     }
 }
 
+/// Builds the OTLP span exporter, on the net runtime.
+#[lore_macro::test_pub]
+fn span_exporter(exporter_config: &ExporterConfig) -> Result<SpanExporter, TelemetryError> {
+    let exporter = on_net_runtime(|| {
+        SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(exporter_config.endpoint.clone())
+            .with_timeout(Duration::from_millis(exporter_config.timeout))
+            .build()
+    })
+    .internal("Failed to build OTLP span exporter")?;
+    Ok(exporter)
+}
+
 /// Initializes an OTLP tracer provider for exporting traces.
 pub fn init_tracer_provider(
     exporter_config: &ExporterConfig,
@@ -112,12 +127,7 @@ pub fn init_tracer_provider(
         trace_config.sample_rate_low_tier,
     )));
 
-    let exporter = SpanExporter::builder()
-        .with_tonic()
-        .with_endpoint(exporter_config.endpoint.clone())
-        .with_timeout(Duration::from_millis(exporter_config.timeout))
-        .build()
-        .internal("Failed to build OTLP span exporter")?;
+    let exporter = span_exporter(exporter_config)?;
 
     let batch_config = BatchConfigBuilder::default()
         .with_max_queue_size(exporter_config.queue_size)
