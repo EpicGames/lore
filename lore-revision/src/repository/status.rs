@@ -58,6 +58,7 @@ use crate::node::ROOT_NODE;
 use crate::path::emit_path_ignore;
 use crate::state;
 use crate::state::Clear;
+use crate::state::HeldNode;
 use crate::state::LinkReference;
 use crate::state::State;
 use crate::util::fan_out;
@@ -808,28 +809,29 @@ async fn report_staged_changes(
 async fn layer_holds_staging(layer: &layer::Layer, layer_state: &layer::LayerState) -> bool {
     let Ok((source, (repository, state))) = layer_state
         .state_staged
-        .find_relative_held(
+        .locate_held_node_below(
             layer_state.repository.clone(),
             ROOT_NODE,
             &layer.source_path,
         )
         .await
+        .map(HeldNode::into_parts)
     else {
         return true;
     };
-    if !source.node.is_valid_or_root_node_id() {
+    if !source.is_valid_or_root_node_id() {
         return true;
     }
 
     if state
-        .node_has_dirty_children(repository.clone(), source.node)
+        .node_has_dirty_children(repository.clone(), source)
         .await
         .unwrap_or(true)
     {
         return true;
     }
 
-    let staged = state::count_staged_files(repository, state, source.node).await;
+    let staged = state::count_staged_files(repository, state, source).await;
     staged.count > 0 || !staged.complete
 }
 
@@ -1162,22 +1164,20 @@ async fn count_at_path_root(
         ));
     }
 
-    let Ok(link) = state
-        .find_node_link(repository.clone(), source_path.as_str())
+    let Ok(found) = state
+        .locate_node(repository.clone(), source_path.as_str())
         .await
     else {
         return Ok((0, 0, None));
     };
-    if !link.is_valid() {
+    if !found.is_valid() {
         return Ok((0, 0, None));
     }
 
-    let (repository, state) = link
-        .resolve(repository.clone(), state.clone())
-        .await
-        .forward::<StatusError>("resolving count path")?;
+    let (node_id, (repository, state)) =
+        found.held((repository.clone(), state.clone())).into_parts();
     let node = state
-        .node(repository.clone(), link.node)
+        .node(repository.clone(), node_id)
         .await
         .forward::<StatusError>("reading count path node")?;
 
@@ -1210,7 +1210,7 @@ async fn count_at_path_root(
         Some(CountWork {
             state,
             repository,
-            node_id: link.node,
+            node_id,
             path: mount_path.clone(),
             states,
         }),
@@ -1648,7 +1648,7 @@ fn resolve_scan_target(
                 state
                     .find_relative_from(repository.clone(), path.as_str(), stop)
                     .await
-                    .is_ok_and(|(node_link, _)| node_link.is_valid()),
+                    .is_ok_and(|found| found.is_valid()),
                 None,
             ),
             Ok(state::PathStop {

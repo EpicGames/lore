@@ -9,6 +9,7 @@ use lore_error_set::prelude::*;
 use crate::node::Node;
 use crate::node::NodeBlock;
 use crate::node::NodeID;
+use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
 use crate::repository::RepositoryContext;
 use crate::state::State;
@@ -87,16 +88,12 @@ pub(crate) async fn node_at_path(
     root: NodeID,
     path: &str,
 ) -> Result<Option<NodeID>, StateError> {
-    let node_link = match state
-        .find_relative_node_link(repository.clone(), root, path)
+    match state
+        .locate_node_below(repository.clone(), root, path)
         .await
     {
-        Ok(node_link) => node_link,
-        Err(StateError::NodeNotFound(_)) => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    if !node_link.is_valid() || node_link.crosses_link(repository, state) {
-        return Ok(None);
+        Ok(found) => Ok(found.own_node().filter(NodeIDExt::is_valid_node_id)),
+        Err(StateError::NodeNotFound(_)) => Ok(None),
+        Err(error) => Err(error),
     }
-    Ok(Some(node_link.node))
 }

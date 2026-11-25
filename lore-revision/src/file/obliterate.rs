@@ -130,8 +130,8 @@ pub(crate) async fn obliterate_file(
             .await
             .forward::<ObliterateError>("Failed to deserialize state")?;
 
-    let node_link = state
-        .find_node_link(repository.clone(), relative_path.as_str())
+    let found = state
+        .locate_node(repository.clone(), relative_path.as_str())
         .await
         .map_err(|err| {
             forward_refusal_or(err, "finding the node", |_err| {
@@ -141,7 +141,7 @@ pub(crate) async fn obliterate_file(
             })
         })?;
 
-    if !node_link.is_valid() {
+    if !found.is_valid() {
         return Err(FileNotFound {
             resource: relative_path.to_string(),
         }
@@ -149,7 +149,7 @@ pub(crate) async fn obliterate_file(
     }
 
     // TODO(vri): UCS-18010 - Implement obliterate for links
-    if node_link.crosses_link(&repository, &state) {
+    let Some(node_id) = found.own_node() else {
         return Err(NotSupported {
             operation: format!(
                 "obliterating {relative_path} inside a link - obliterate it by address in the linked \
@@ -157,10 +157,10 @@ pub(crate) async fn obliterate_file(
             ),
         }
         .into());
-    }
+    };
 
     let node = state
-        .node(repository.clone(), node_link.node)
+        .node(repository.clone(), node_id)
         .await
         .map_err(|err| {
             forward_refusal_or(err, "reading the node", |_err| {
@@ -193,7 +193,7 @@ pub(crate) async fn obliterate_file(
         repository.clone(),
         state.clone(),
         relative_path.clone(),
-        node_link.node,
+        node_id,
         NodeFlags::NoFlags,
         stage_stats,
         None,

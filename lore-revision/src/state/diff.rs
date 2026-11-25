@@ -141,24 +141,19 @@ impl GraftOracle {
         if !self.view.excludes_subtree(path, FilterMode::View) {
             return false;
         }
-        let Ok(link) = self
+        // A path reached through a link is merged through that link instead.
+        let Some(node_id) = self
             .state_target
-            .find_node_link(self.repository.clone(), path.as_str())
+            .locate_node(self.repository.clone(), path.as_str())
             .await
+            .ok()
+            .and_then(|found| found.own_node())
         else {
             return false;
         };
-        if !link.is_valid_or_root() {
-            return false;
-        }
-        // `find_node_link` resolves through links. A path in another
-        // repository is merged through that link instead.
-        if link.repository != self.repository.id {
-            return false;
-        }
         let Ok(node) = self
             .state_target
-            .node(self.repository.clone(), link.node)
+            .node(self.repository.clone(), node_id)
             .await
         else {
             return false;
@@ -175,7 +170,7 @@ impl GraftOracle {
             return false;
         }
         self.state_target
-            .node_has_staged_children(self.repository.clone(), link.node)
+            .node_has_staged_children(self.repository.clone(), node_id)
             .await
             .is_ok_and(|has_staged| !has_staged)
     }
@@ -2722,7 +2717,7 @@ impl Settling {
         let found = self.from.node_at(&parent_path).await;
         let listed = found.is_valid_or_root();
         let parent = if listed {
-            found.node
+            found.into_own_node()?
         } else {
             ensure_scan_dir_chain(
                 self.from.repository.clone(),
@@ -2920,13 +2915,15 @@ impl Settling {
         if Arc::ptr_eq(&self.from.state, &self.current.state) {
             return Some(recorded);
         }
-        let link = self.current.node_at(path).await;
-        if !link.is_valid() || link.revision != self.current.state.revision() {
-            return None;
-        }
+        let id = self
+            .current
+            .node_at(path)
+            .await
+            .own_node()
+            .filter(NodeIDExt::is_valid_node_id)?;
         self.current
             .state
-            .node(self.current.repository.clone(), link.node)
+            .node(self.current.repository.clone(), id)
             .await
             .is_ok_and(|current| current.address.hash == from_node.address.hash)
             .then_some(recorded)
@@ -2941,10 +2938,10 @@ impl Settling {
         match self
             .to
             .state
-            .find_relative_node_link(self.to.repository.clone(), self.to.node, below)
+            .locate_node_below(self.to.repository.clone(), self.to.node, below)
             .await
         {
-            Ok(link) => link.is_valid(),
+            Ok(found) => found.is_valid(),
             Err(crate::state::StateErrors::NodeNotFound(_)) => false,
             Err(_) => true,
         }
@@ -2957,8 +2954,8 @@ impl Settling {
         if Arc::ptr_eq(&self.from.state, &self.current.state) {
             return false;
         }
-        let link = self.current.node_at(path).await;
-        !link.is_valid() || moved.is_some_and(|node| link.node != node)
+        let found = self.current.node_at(path).await;
+        !found.is_valid() || moved.is_some_and(|node| found.own_node() != Some(node))
     }
 
     fn mark(

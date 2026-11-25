@@ -18,6 +18,7 @@ use crate::lore_warn;
 use crate::node::Node;
 use crate::node::NodeBlock;
 use crate::node::NodeID;
+use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
 use crate::repository::RepositoryContext;
 use crate::state::LinkReference;
@@ -56,11 +57,11 @@ pub(crate) async fn reset_staged_add_link(
         .await
         .unwrap_or_else(|_| link_path.as_str().to_string());
     let committed_directory_node = state_current
-        .find_node_link(repository.clone(), &owner_relative_path)
+        .locate_node(repository.clone(), &owner_relative_path)
         .await
         .ok()
-        .filter(|node_link| node_link.is_valid())
-        .map(|node_link| node_link.node);
+        .and_then(|found| found.own_node())
+        .filter(NodeIDExt::is_valid_node_id);
 
     if let Some(committed_node_id) = committed_directory_node {
         // Restore the committed directory: recreate the empty placeholder on

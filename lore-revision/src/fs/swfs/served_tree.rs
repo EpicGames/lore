@@ -22,6 +22,7 @@ use crate::node::SiblingCycleGuard;
 use crate::repository::MountKind;
 use crate::repository::RepositoryContext;
 use crate::repository::is_reserved_node_name;
+use crate::state::FoundNode;
 use crate::state::MAX_LINK_DEPTH;
 use crate::state::State;
 use crate::state::StateError;
@@ -560,9 +561,9 @@ async fn layer_mount(
         ROOT_NODE
     } else {
         layered_state
-            .find_node_link(layered.clone(), source_path.as_str())
-            .await?
-            .node
+            .locate_node(layered.clone(), source_path.as_str())
+            .await
+            .and_then(FoundNode::into_own_node)?
     };
     Ok(Some(ServedMount {
         path,

@@ -179,11 +179,11 @@ async fn diff_filesystem_paths_in(
             let mut exists_in_state = false;
             let mut exists_in_filesystem = false;
 
-            let node_link = state_from
-                .find_node_link(repository.clone(), path.as_str())
+            let found = state_from
+                .locate_node(repository.clone(), path.as_str())
                 .await
                 .unwrap_or_default();
-            if node_link.is_valid() {
+            if found.is_valid() {
                 exists_in_state = true;
             } else {
                 let repository_path = path.clone();

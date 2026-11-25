@@ -355,10 +355,13 @@ impl ModifiedTree {
     /// it holds keeps marked. What lies below a directory stays.
     async fn forget(&self, state: &State, path: &RelativePath) -> Result<(), StateError> {
         let node = match state
-            .find_node_link(self.repository.clone(), path.as_str())
+            .locate_node(self.repository.clone(), path.as_str())
             .await
         {
-            Ok(found) => found.node,
+            Ok(found) => match found.own_node() {
+                Some(id) => id,
+                None => return Ok(()),
+            },
             Err(error) if error.is_node_not_found() => return Ok(()),
             Err(error) => return Err(error),
         };

@@ -1204,6 +1204,17 @@ async fn delete_change(
 async fn verify_change(
     repository: &Arc<RepositoryContext>,
     state: &Arc<State>,
+    change: NodeChange,
+    incoming: &[NodeChange],
+) -> Result<Option<NodeChange>, SyncError> {
+    Box::pin(verify_change_on(repository, state, change, incoming)).await
+}
+
+/// [`verify_change`] with the working tree standing on `current` rather than on the state the
+/// change starts from.
+async fn verify_change_on(
+    repository: &Arc<RepositoryContext>,
+    current: &Arc<State>,
     mut change: NodeChange,
     incoming: &[NodeChange],
 ) -> Result<Option<NodeChange>, SyncError> {
@@ -1212,7 +1223,7 @@ async fn verify_change(
         &mut change,
         repository.clone(),
         operation,
-        NodeMapping::root(repository.clone(), state.clone()),
+        NodeMapping::root(repository.clone(), current.clone()),
         false,
         false,
         false,
@@ -1298,6 +1309,35 @@ async fn a_deleted_directory_holding_an_unmodified_case_variant_is_realized() {
                 .expect("a case variant holding the tree's content is no local change")
                 .is_some()
         );
+    }))
+    .await;
+}
+
+/// A deleted directory the current revision does not hold is measured against nothing there: the
+/// file the delete's side tracks, unmodified, is no local work, and edited it is.
+#[tokio::test]
+async fn a_deleted_directory_the_current_revision_lacks_refuses_only_local_work() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(1174, 0);
+        let state = plugin_tree(&repository, &[(TRACKED, &content)]).await;
+        let current = State::new();
+        write_working_files(&repository, &[(TRACKED, &content)]).await;
+
+        let delete = delete_change(&repository, &state, PLUGIN).await;
+        assert!(
+            Box::pin(verify_change_on(&repository, &current, delete, &[]))
+                .await
+                .expect("the tracked file unmodified is no local work")
+                .is_some()
+        );
+
+        write_working_files(&repository, &[(TRACKED, &pseudo_random_bytes(1174, 1))]).await;
+        let delete = delete_change(&repository, &state, PLUGIN).await;
+        assert!(is_local_modifications(
+            &Box::pin(verify_change_on(&repository, &current, delete, &[])).await
+        ));
     }))
     .await;
 }
@@ -2979,7 +3019,7 @@ async fn a_deleted_directory_check_stops_once_the_sync_is_refused() {
                         repository: repository.clone(),
                         state: current.state.clone(),
                         path: path.clone(),
-                        node: directory.node,
+                        node: directory.identity().node,
                     },
                     observed: None,
                     flags: NodeFlags::NoFlags,
@@ -3553,9 +3593,10 @@ async fn a_write_creates_a_directory_ahead_only_where_it_holds_nothing_kept() {
                     .await;
             let state = tree_holding(&repository, files, empty).await;
             let node_id = state
-                .find_relative_node_link(repository.clone(), ROOT_NODE, directory)
+                .locate_node_below(repository.clone(), ROOT_NODE, directory)
                 .await
                 .expect("the directory")
+                .identity()
                 .node;
             let node = state
                 .node(repository.clone(), node_id)

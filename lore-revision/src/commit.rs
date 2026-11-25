@@ -2039,19 +2039,19 @@ async fn layer_commit_root(
         return Ok((ROOT_NODE, relative_path));
     }
 
-    let node_link = state_staged
-        .find_node_link(repository.clone(), source_path)
+    let found = state_staged
+        .locate_node(repository.clone(), source_path)
         .await
         .unwrap_or_default();
-    if !node_link.is_valid() {
+    if !found.is_valid() {
         return Err(CommitError::internal("Invalid subpath"));
     }
-    if node_link.crosses_link(repository, state_staged) {
-        // TODO(mjansson): Layers that specify a path living inside a link need
-        //                 special snowflake care here to commit from the link and down
-        return Err(CommitError::internal("Not supported"));
-    }
-    Ok((node_link.node, relative_path))
+    // TODO(mjansson): Layers that specify a path living inside a link need
+    //                 special snowflake care here to commit from the link and down
+    let node = found
+        .own_node()
+        .ok_or_else(|| CommitError::internal("Not supported"))?;
+    Ok((node, relative_path))
 }
 
 /// Commits `state_staged` as the next revision after `state_current`. `built_on` is the revision

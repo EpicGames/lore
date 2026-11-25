@@ -379,7 +379,7 @@ kinds! {
     /// The kind of [`ops::find_linked`].
     FIND_LINKED {
         name: "find through links",
-        primitive: "State::find_relative_node_link",
+        primitive: "State::locate_node_below",
         mode: "a hop per name, entering links",
         tier: Tier::Any,
         role: Role::Reader,

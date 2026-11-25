@@ -140,10 +140,11 @@ async fn resolve_path_impl(
             }
 
             match state
-                .find_node_link(internal.repository_context.clone(), path)
+                .locate_node(internal.repository_context.clone(), path)
                 .await
             {
-                Ok(link) => {
+                Ok(found) => {
+                    let link = found.identity();
                     emit_resolve_complete(
                         id,
                         link.node,
@@ -183,7 +184,7 @@ async fn resolve_path_impl(
                         );
                         Err(ResolvePathError::internal_with_context(
                             error,
-                            "State::find_node_link",
+                            "State::locate_node",
                         ))
                     }
                 }

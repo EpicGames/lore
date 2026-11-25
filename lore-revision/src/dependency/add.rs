@@ -15,6 +15,7 @@ use crate::errors::FileNotFound;
 use crate::errors::NotSupported;
 use crate::lore::Hash;
 use crate::node::NodeID;
+use crate::node::NodeIDExt;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::state;
@@ -183,8 +184,8 @@ pub(crate) async fn find_own_node(
     state: &State,
     path: &str,
 ) -> Result<Option<NodeID>, DependencyError> {
-    let node_link = match state.find_node_link(repository.clone(), path).await {
-        Ok(node_link) => node_link,
+    let found = match state.locate_node(repository.clone(), path).await {
+        Ok(found) => found,
         Err(err) if err.is_node_not_found() => {
             return Err(DependencyError::FileNotFound(
                 FileNotFound {
@@ -195,16 +196,16 @@ pub(crate) async fn find_own_node(
         }
         Err(err) => return Err(err).forward_any::<DependencyError>("finding the path"),
     };
-    if node_link.crosses_link(repository, state) {
+    let Some(node) = found.own_node() else {
         return Ok(None);
-    }
-    if !node_link.is_valid() {
+    };
+    if !node.is_valid_node_id() {
         return Err(FileNotFound {
             resource: path.to_string(),
         }
         .into());
     }
-    Ok(Some(node_link.node))
+    Ok(Some(node))
 }
 
 pub(super) async fn flush_state(

@@ -96,6 +96,7 @@ use crate::revision::sync::LoreRevisionSyncProgressEventData;
 use crate::stage;
 use crate::stage::StageError;
 use crate::state;
+use crate::state::FoundNode;
 use crate::state::LinkMergeEntry;
 use crate::state::LinkMergeResolution;
 use crate::state::LinkPin;
@@ -1566,11 +1567,11 @@ async fn mounted_node_path(
     } else {
         mapping
             .state
-            .find_node_link(mapping.repository.clone(), source_path.as_str())
+            .locate_node(mapping.repository.clone(), source_path.as_str())
             .await
-            .ok()
-            .filter(NodeLink::is_valid)?
-            .node
+            .ok()?
+            .own_node()
+            .filter(NodeIDExt::is_valid_node_id)?
     };
 
     let below = mapping
@@ -4494,10 +4495,11 @@ async fn graft_add_node(
     let mut parent_path = path.clone();
     let parent_path = parent_path.pop();
     let parent = state_staged
-        .find_node_link(repository.clone(), parent_path.as_str())
+        .locate_node(repository.clone(), parent_path.as_str())
         .await
+        .and_then(FoundNode::into_own_node)
         .forward::<MergeError>("resolving adopted node parent")?;
-    if !parent.is_valid_or_root() {
+    if !parent.is_valid_or_root_node_id() {
         return Err(MergeError::internal("Invalid adopted node parent"));
     }
 
@@ -4515,10 +4517,10 @@ async fn graft_add_node(
     node.flags |= (NodeFlags::StagedAdd | NodeFlags::StagedMerge).bits();
 
     let node_id = state_staged
-        .node_add(repository.clone(), parent.node, node, path.name())
+        .node_add(repository.clone(), parent, node, path.name())
         .await
         .forward::<MergeError>("adding adopted node")?;
-    graft_stage_ancestors(repository, state_staged, parent.node).await?;
+    graft_stage_ancestors(repository, state_staged, parent).await?;
     Ok(node_id)
 }
 
@@ -4599,11 +4601,12 @@ async fn apply_graft_copy(
     state_staged: Arc<State>,
     change: &NodeChange,
 ) -> Result<usize, MergeError> {
-    let link = state_staged
-        .find_node_link(repository.clone(), change.path().as_str())
+    let node_id = state_staged
+        .locate_node(repository.clone(), change.path().as_str())
         .await
+        .and_then(FoundNode::into_own_node)
         .forward::<MergeError>("resolving graft path")?;
-    if !link.is_valid_or_root() {
+    if !node_id.is_valid_or_root_node_id() {
         return Err(MergeError::internal("Invalid graft path"));
     }
 
@@ -4612,8 +4615,7 @@ async fn apply_graft_copy(
     // matches, so the result is proportional to the difference rather than to
     // the size of the subtree. No oracle here, because this walk has to descend.
     let path = change.path().clone();
-    let staged =
-        state::node_change_state(&repository, &state_staged, link.node, path.clone()).await;
+    let staged = state::node_change_state(&repository, &state_staged, node_id, path.clone()).await;
     let source = change.to.clone();
     let mut changes = state::ChangeStream::spawn(async move |changes| {
         state::diff_subtree_flagged(
@@ -6907,26 +6909,26 @@ pub async fn merge_unresolve(
         );
 
         // Filter out paths that don't have a staged node - they can't be a merged change.
-        let node_link = state_staged
-            .find_node_link(repository.clone(), relative_path.as_str())
+        let found = state_staged
+            .locate_node(repository.clone(), relative_path.as_str())
             .await
             .unwrap_or_default();
-        if !node_link.is_valid() {
+        if !found.is_valid() {
             emit_path_ignore(path.as_str()).await;
             lore_debug!("Ignoring invalid path, does not exist in staged state: {path}");
             continue;
         }
 
-        if node_link.repository != repository.id {
-            // TODO(vri): UCS-19234 - Links: Implement merge support for cross-link node links
+        // TODO(vri): UCS-19234 - Links: Implement merge support for cross-link node links
+        let Some(node_id) = found.own_node() else {
             return Err(MergeError::internal(
                 "Conflict resolution inside linked repositories is not yet supported",
             ));
-        }
+        };
 
         // Filter out paths that have a staged node but not the merged flag - they are not a merged change.
-        let block_index = NodeBlock::index(node_link.node);
-        let node_index = Node::index(node_link.node);
+        let block_index = NodeBlock::index(node_id);
+        let node_index = Node::index(node_id);
         let block = state_staged
             .block(repository.clone(), block_index)
             .await
@@ -6945,7 +6947,7 @@ pub async fn merge_unresolve(
 
         state_staged.node_change_in_place(
             &block,
-            node_link.node,
+            node_id,
             (node.parent, node.name_hash),
             |content| content.set_merge_resolved(false),
         );
@@ -7229,12 +7231,12 @@ async fn files_to_resolve(
         let Some(below) = file_path.below(&user_relative) else {
             continue;
         };
-        let file_node_link = state
-            .find_relative_node_link(context.clone(), node_link.node, below)
+        let found = state
+            .locate_node_below(context.clone(), node_link.node, below)
             .await
             .unwrap_or_default();
-        if file_node_link.is_valid() {
-            files.push((file_path, file_node_link));
+        if found.is_valid() {
+            files.push((file_path, found.identity()));
         }
     }
     Ok(FilesToResolve {
@@ -7517,9 +7519,10 @@ async fn resolve_paths(
         // Filter out paths that don't have a staged node - they can't be a merged change.
         // Use is_valid_or_root() since directory/root paths are now supported.
         let node_link = state_staged
-            .find_node_link(repository.clone(), relative_path.as_str())
+            .locate_node(repository.clone(), relative_path.as_str())
             .await
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .identity();
         if !node_link.is_valid_or_root() {
             emit_path_ignore(path.as_str()).await;
             lore_warn!("Ignoring invalid path, does not exist in staged state: {path}");
@@ -8262,10 +8265,10 @@ pub(crate) fn merge_metadata_task(
         let source_node = match source_node {
             Some(node) => node,
             None => match state_source
-                .find_node_link(repository.clone(), path.as_str())
+                .locate_node(repository.clone(), path.as_str())
                 .await
             {
-                Ok(node_link) if node_link.is_valid() => node_link.node,
+                Ok(found) if found.is_valid() => found.identity().node,
                 _ => {
                     lore_debug!(
                         "Merge metadata skipped due to missing 'source' node for {}",
@@ -8288,12 +8291,12 @@ pub(crate) fn merge_metadata_task(
             .node(NodeFileMetadata::index(metadata_node))
             .metadata;
 
-        if let Ok(node_link) = state_staged
-            .find_node_link(repository.clone(), path.as_str())
+        if let Ok(found) = state_staged
+            .locate_node(repository.clone(), path.as_str())
             .await
-            && node_link.is_valid()
+            && found.is_valid()
         {
-            let metadata_node = node::node_to_file_metadata(node_link.node);
+            let metadata_node = node::node_to_file_metadata(found.identity().node);
             let metadata_block_index = NodeFileMetadataBlock::index(metadata_node);
             let metadata_node_index = NodeFileMetadata::index(metadata_node);
 

@@ -328,11 +328,12 @@ pub(crate) async fn verify(
 
     // Check the node hierarchy
     let node_id = if let Some(path) = path {
-        let node_link = state
-            .find_node_link(repository.clone(), path.as_str())
+        state
+            .locate_node(repository.clone(), path.as_str())
             .await
-            .forward::<RepositoryError>("Invalid repository path")?;
-        node_link.node
+            .forward::<RepositoryError>("Invalid repository path")?
+            .identity()
+            .node
     } else {
         ROOT_NODE
     };

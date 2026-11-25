@@ -454,14 +454,16 @@ async fn add_carried(
 ) -> Result<bool, DirtyError> {
     let mut any = false;
     for added in added {
-        let Ok(parent) = state
-            .find_node_link(repository.clone(), added.path.parent().unwrap_or(""))
+        let Some(parent) = state
+            .locate_node(repository.clone(), added.path.parent().unwrap_or(""))
             .await
+            .ok()
+            .and_then(|found| found.own_node())
         else {
             continue;
         };
         if !state
-            .is_live_directory(repository, parent.node)
+            .is_live_directory(repository, parent)
             .await
             .forward::<DirtyError>("Failed to read the parent of an add carried past a commit")?
         {
@@ -478,7 +480,7 @@ async fn add_carried(
             ..Default::default()
         };
         let node_id = state
-            .node_add(repository.clone(), parent.node, node, name)
+            .node_add(repository.clone(), parent, node, name)
             .await
             .forward::<DirtyError>("Failed to add again an add carried past a commit")?;
         state

@@ -46,6 +46,7 @@ use crate::repository::RepositoryWriteToken;
 use crate::repository::is_reserved_node_name;
 use crate::state;
 use crate::state::Clear;
+use crate::state::FoundNode;
 use crate::state::LinkPin;
 use crate::state::Mark;
 use crate::state::NodeMapping;
@@ -796,29 +797,28 @@ async fn resolve_unstage_target(
     node_path: &RelativePath,
     link_tracker: &Arc<LinkTracker>,
 ) -> Result<Option<UnstageTarget>, UnstageError> {
-    let node_link = match state_staged
-        .find_node_link(repository.clone(), node_path.as_str())
+    let found = match state_staged
+        .locate_node(repository.clone(), node_path.as_str())
         .await
     {
-        Ok(node_link) => node_link,
+        Ok(found) => found,
         Err(err) if err.is_node_not_found() => return Ok(None),
         Err(err) => return Err(err).forward::<UnstageError>("Failed to find subnode"),
     };
 
-    if node_link.repository == repository.id {
+    if let Some(node_id) = found.own_node() {
         return Ok(Some(UnstageTarget {
             repository,
             state_current,
             state_staged,
-            node_id: node_link.node,
+            node_id,
         }));
     }
 
     lore_debug!(
-        "Transition into linked repository: from {} to {}, node={}",
+        "Transition into linked repository: from {} to {}",
         repository.id,
-        node_link.repository,
-        node_link.node
+        found.identity().repository,
     );
 
     let chain = crate::link::resolve_tracked_link_chain(
@@ -843,14 +843,14 @@ async fn resolve_unstage_target(
     .forward::<UnstageError>("Failed to deserialize revision state")?;
 
     let node_id = state_staged
-        .find_relative_node_link(
+        .locate_node_below(
             repository.clone(),
             chain.innermost.node,
             chain.remainder_path.as_str(),
         )
         .await
-        .forward::<UnstageError>("Failed to find node in linked repository")?
-        .node;
+        .and_then(FoundNode::into_own_node)
+        .forward::<UnstageError>("Failed to find node in linked repository")?;
 
     Ok(Some(UnstageTarget {
         repository,

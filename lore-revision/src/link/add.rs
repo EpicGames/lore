@@ -41,6 +41,7 @@ use crate::repository::clone::LoreRepositoryCloneEndEventData;
 use crate::stage;
 use crate::stage::KnownChild;
 use crate::stage::StageOptions;
+use crate::state::FoundNode;
 use crate::state::LinkReference;
 use crate::state::NodeMapping;
 use crate::state::State;
@@ -268,8 +269,8 @@ pub async fn add(
         .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
 
     lore_debug!("Find link target node for {source_path}");
-    let link_node_link = link_state
-        .find_node_link(link.clone(), source_path.as_str())
+    let link_found = link_state
+        .locate_node(link.clone(), source_path.as_str())
         .await
         .forward_with::<LinkError, _>(|| {
             format!(
@@ -278,8 +279,8 @@ pub async fn add(
             )
         })?;
 
-    lore_debug!("Link target node is {link_node_link:?}");
-    if !link_node_link.is_valid_or_root() {
+    lore_debug!("Link target node is {:?}", link_found.identity());
+    if !link_found.is_valid_or_root() {
         return Err(InvalidPath {
             path: source_path.to_string(),
         }
@@ -287,15 +288,15 @@ pub async fn add(
     }
 
     // Target node must be in the given link repository, not a link itself
-    if link_node_link.repository != link.id {
+    let Some(link_target) = link_found.own_node() else {
         return Err(LinkError::internal(
             "Link path is a link itself, link to the target repository directly",
         ));
-    }
+    };
 
     // Target node must be a directory
     let link_node = link_state
-        .node(link.clone(), link_node_link.node)
+        .node(link.clone(), link_target)
         .await
         .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
 
@@ -308,10 +309,9 @@ pub async fn add(
     let clone_path = link_path.clone();
 
     // The stored path rather than the argument, which resolved case-insensitively.
-    let resolved_source_path =
-        link::link_source_path(link.clone(), &link_state, link_node_link.node)
-            .await
-            .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
+    let resolved_source_path = link::link_source_path(link.clone(), &link_state, link_target)
+        .await
+        .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
 
     let (link_flags, stored_branch) = if let Some(row) = mounted {
         (LinkFlags::from_bits_retain(row.flags()), row.branch())
@@ -333,14 +333,15 @@ pub async fn add(
     .await
     .forward::<LinkError>("Failed checking link source paths")?;
 
-    if let Ok(node_link) = inner_state
-        .find_relative_node_link(
+    if let Ok(node_id) = inner_state
+        .locate_node_below(
             inner_repository.clone(),
             chain.innermost.node,
             remainder_path.as_str(),
         )
         .await
-        && let Ok(node) = inner_state.node(inner_repository.clone(), node_link.node).await
+        .and_then(FoundNode::into_own_node)
+        && let Ok(node) = inner_state.node(inner_repository.clone(), node_id).await
         // Allow re-adding a link to a path that is staged for delete
         && !node.is_staged_delete()
     {
@@ -351,13 +352,10 @@ pub async fn add(
             )));
         }
 
-        let mut children = StateNodeChildrenIterator::new(
-            inner_state.clone(),
-            inner_repository.clone(),
-            node_link.node,
-        )
-        .await
-        .forward::<LinkError>("Failed deserializing state node block")?;
+        let mut children =
+            StateNodeChildrenIterator::new(inner_state.clone(), inner_repository.clone(), node_id)
+                .await
+                .forward::<LinkError>("Failed deserializing state node block")?;
 
         // Prevent the directory having children
         if let Ok(child) = children.next().await
@@ -389,7 +387,7 @@ pub async fn add(
         lore_debug!("Staging link node");
         let node = Node {
             flags: NodeFlags::Link.bits(),
-            child: link_node_link.node,
+            child: link_target,
             address: Address {
                 hash: link_revision,
                 context: link.id.into(),
@@ -450,15 +448,11 @@ pub async fn add(
             stats: stats.clone(),
             modified_times: operation.modified_times(),
         };
-        clone::clone_node(
-            clone_ctx,
-            storage,
-            clone_path,
-            link_node_link.node,
-            clone_states,
-        )
-        .await
-        .forward_with::<LinkError, _>(|| format!("Failed cloning linked repository {}", link.id))?;
+        clone::clone_node(clone_ctx, storage, clone_path, link_target, clone_states)
+            .await
+            .forward_with::<LinkError, _>(|| {
+                format!("Failed cloning linked repository {}", link.id)
+            })?;
 
         event::LoreEvent::RepositoryCloneEnd(LoreRepositoryCloneEndEventData {
             branch: branch_name.into(),

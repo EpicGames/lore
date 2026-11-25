@@ -230,8 +230,8 @@ pub(crate) async fn file_node_outside_links(
 ) -> Result<NodeID, MetadataErrors> {
     let relative_path = RelativePath::new_from_user_path(repository.require_path()?, path)
         .forward_any::<MetadataErrors>("resolving user path")?;
-    let node_link = state
-        .find_node_link(repository.clone(), relative_path.as_str())
+    let found = state
+        .locate_node(repository.clone(), relative_path.as_str())
         .await
         .map_matched_err("finding node", |m| match m {
             MatchedStateErrors::NodeNotFound(traced) => MetadataErrors::FileNotFound(
@@ -242,19 +242,18 @@ pub(crate) async fn file_node_outside_links(
             ),
             other => other.forward::<MetadataErrors>("finding node"),
         })?;
-    if !node_link.is_valid() {
+    if !found.is_valid() {
         return Err(FileNotFound {
             resource: path.to_string(),
         }
         .into());
     }
-    if node_link.crosses_link(repository, state) {
-        return Err(NotSupported {
+    found.own_node().ok_or_else(|| {
+        NotSupported {
             operation: format!("file metadata on `{relative_path}`, which is inside a link"),
         }
-        .into());
-    }
-    Ok(node_link.node)
+        .into()
+    })
 }
 
 /// Which of a source revision's keys a merge or cherry-pick carries onto the

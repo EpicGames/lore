@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 import json
 import os
+import re
 
 import pytest
 from error_types import (
@@ -11,6 +12,7 @@ from error_types import (
     NotSupportedError,
 )
 from link_helpers import (
+    DEFAULT_LINK_MOUNT,
     assert_crr_clean,
     assert_mount_exposes,
     build_nested_link_repos_at,
@@ -1052,3 +1054,45 @@ def test_dry_run_unstage_and_reset_keep_a_staged_link_change(new_lore_repo, chan
     repo.unstage("lnk")
 
     assert (repo.link_list(), repo.read_files()) == committed
+
+
+def dumped_id(repo: Lore, path: str) -> str:
+    """The node id `repository dump --path` reports for `path`."""
+    name = re.escape(os.path.basename(path))
+    match = re.search(
+        rf"^{name} id (\d+)\b", repo.repository_dump(path=path), re.MULTILINE
+    )
+    assert match, path
+    return match.group(1)
+
+
+@pytest.mark.smoke
+def test_link_reset_of_a_linked_path_leaves_a_parent_move_beside_a_deleted_node(
+    new_lore_repo,
+):
+    """A reset of a path inside a link resets the linked file and keeps the parent's dirty move
+    onto a deleted node of the same name, though both repositories number that node alike."""
+    repo, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        parent_files={"README.txt": "parent\n", "b.txt": "moved\n"},
+        link_files={"README.txt": "linked\n"},
+    )
+    linked = f"{DEFAULT_LINK_MOUNT}/README.txt"
+    assert dumped_id(repo, "README.txt") == dumped_id(repo, linked)
+    repo.remove_file("README.txt")
+    repo.dirty("README.txt")
+    os.rename(os.path.join(repo.path, "b.txt"), os.path.join(repo.path, "README.txt"))
+    repo.dirty_move("b.txt", "README.txt")
+    status = parse_status_json(repo.status(json=True))
+    repo.write_files({linked: "local\n"})
+
+    repo.file_reset(linked)
+
+    files = repo.read_files()
+    assert files[linked] == "linked\n"
+    assert files["README.txt"] == "moved\n"
+    assert "b.txt" not in files
+    assert parse_status_json(repo.status(json=True)) == status
+    assert ("README.txt", "move", "b.txt") in {
+        (entry["path"], entry["action"], entry["fromPath"]) for entry in status
+    }

@@ -57,6 +57,7 @@ use crate::stage;
 use crate::state;
 use crate::state::Clear;
 use crate::state::Ext;
+use crate::state::FoundNode;
 use crate::state::LinkPin;
 use crate::state::LinkPinAgreement;
 use crate::state::LinkReference;
@@ -1579,7 +1580,7 @@ async fn carry_mount(
         path: path.to_string(),
     };
     let found = match target
-        .find_node_link(link_context.clone(), path.as_str())
+        .locate_node(link_context.clone(), path.as_str())
         .await
     {
         Err(err) if err.is_node_not_found() => {
@@ -1589,10 +1590,7 @@ async fn carry_mount(
         }
         found => found?,
     };
-    if !found.is_valid_or_root() {
-        return Err(invalid().into());
-    }
-    Ok(found.node)
+    found.own_node().ok_or_else(|| invalid().into())
 }
 
 /// A linked repository's state, with the context reaching it.
@@ -1729,7 +1727,7 @@ pub struct ResolvedLinkChain {
 
 /// Resolve `remainder_path`, which names a path below `base`, down through any
 /// link boundaries into the crossed links, the innermost mapping and what is left
-/// unconsumed there. Like `find_relative_node_link` but records each crossed link.
+/// unconsumed there. Like `State::locate_node_below` but records each crossed link.
 /// Bounded by `MAX_LINK_DEPTH` and a visited-repository set.
 ///
 /// Both ends take the same shape: a mapping plus the remainder below it is the path in the
@@ -1937,22 +1935,23 @@ impl ResolvedLinkChain {
         let NodeMapping {
             repository, state, ..
         } = &self.innermost;
-        let node_link = state
-            .find_relative_node_link(
+        let node_id = state
+            .locate_node_below(
                 repository.clone(),
                 self.innermost.node,
                 self.remainder_path.as_str(),
             )
             .await
+            .and_then(FoundNode::into_own_node)
             .forward::<LinkError>("Invalid path")?;
-        if !node_link.is_valid() {
+        if !node_id.is_valid_node_id() {
             return Err(InvalidPath {
                 path: link_path.to_string(),
             }
             .into());
         }
         let link_node = state
-            .node(repository.clone(), node_link.node)
+            .node(repository.clone(), node_id)
             .await
             .forward::<LinkError>("Failed deserializing state")?;
         if !link_node.is_link() {
@@ -1961,7 +1960,7 @@ impl ResolvedLinkChain {
             }
             .into());
         }
-        Ok((node_link.node, link_node))
+        Ok((node_id, link_node))
     }
 
     /// The child (state, repository) mounted by level `index`: the next level's
@@ -2286,18 +2285,19 @@ pub async fn restore_link_paths_from_state(
                 continue;
             }
 
-            let node_link = link_state
-                .find_relative_node_link(link_context.clone(), mounted, link_relative.as_str())
+            let Some(node_id) = link_state
+                .locate_node_below(link_context.clone(), mounted, link_relative.as_str())
                 .await
-                .forward::<LinkError>("Failed resolving link node")?;
-            if !node_link.is_valid_or_root() {
+                .forward::<LinkError>("Failed resolving link node")?
+                .own_node()
+            else {
                 continue;
-            }
+            };
             let block = link_state
-                .block(link_context.clone(), NodeBlock::index(node_link.node))
+                .block(link_context.clone(), NodeBlock::index(node_id))
                 .await
                 .forward::<LinkError>("Failed deserializing state node block")?;
-            let node = block.node(Node::index(node_link.node));
+            let node = block.node(Node::index(node_id));
             if !node.is_file() {
                 continue;
             }
@@ -3219,32 +3219,25 @@ async fn resolve_link_node_at_path(
     repository: Arc<RepositoryContext>,
     link_path: &str,
 ) -> Result<LinkNodeAtPath, LinkError> {
-    let node_link = state
-        .find_node_link(repository.clone(), link_path)
+    let found = state
+        .locate_node(repository.clone(), link_path)
         .await
         .forward::<LinkError>("Invalid path")?;
 
-    if !node_link.is_valid() {
+    if !found.is_valid() {
         return Err(InvalidPath {
             path: link_path.to_string(),
         }
         .into());
     }
 
-    // `find_node_link` may have crossed parent links; resolve the owning repo
-    // and its state so the node/reference lookups target the right registry.
-    let (parent_repository, parent_state) = if node_link.repository == repository.id {
-        (repository.clone(), state.clone())
-    } else {
-        let owning = repository.to_link_context(node_link.repository).await;
-        let owning_state = State::deserialize(owning.clone(), node_link.revision)
-            .await
-            .forward::<LinkError>("Failed deserializing state")?;
-        (owning, owning_state)
-    };
+    // The path may cross parent links, so the node and reference lookups target the registry of
+    // the repository holding the link node.
+    let (local_node, (parent_repository, parent_state)) =
+        found.held((repository, state.clone())).into_parts();
 
     let link_node = parent_state
-        .node(parent_repository.clone(), node_link.node)
+        .node(parent_repository.clone(), local_node)
         .await
         .forward::<LinkError>("Failed deserializing state")?;
 
@@ -3262,7 +3255,7 @@ async fn resolve_link_node_at_path(
     Ok(LinkNodeAtPath {
         parent_repository,
         parent_state,
-        local_node: node_link.node,
+        local_node,
         link_node,
         link_context,
     })
@@ -3292,7 +3285,7 @@ pub async fn link_context_at_path(
 
 /// Resolves a link by path to its full context.
 ///
-/// Finds the node via `find_node_link` (which descends through any parent
+/// Finds the node via `State::locate_node` (which descends through any parent
 /// links), then looks up the node and its `LinkReference` in the OWNING
 /// repository — the innermost containing repo for a nested link, not the
 /// top-level one. `parent_repository`/`parent_state`/`local_node` identify
@@ -3623,21 +3616,21 @@ async fn link_node_at_path(
     repository: Arc<RepositoryContext>,
     link_path: &str,
 ) -> Result<Option<(NodeID, Node)>, LinkError> {
-    let node_link = match state.find_node_link(repository.clone(), link_path).await {
-        Ok(node_link) => node_link,
+    let found = match state.locate_node(repository.clone(), link_path).await {
+        Ok(found) => found,
         Err(err) if err.is_node_not_found() => return Ok(None),
         Err(err) => return Err(err).forward::<LinkError>("Failed resolving link path"),
     };
-    if !node_link.is_valid() || node_link.repository != repository.id {
+    let Some(node_id) = found.own_node().filter(NodeIDExt::is_valid_node_id) else {
         return Ok(None);
-    }
+    };
 
     let node = state
-        .node(repository, node_link.node)
+        .node(repository, node_id)
         .await
         .forward::<LinkError>("Failed deserializing state")?;
 
-    Ok(node.is_link().then_some((node_link.node, node)))
+    Ok(node.is_link().then_some((node_id, node)))
 }
 
 /// Whether `changes`, a merge's diff sorted by path, delete the link to `link_repository` at
@@ -4228,9 +4221,9 @@ async fn classify_link_pin(
         && let Some((state_incoming_pin, current_mount)) = &kept_mount
     {
         conflicted = !state_incoming_pin
-            .find_node_link(link_context.clone(), current_mount.as_str())
+            .locate_node(link_context.clone(), current_mount.as_str())
             .await
-            .is_ok_and(|node_link| node_link.is_valid_or_root());
+            .is_ok_and(|found| found.is_valid_or_root());
     }
 
     let carried = incoming_row.carried(sides.incoming_branch, sides.staged_branch);
@@ -4261,13 +4254,13 @@ async fn classify_link_pin(
         Some((state_target_pin, _, _, incoming_mount)) => {
             // A remount the pin does not travel with lands at the pin this branch keeps, and one
             // that pin does not hold leaves the two sides' rows for the user to choose between.
-            let node_link = state_target_pin
-                .find_node_link(link_context, incoming_mount.as_str())
+            let node_id = state_target_pin
+                .locate_node(link_context, incoming_mount.as_str())
                 .await
                 .ok()
-                .filter(|node_link| node_link.is_valid_or_root());
-            match node_link {
-                Some(node_link) => Some((incoming_mount, node_link.node)),
+                .and_then(|found| found.own_node());
+            match node_id {
+                Some(node_id) => Some((incoming_mount, node_id)),
                 None => return conflict(carried, incoming_node.child),
             }
         }

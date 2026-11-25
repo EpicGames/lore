@@ -146,17 +146,13 @@ async fn stage_into_single_layer(
     // need to stage the link node and upwards in the layer repository.
     let layer_staged_node = layer_state
         .state_staged
-        .find_node_link(layer_state.repository.clone(), layer_source_path.as_str())
+        .locate_node(layer_state.repository.clone(), layer_source_path.as_str())
         .await
-        .forward::<StageError>("Failed to locate layer source base node")?;
-
-    let (layer_repository, layer_state_staged) = layer_staged_node
-        .resolve(
+        .forward::<StageError>("Failed to locate layer source base node")?
+        .held((
             layer_state.repository.clone(),
             layer_state.state_staged.clone(),
-        )
-        .await
-        .forward::<StageError>("Failed to locate layer source base node")?;
+        ));
 
     lore_debug!(
         "Staging path in layer {}: {} / {}",
@@ -169,12 +165,7 @@ async fn stage_into_single_layer(
         tasks,
         stage::stage_filesystem_path(
             operation,
-            NodeMapping {
-                repository: layer_repository,
-                state: layer_state_staged,
-                path: layer_mount_path,
-                node: layer_staged_node.node,
-            },
+            layer_staged_node.into_mapping(layer_mount_path),
             remain,
             KnownChild::Unresolved,
             stats,
@@ -663,14 +654,14 @@ async fn carried_where_absent(
     state: &Arc<State>,
     path: &RelativePath,
 ) -> Result<bool, StageError> {
-    let Ok((node_link, (held_repository, held_state))) = state
-        .find_relative_held(repository.clone(), ROOT_NODE, path.as_str())
+    let Ok(held) = state
+        .locate_held_node_below(repository.clone(), ROOT_NODE, path.as_str())
         .await
     else {
         return Ok(false);
     };
-    let node = held_state
-        .node(held_repository, node_link.node)
+    let node = held
+        .read()
         .await
         .forward::<StageError>("Failed to read a directory the working tree no longer holds")?;
     Ok(state::marked_directory_carried_by_children(&node))
@@ -1326,19 +1317,20 @@ async fn resolve_stage_target(
         )> = if relative_path.is_empty() {
             // Root path is always a directory in the main repository.
             Some((state.clone(), repository.clone(), ROOT_NODE, true))
-        } else if let Ok((node_link, (resolved_repository, resolved_state))) = state
-            .find_relative_held(repository.clone(), ROOT_NODE, relative_path.as_str())
+        } else if let Ok(held) = state
+            .locate_held_node_below(repository.clone(), ROOT_NODE, relative_path.as_str())
             .await
-            && node_link.is_valid()
+            && held.id().is_valid_node_id()
         {
-            let node = resolved_state
-                .node(resolved_repository.clone(), node_link.node)
+            let node = held
+                .read()
                 .await
                 .forward::<StageError>("Failed to resolve node for dirty staging")?;
+            let (id, (resolved_repository, resolved_state)) = held.into_parts();
             Some((
                 resolved_state,
                 resolved_repository,
-                node_link.node,
+                id,
                 node.is_directory() && !node.is_dirty_delete(),
             ))
         } else {

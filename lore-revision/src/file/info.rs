@@ -295,24 +295,21 @@ impl InfoTree {
         repository: &Arc<RepositoryContext>,
         path: &RelativePath,
     ) -> Result<Option<(NodeID, Node)>, InfoError> {
-        let Some(link) = absent_unless_refused::<_, _, InfoError>(
+        let Some(id) = absent_unless_refused::<_, _, InfoError>(
             self.state
-                .find_node_link(repository.clone(), path.as_str())
+                .locate_node(repository.clone(), path.as_str())
                 .await,
             "finding the node in the measured tree",
         )?
-        else {
+        .and_then(|found| found.own_node()) else {
             return Ok(None);
         };
-        if link.repository != repository.id {
-            return Ok(None);
-        }
         let node = self
             .state
-            .node(repository.clone(), link.node)
+            .node(repository.clone(), id)
             .await
             .forward::<InfoError>("reading the node in the measured tree")?;
-        Ok(Some((link.node, node)))
+        Ok(Some((id, node)))
     }
 }
 
@@ -329,15 +326,16 @@ async fn info_path(
     sizes: RequestedSizes,
 ) -> Result<(), InfoError> {
     let RequestedSizes { local, filtered } = sizes;
-    if let Some(node_link) = absent_unless_refused::<_, _, InfoError>(
+    if let Some(found) = absent_unless_refused::<_, _, InfoError>(
         state_current
-            .find_node_link(repository.clone(), path.as_str())
+            .locate_node(repository.clone(), path.as_str())
             .await,
         "finding the node",
     )? {
         // TODO(vri): UCS-19229 - Links: Handle link nodes in file info lookup
+        let node_id = found.identity().node;
         let node_path = state_current
-            .node_path(repository.clone(), node_link.node)
+            .node_path(repository.clone(), node_id)
             .await
             .map_err(|err| {
                 forward_refusal_or(err, "reading the node path", |_err| {
@@ -348,7 +346,7 @@ async fn info_path(
             })?;
 
         let node = state_current
-            .node(repository.clone(), node_link.node)
+            .node(repository.clone(), node_id)
             .await
             .map_err(|err| {
                 forward_refusal_or(err, "reading the node", |_err| {
@@ -399,7 +397,7 @@ async fn info_path(
 
         let is_modified = matches!(local_filtered.comparison, Some(NodeComparison::Differs));
 
-        let node_size = if node_link.node == ROOT_NODE {
+        let node_size = if node_id == ROOT_NODE {
             let tree = state_current
                 .tree(repository.clone())
                 .await
@@ -426,7 +424,7 @@ async fn info_path(
         })
         .send();
 
-        let metadata_node = node::node_to_file_metadata(node_link.node);
+        let metadata_node = node::node_to_file_metadata(node_id);
         let metadata_block_index = NodeFileMetadataBlock::index(metadata_node);
         let metadata_node_index = NodeFileMetadata::index(metadata_node);
 
@@ -926,17 +924,20 @@ async fn read_held_directory(
         (ancestor.repository, ancestor.state, ancestor.node)
     } else {
         let below = path.as_str()[ancestor.path_len..].trim_start_matches('/');
-        match absent_unless_refused::<_, _, InfoError>(
+        let Some(found) = absent_unless_refused::<_, _, InfoError>(
             ancestor
                 .state
-                .find_relative(ancestor.repository.clone(), ancestor.node, below)
+                .locate_node_below(ancestor.repository.clone(), ancestor.node, below)
                 .await,
             "finding a directory of the measured tree",
-        )? {
-            Some((link, Some((repository, state)))) => (repository, state, link.node),
-            Some((link, None)) => (ancestor.repository, ancestor.state, link.node),
-            None => return Ok(None),
-        }
+        )?
+        else {
+            return Ok(None);
+        };
+        let (node, (repository, state)) = found
+            .held((ancestor.repository, ancestor.state))
+            .into_parts();
+        (repository, state, node)
     };
     let held = state
         .node(repository.clone(), node)

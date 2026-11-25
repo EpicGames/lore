@@ -76,6 +76,7 @@ use crate::revision::sync::SyncVerifyArgs;
 use crate::revision::sync::SyncVerifyStats;
 use crate::stage;
 use crate::state;
+use crate::state::HeldNode;
 use crate::state::Mark;
 use crate::state::NameChange;
 use crate::state::NodeComparison;
@@ -703,25 +704,6 @@ fn changes_in_dependency_set(
         .collect()
 }
 
-/// The node `current` holds at `path`, as [`NodeMapping::node_at`] finds it, with the context and
-/// state holding it: the linked ones the walk opened where `path` crosses a link, and `current`'s
-/// own elsewhere.
-async fn held_at(
-    current: &NodeMapping,
-    path: &RelativePath,
-) -> Option<(NodeID, crate::link::LinkedState)> {
-    let below = path.below(&current.path)?;
-    let (node_link, linked) = current
-        .state
-        .find_relative(current.repository.clone(), current.node, below)
-        .await
-        .ok()?;
-    node_link.node.is_valid_node_id().then(|| {
-        let held = linked.unwrap_or_else(|| (current.repository.clone(), current.state.clone()));
-        (node_link.node, held)
-    })
-}
-
 /// How the working file at `repository_path`, the path a change names or the one a move carries
 /// its file from, compares to the node it was realized from, and whether the current revision is
 /// what holds that node.
@@ -760,7 +742,10 @@ fn modification_against_measured_node<'a>(
 
         let from_is_current = change.from.mapping.state.revision() == current.state.revision();
         let held = if !from_is_current {
-            held_at(current, repository_path).await
+            current
+                .held_at(repository_path)
+                .await
+                .map(HeldNode::into_parts)
         } else if change.from.mapping.node.is_valid_node_id()
             || !info.is_file()
             || incoming.link_delete_above(repository_path).is_none()
@@ -986,14 +971,14 @@ async fn link_held_at(
     mapping: &NodeMapping,
     path: &RelativePath,
 ) -> Result<Option<(Arc<RepositoryContext>, Node)>, SyncError> {
-    let Some((found, (repository, state))) = held_at(mapping, path).await else {
+    let Some(held) = mapping.held_at(path).await else {
         return Ok(None);
     };
-    let node = state
-        .node(repository.clone(), found)
+    let node = held
+        .read()
         .await
         .forward::<SyncError>("Failed loading the link node the working tree stands on")?;
-    Ok(node.is_link().then_some((repository, node)))
+    Ok(node.is_link().then(|| (held.repository().clone(), node)))
 }
 
 /// What a sync does with the mount of a link it deletes or moves, once [`verify_mount`] has found
@@ -1309,16 +1294,9 @@ async fn incoming_tree_meets(
 ) -> Result<bool, SyncError> {
     let mut path = kept.path.clone();
     while path.as_str() != incoming.path.as_str() && incoming.path.covers(&path) {
-        let found = incoming.node_at(&path).await;
-        if found.node.is_valid_node_id() {
-            let (repository, state) = found
-                .resolve(incoming.repository.clone(), incoming.state.clone())
-                .await
-                .forward_with::<SyncError, _>(|| {
-                    format!("Failed to deserialize state {}", found.revision)
-                })?;
-            let is_directory = state
-                .node(repository, found.node)
+        if let Some(held) = incoming.held_at(&path).await {
+            let is_directory = held
+                .read()
                 .await
                 .forward::<SyncError>("Failed loading the incoming node")?
                 .is_directory();
@@ -1928,16 +1906,12 @@ impl IncomingChanges {
             .as_str()
             .splitn(mount_components + 1, '/')
             .nth(mount_components)?;
-        let (found, nested) = state
-            .find_relative(repository.clone(), *mounted, below)
+        let held = state
+            .locate_node_below(repository.clone(), *mounted, below)
             .await
-            .ok()?;
-        found.node.is_valid_node_id().then(|| {
-            (
-                found.node,
-                nested.unwrap_or_else(|| (repository.clone(), state.clone())),
-            )
-        })
+            .ok()?
+            .held((repository.clone(), state.clone()));
+        held.id().is_valid_node_id().then(|| held.into_parts())
     }
 
     /// The link delete mounted above `path`, or at it where `at_path` says so, the outermost
@@ -2406,15 +2380,13 @@ async fn tracked_source(
     from: &RelativePath,
 ) -> Option<(Arc<RepositoryContext>, Node)> {
     let repository = change.from.mapping.repository.clone();
-    if let Some(current) = merge_current {
-        let link = NodeMapping::root(repository.clone(), current.clone())
-            .node_at(from)
-            .await;
-        if link.node.is_valid_node_id() {
-            let (repository, state) = link.resolve(repository, current.clone()).await.ok()?;
-            let node = state.node(repository.clone(), link.node).await.ok()?;
-            return Some((repository, node));
-        }
+    if let Some(current) = merge_current
+        && let Some(held) = NodeMapping::root(repository.clone(), current.clone())
+            .held_at(from)
+            .await
+    {
+        let node = held.read().await.ok()?;
+        return Some((held.repository().clone(), node));
     }
     let node = change.from.get_node().await.ok()?;
     Some((repository, node))
@@ -2870,14 +2842,11 @@ pub async fn verify_filesystem(
         }
 
         if is_delete {
-            let current_node_link = current.node_at(change.path()).await;
-            let (repository_current, state_current) = current_node_link
-                .resolve(repository.clone(), current.state.clone())
+            let (subnode_current, (repository_current, state_current)) = current
+                .node_at(change.path())
                 .await
-                .forward_with::<SyncError, _>(|| {
-                    format!("Failed to deserialize state {}", current_node_link.revision)
-                })?;
-            let subnode_current = current_node_link.node;
+                .held((repository.clone(), current.state.clone()))
+                .into_parts();
             let state_from = change.from.mapping.state.clone();
             let mut directory_changes = state::diff_filesystem_subtree(
                 &operation,
@@ -4980,9 +4949,10 @@ pub(crate) async fn relink_moved_node(
     is_merge: bool,
 ) -> Result<NodeID, SyncError> {
     let new_parent_id = state_stage
-        .find_node_link(repository.clone(), to_path.parent().unwrap_or(""))
+        .locate_node(repository.clone(), to_path.parent().unwrap_or(""))
         .await
         .forward::<SyncError>("Failed to stage change")?
+        .identity()
         .node;
 
     let from_name = from_path.name();
@@ -5080,10 +5050,10 @@ pub(crate) async fn stage_realized_delete(
     is_merge: bool,
 ) -> Result<(), SyncError> {
     let node_link = match state_stage
-        .find_node_link(repository.clone(), change.path().as_str())
+        .locate_node(repository.clone(), change.path().as_str())
         .await
     {
-        Ok(node_link) => node_link,
+        Ok(found) => found.identity(),
         Err(e) if e.is_node_not_found() => return Ok(()),
         Err(err) => return Err(err).forward::<SyncError>("Failed to stage change"),
     };
@@ -5147,9 +5117,10 @@ pub(crate) fn stage_realized_change<'a>(
             && let Some(from_path) = change.move_source()
         {
             let from_node = state_stage
-                .find_node_link(repository.clone(), from_path.as_str())
+                .locate_node(repository.clone(), from_path.as_str())
                 .await
                 .forward::<SyncError>("Failed to stage change")?
+                .identity()
                 .node;
             relink_moved_node(
                 state_stage,

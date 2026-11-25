@@ -556,9 +556,9 @@ async unsafe fn get_directory_enumeration_async(
                 if layer.mount_path.is_empty()
                     || layer.mount_path.as_str().starts_with(file_path.as_str())
                 {
-                    let Ok(node_link) = layer
+                    let Ok(found) = layer
                         .state
-                        .find_node_link(layer.repository.clone(), relative_path.as_str())
+                        .locate_node(layer.repository.clone(), relative_path.as_str())
                         .await
                     else {
                         lore_debug!(
@@ -566,14 +566,13 @@ async unsafe fn get_directory_enumeration_async(
                         );
                         continue;
                     };
-                    if node_link.repository != layer.repository.id {
+                    let Some(node) = found.own_node() else {
                         lore_debug!("Layer {layer_index} modules not yet supported");
                         continue;
-                    }
-                    base_nodes[layer_index] = Some(node_link.node);
+                    };
+                    base_nodes[layer_index] = Some(node);
                     lore_debug!(
-                        "Layer {layer_index} base directory: {relative_path} (node {})",
-                        node_link.node
+                        "Layer {layer_index} base directory: {relative_path} (node {node})"
                     );
                 }
             } else if layer.mount_path.is_empty() {
@@ -604,17 +603,17 @@ async unsafe fn get_directory_enumeration_async(
                     if layer.mount_path.is_empty()
                         || layer.mount_path.as_str().starts_with(directory_path)
                     {
-                        if let Ok(base_link) = layer
+                        if let Ok(found) = layer
                             .state
-                            .find_node_link(layer.repository.clone(), relative_path.as_str())
+                            .locate_node(layer.repository.clone(), relative_path.as_str())
                             .await
                         {
-                            base_nodes[layer_index] = Some(base_link.node);
+                            base_nodes[layer_index] = found.own_node();
                             lore_debug!(
-                                "Search directory: Layer {layer_index} search {} directory {} matched node {}",
+                                "Search directory: Layer {layer_index} search {} directory {} matched node {:?}",
                                 enum_instance.search,
                                 directory_path,
-                                base_nodes[layer_index].unwrap_or_default()
+                                base_nodes[layer_index]
                             );
                         } else {
                             lore_debug!(
@@ -843,20 +842,17 @@ async unsafe fn get_placeholder_info_async(
             RelativePath::new_from_mount_path(repository.require_path()?, path.as_str())
                 .unwrap_or_default();
 
-        let Ok(node_link) = state
-            .find_node_link(repository.clone(), relative_path.as_str())
+        let Ok(found) = state
+            .locate_node(repository.clone(), relative_path.as_str())
             .await
         else {
             continue;
         };
-        if !node_link.is_valid() {
+        if !found.is_valid() {
             continue;
         }
-        let Ok((repository, state)) = node_link.resolve(repository.clone(), state.clone()).await
-        else {
-            continue;
-        };
-        let Ok(node) = state.node(repository.clone(), node_link.node).await else {
+        let (node_id, (repository, state)) = found.held((repository, state)).into_parts();
+        let Ok(node) = state.node(repository.clone(), node_id).await else {
             continue;
         };
         if node.is_staged_delete() {
@@ -953,12 +949,12 @@ async fn query_file_name_async(
     relative_path: RelativePath,
 ) -> Result<NodeLink, i32> {
     for layer in instance_context.layers.iter() {
-        if let Ok(node_link) = layer
+        if let Ok(found) = layer
             .state
-            .find_node_link(layer.repository.clone(), relative_path.as_str())
+            .locate_node(layer.repository.clone(), relative_path.as_str())
             .await
         {
-            return Ok(node_link);
+            return Ok(found.identity());
         }
     }
 
@@ -1007,26 +1003,23 @@ async fn get_file_data_async(
     lore_debug!("Get file data: {path}");
 
     for layer in instance_context.layers.iter() {
-        let Ok(node_link) = layer
+        let Ok(found) = layer
             .state
-            .find_node_link(layer.repository.clone(), path.as_str())
+            .locate_node(layer.repository.clone(), path.as_str())
             .await
         else {
             continue;
         };
 
-        if !node_link.is_valid() {
+        if !found.is_valid() {
             continue;
         }
 
-        let Ok((repository, state)) = node_link
-            .resolve(layer.repository.clone(), layer.state.clone())
-            .await
-        else {
-            continue;
-        };
+        let (node_id, (repository, state)) = found
+            .held((layer.repository.clone(), layer.state.clone()))
+            .into_parts();
 
-        let Ok(node) = state.node(repository.clone(), node_link.node).await else {
+        let Ok(node) = state.node(repository.clone(), node_id).await else {
             continue;
         };
 
@@ -1132,36 +1125,29 @@ async fn prefetch_files(
             let repository = repository.clone();
             let state = state.clone();
             async move {
-                if let Ok(node_link) = state
-                    .find_node_link(repository.clone(), path.as_str())
-                    .await
-                {
-                    if node_link.is_valid() {
-                        if let Ok((repository, state)) = node_link.resolve(repository, state).await
-                        {
-                            if let Ok(node) = state.node(repository.clone(), node_link.node).await {
-                                if !node.address.hash.is_zero() {
-                                    let _ = immutable::cache(
-                                        repository.clone(),
-                                        vec![node.address],
-                                        true,
-                                    )
-                                    .await;
+                if let Ok(found) = state.locate_node(repository.clone(), path.as_str()).await {
+                    if found.is_valid() {
+                        let (node_id, (repository, state)) =
+                            found.held((repository, state)).into_parts();
+                        if let Ok(node) = state.node(repository.clone(), node_id).await {
+                            if !node.address.hash.is_zero() {
+                                let _ =
+                                    immutable::cache(repository.clone(), vec![node.address], true)
+                                        .await;
 
-                                    if let Ok(result) = repository
-                                        .immutable_store()
-                                        .query(repository.id, node.address, StoreMatch::MatchHash)
-                                        .await
-                                    {
-                                        /*
-                                        file_count
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        */
-                                        file_size.fetch_add(
-                                            result.fragment.size_content as usize,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
-                                    }
+                                if let Ok(result) = repository
+                                    .immutable_store()
+                                    .query(repository.id, node.address, StoreMatch::MatchHash)
+                                    .await
+                                {
+                                    /*
+                                    file_count
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    */
+                                    file_size.fetch_add(
+                                        result.fragment.size_content as usize,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
                                 }
                             }
                         }

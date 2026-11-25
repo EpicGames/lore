@@ -237,9 +237,10 @@ pub(crate) async fn write_file(
         .forward::<WriteError>("Failed to deserialize state")?;
 
     let Some((node_id, (link_repository, link_state))) = state
-        .find_relative_held_if_present(repository.clone(), ROOT_NODE, relative_path.as_str())
+        .locate_held_node_below_if_present(repository.clone(), ROOT_NODE, relative_path.as_str())
         .await
         .forward_any::<WriteError>("finding the node")?
+        .map(state::HeldNode::into_parts)
     else {
         return Err(FileNotFound {
             resource: relative_path.to_string(),

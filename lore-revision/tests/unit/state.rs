@@ -31,6 +31,7 @@ mod attach;
 mod chain_log;
 mod diff;
 mod discard;
+mod found;
 mod hierarchy_walk;
 mod link_target;
 mod namespace;

@@ -1252,8 +1252,8 @@ async fn diff_read_file(
         }
     };
 
-    let node_link = state
-        .find_node_link(repository.clone(), relative_path.as_str())
+    let (node, (repository, state)) = state
+        .locate_node(repository.clone(), relative_path.as_str())
         .await
         .map_err(|err| {
             forward_refusal_or(err, "finding the file to diff", |_err| {
@@ -1261,19 +1261,11 @@ async fn diff_read_file(
                     resource: relative_path.to_string(),
                 })
             })
-        })?;
+        })?
+        .held((repository, state.clone()))
+        .into_parts();
 
-    let (repository, state) = if node_link.repository != repository.id {
-        let repository = repository.to_link_context(node_link.repository).await;
-        let state = state::State::deserialize(repository.clone(), node_link.revision)
-            .await
-            .forward::<DiffError>("Failed deserializing revision state")?;
-        (repository, state)
-    } else {
-        (repository, state.clone())
-    };
-
-    read_node_content(repository, &state, node_link.node, relative_path).await
+    read_node_content(repository, &state, node, relative_path).await
 }
 
 /// Read and classify the content of one file node in a revision.

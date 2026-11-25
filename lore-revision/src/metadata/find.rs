@@ -46,8 +46,9 @@ async fn linked_file_node(
     path: &RelativePath,
 ) -> Result<Option<(NodeID, LinkedState)>, MetadataErrors> {
     state
-        .find_relative_held_if_present(repository.clone(), ROOT_NODE, path.as_str())
+        .locate_held_node_below_if_present(repository.clone(), ROOT_NODE, path.as_str())
         .await
+        .map(|held| held.map(state::HeldNode::into_parts))
         .forward("finding node")
 }
 

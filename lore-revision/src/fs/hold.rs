@@ -206,12 +206,8 @@ async fn tracked_node(
     state: &State,
     path: &RelativePath,
 ) -> Result<Option<NodeID>, StateError> {
-    match state
-        .find_relative_node_link(repository.clone(), ROOT_NODE, path.as_str())
-        .await
-    {
-        Ok(link) if link.revision == state.revision() => Ok(Some(link.node)),
-        Ok(_) => Ok(None),
+    match state.locate_node(repository.clone(), path.as_str()).await {
+        Ok(found) => Ok(found.own_node()),
         Err(error) if error.is_node_not_found() => Ok(None),
         Err(error) => Err(error),
     }
@@ -792,12 +788,12 @@ async fn side_at(
     (repository, state): (&Arc<RepositoryContext>, &Arc<State>),
     path: &RelativePath,
 ) -> Result<Option<NodeChangeState>, StateError> {
-    let found = state
-        .find_relative_node_link(repository.clone(), ROOT_NODE, path.as_str())
-        .await;
-    let link = match found {
-        Ok(link) if link.revision != state.revision() => return Ok(None),
-        Ok(link) => Some(link),
+    let found = state.locate_node(repository.clone(), path.as_str()).await;
+    let id = match found {
+        Ok(found) => match found.own_node() {
+            Some(id) => Some(id),
+            None => return Ok(None),
+        },
         Err(error) if error.is_node_not_found() => None,
         Err(error) => return Err(error),
     };
@@ -813,11 +809,11 @@ async fn side_at(
         address: Default::default(),
         mode: 0,
     };
-    let Some(link) = link else {
+    let Some(id) = id else {
         return Ok(Some(absent));
     };
-    let node = state.node(repository.clone(), link.node).await?;
-    Ok(Some(absent.from_child(link.node, &node, path.clone())))
+    let node = state.node(repository.clone(), id).await?;
+    Ok(Some(absent.from_child(id, &node, path.clone())))
 }
 
 /// The refusal of what a provider holding whole revisions cannot do, `what` phrased as a verb.
@@ -1227,11 +1223,13 @@ impl<'a, H: HoldHost> Directories<'a, H> {
             }
             let wanted = match side
                 .state
-                .find_relative_node_link(side.repository.clone(), ROOT_NODE, at.as_str())
+                .locate_node(side.repository.clone(), at.as_str())
                 .await
             {
-                Ok(link) if link.revision == side.state.revision() => link.node,
-                Ok(_) => return Ok(None),
+                Ok(found) => match found.own_node() {
+                    Some(id) => id,
+                    None => return Ok(None),
+                },
                 Err(error) if error.is_node_not_found() => return Ok(None),
                 Err(error) => return Err(error),
             };

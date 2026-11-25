@@ -2591,10 +2591,13 @@ impl InstanceOperation for SwfsOperation {
         };
         let repository = resources.repository();
         let node_at = async |path: &RelativePath| match state
-            .find_node_link(repository.clone(), path.as_str())
+            .locate_node(repository.clone(), path.as_str())
             .await
         {
-            Ok(link) if link.is_valid() => Ok(Some((link.repository, link.node, link.revision))),
+            Ok(found) if found.is_valid() => {
+                let link = found.identity();
+                Ok(Some((link.repository, link.node, link.revision)))
+            }
             Ok(_) | Err(StateError::NodeNotFound(_)) => Ok(None),
             Err(err) => Err(FsError::internal_with_context(
                 err,

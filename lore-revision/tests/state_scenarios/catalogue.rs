@@ -67,7 +67,7 @@ const READERS: &[&str] = &[
     "State::collect_named_children_unsorted",
     "State::node_path",
     "State::node_name",
-    "State::find_relative_node_link",
+    "State::locate_node_below",
     "State::collect_dirty_paths",
     "State::node_has_",
     "State::watch_chain",

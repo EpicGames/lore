@@ -7,6 +7,7 @@ mod diff;
 #[cfg(feature = "test-util")]
 pub mod diff;
 pub mod dump;
+mod found;
 pub mod node;
 #[cfg(not(feature = "test-util"))]
 pub(crate) mod os_diff;
@@ -45,6 +46,8 @@ pub use diff::GraftOracle;
 #[cfg(target_os = "linux")]
 pub(crate) use diff::diff_states_into;
 pub(crate) use diff::diff_subtree_flagged;
+pub use found::FoundNode;
+pub use found::HeldNode;
 use futures::future::Either;
 use lore_base::error::InvalidPath;
 use lore_base::lore_spawn;
@@ -148,7 +151,6 @@ use crate::immutable::read_options_from_repository;
 use crate::instance::InstanceId;
 use crate::interface::LoreString;
 use crate::link::LinkFlags;
-use crate::link::LinkedState;
 use crate::lore::Address;
 use crate::lore::BranchId;
 use crate::lore::Context;
@@ -5988,72 +5990,79 @@ impl State {
     /// that name, and a revision holding one anyway is not reached through it, whichever case
     /// it is spelled in. Resolution is by name hash, which folds case, so this is the one check
     /// on the path that a listing's skip of such a node does not already cover.
-    ///
-    /// Answers [`Self::find_relative`]'s future itself, mapped to the link, so the caller's future
-    /// holds no second copy of the arguments.
-    pub fn find_relative_node_link<'a>(
-        &'a self,
-        repository: Arc<RepositoryContext>,
-        root: NodeID,
-        path: &'a str,
-    ) -> impl Future<Output = Result<NodeLink, StateError>> + Send + 'a {
-        futures::FutureExt::map(self.find_relative(repository, root, path), |found| {
-            found.map(|(link, _)| link)
-        })
-    }
-
-    /// [`Self::find_relative`], with the repository and state holding the node: the linked ones
-    /// where a link was crossed to reach it, and `repository` and this state otherwise.
-    ///
-    /// Answers [`Self::find_relative`]'s future itself, mapped, so the caller's future holds no
-    /// second copy of the arguments.
-    pub(crate) fn find_relative_held<'a>(
-        self: &'a Arc<Self>,
-        repository: Arc<RepositoryContext>,
-        root: NodeID,
-        path: &'a str,
-    ) -> impl Future<Output = Result<(NodeLink, LinkedState), StateError>> + Send + 'a {
-        let own = (repository.clone(), self.clone());
-        futures::FutureExt::map(self.find_relative(repository, root, path), move |found| {
-            found.map(|(link, held)| (link, held.unwrap_or(own)))
-        })
-    }
-
-    /// [`Self::find_relative_held`] for the node alone, `None` where the tree does not hold `path`.
-    ///
-    /// Answers [`Self::find_relative_held`]'s future itself, mapped, so the caller's future holds
-    /// no second copy of the arguments.
-    pub(crate) fn find_relative_held_if_present<'a>(
-        self: &'a Arc<Self>,
-        repository: Arc<RepositoryContext>,
-        root: NodeID,
-        path: &'a str,
-    ) -> impl Future<Output = Result<Option<(NodeID, LinkedState)>, StateError>> + Send + 'a {
-        futures::FutureExt::map(
-            self.find_relative_held(repository, root, path),
-            |found| match found {
-                Ok((link, held)) => Ok(link.is_valid().then_some((link.node, held))),
-                Err(err) if err.is_node_not_found() => Ok(None),
-                Err(err) => Err(err),
-            },
-        )
-    }
-
-    /// [`Self::find_relative_node_link`], with the linked state holding the node where a link was
-    /// crossed to reach it, for a caller that reads the node.
-    pub(crate) async fn find_relative(
+    pub async fn locate_node_below(
         &self,
         repository: Arc<RepositoryContext>,
         root: NodeID,
         path: &str,
-    ) -> Result<(NodeLink, Option<LinkedState>), StateError> {
+    ) -> Result<FoundNode, StateError> {
         let stop = self
             .find_to_link::<true>(&repository, root, path, false)
             .await?;
         self.find_relative_from(repository, path, stop).await
     }
 
-    /// [`Self::find_relative`] resumed where [`Self::find_to_link`] stopped on `path`, for a
+    /// [`Self::locate_node_below`] from the root.
+    ///
+    /// Answers [`Self::locate_node_below`]'s future itself, so the caller's future holds no second
+    /// copy of the arguments.
+    pub fn locate_node<'a>(
+        &'a self,
+        repository: Arc<RepositoryContext>,
+        path: &'a str,
+    ) -> impl Future<Output = Result<FoundNode, StateError>> + Send + 'a {
+        self.locate_node_below(repository, ROOT_NODE, path)
+    }
+
+    /// [`Self::locate_node_below`], held by the pair that numbers the node.
+    ///
+    /// Answers [`Self::locate_node_below`]'s future itself, mapped, so the caller's future holds no
+    /// second copy of the arguments.
+    pub(crate) fn locate_held_node_below<'a>(
+        self: &'a Arc<Self>,
+        repository: Arc<RepositoryContext>,
+        root: NodeID,
+        path: &'a str,
+    ) -> impl Future<Output = Result<HeldNode, StateError>> + Send + 'a {
+        let searched = (repository.clone(), self.clone());
+        futures::FutureExt::map(
+            self.locate_node_below(repository, root, path),
+            move |found| found.map(|found| found.held(searched)),
+        )
+    }
+
+    /// [`Self::locate_held_node_below`] for a valid node, `None` where the tree does not hold
+    /// `path`.
+    ///
+    /// Answers [`Self::locate_held_node_below`]'s future itself, mapped, so the caller's future
+    /// holds no second copy of the arguments.
+    pub(crate) fn locate_held_node_below_if_present<'a>(
+        self: &'a Arc<Self>,
+        repository: Arc<RepositoryContext>,
+        root: NodeID,
+        path: &'a str,
+    ) -> impl Future<Output = Result<Option<HeldNode>, StateError>> + Send + 'a {
+        futures::FutureExt::map(
+            self.locate_held_node_below(repository, root, path),
+            |found| match found {
+                Ok(held) => Ok(held.id().is_valid_node_id().then_some(held)),
+                Err(err) if err.is_node_not_found() => Ok(None),
+                Err(err) => Err(err),
+            },
+        )
+    }
+
+    /// The node at `path` as a bare link, for tests that read it.
+    #[cfg(feature = "test-util")]
+    pub async fn find_node_link(
+        &self,
+        repository: Arc<RepositoryContext>,
+        path: &str,
+    ) -> Result<NodeLink, StateError> {
+        Ok(self.locate_node(repository, path).await?.identity())
+    }
+
+    /// [`Self::locate_node_below`] resumed where [`Self::find_to_link`] stopped on `path`, for a
     /// caller that reads the stop itself first.
     ///
     /// Not an `async fn`: only a link crossed awaits, and its future holds only what crossing
@@ -6063,16 +6072,13 @@ impl State {
         repository: Arc<RepositoryContext>,
         path: &'a str,
         stop: PathStop,
-    ) -> impl Future<Output = Result<(NodeLink, Option<LinkedState>), StateError>> + Send + 'a {
+    ) -> impl Future<Output = Result<FoundNode, StateError>> + Send + 'a {
         let link = match stop.at {
             Stop::End => {
-                return futures::future::Either::Left(std::future::ready(Ok((
-                    NodeLink {
-                        node: stop.node,
-                        repository: repository.id,
-                        revision: self.revision(),
-                    },
-                    None,
+                return futures::future::Either::Left(std::future::ready(Ok(FoundNode::own(
+                    stop.node,
+                    &repository,
+                    self,
                 ))));
             }
             Stop::Missing => {
@@ -6091,23 +6097,23 @@ impl State {
         futures::future::Either::Right(async move {
             let repository = repository.to_link_context(link.repository).await;
             let link_state = State::deserialize(repository.clone(), link.revision).await?;
-            let (found, held) = link_state
-                .find_relative_boxed(repository.clone(), link.node, rest)
+            let found = link_state
+                .locate_node_below_boxed(repository.clone(), link.node, rest)
                 .await?;
-            Ok((found, held.or(Some((repository, link_state)))))
+            Ok(found.or_held((repository, link_state)))
         })
     }
 
-    /// [`Self::find_relative`] for [`Self::find_relative_from`] to recurse into, boxed as a trait
-    /// object outside it. Its own type would hold `find_relative_from`'s, so proving that one
-    /// `Send` would never end.
-    fn find_relative_boxed<'a>(
+    /// [`Self::locate_node_below`] for [`Self::find_relative_from`] to recurse into, boxed as a
+    /// trait object outside it. Its own type would hold `find_relative_from`'s, so proving that
+    /// one `Send` would never end.
+    fn locate_node_below_boxed<'a>(
         &'a self,
         repository: Arc<RepositoryContext>,
         root: NodeID,
         path: &'a str,
-    ) -> crate::BoxFuture<'a, Result<(NodeLink, Option<LinkedState>), StateError>> {
-        Box::pin(self.find_relative(repository, root, path))
+    ) -> crate::BoxFuture<'a, Result<FoundNode, StateError>> {
+        Box::pin(self.locate_node_below(repository, root, path))
     }
 
     /// Where a walk of `path` below `root` stops: at its end, at the first link it crosses, or
@@ -6175,15 +6181,6 @@ impl State {
         })
     }
 
-    pub async fn find_node_link(
-        &self,
-        repository: Arc<RepositoryContext>,
-        path: &str,
-    ) -> Result<NodeLink, StateError> {
-        self.find_relative_node_link(repository, ROOT_NODE, path)
-            .await
-    }
-
     /// The kind this tree tracks `path` below `root` as ([`State::tracks`]): `Some` of whether a
     /// filter asks about it as a directory, or `None` where the tree does not track it. The node is
     /// read through any link the path crosses, and a path the tree cannot resolve is not tracked.
@@ -6193,55 +6190,23 @@ impl State {
         root: NodeID,
         path: &str,
     ) -> Result<Option<bool>, StateError> {
-        let Some(link) = self
-            .find_relative_node_link(repository.clone(), root, path)
+        let Some(held) = self
+            .locate_held_node_below(repository, root, path)
             .await
             .ok()
-            .filter(NodeLink::is_valid)
+            .filter(|held| held.id().is_valid_node_id())
         else {
             return Ok(None);
         };
-        let Ok((repository, state)) = link.resolve(repository, self.clone()).await else {
-            return Ok(None);
-        };
-        let Ok(node) = state.node(repository.clone(), link.node).await else {
+        let Ok(node) = held.read().await else {
             return Ok(None);
         };
         let flags = NodeFlags::from_bits_retain(node.flags);
-        Ok(state
-            .tracks(&repository, link.node, flags)
+        Ok(held
+            .state()
+            .tracks(held.repository(), held.id(), flags)
             .await?
             .then(|| !flags.contains(NodeFlags::File)))
-    }
-
-    pub async fn find_link_parent_node(
-        &self,
-        repository: Arc<RepositoryContext>,
-        path: &str,
-        target_repository_id: RepositoryId,
-    ) -> Result<NodeID, StateError> {
-        let mut current_path = RelativePath::from_str(path).unwrap_or_default();
-
-        while !current_path.is_empty() {
-            current_path.pop();
-
-            if current_path.is_empty() {
-                break;
-            }
-
-            if let Ok(node_link) = self
-                .find_node_link(repository.clone(), current_path.as_str())
-                .await
-                && node_link.is_valid()
-                && let Ok(node) = self.node(repository.clone(), node_link.node).await
-                && node.is_link()
-                && node.address.context == target_repository_id.into()
-            {
-                return Ok(node_link.node);
-            }
-        }
-
-        Err(NodeNotFound.into())
     }
 
     pub async fn find_node(
@@ -6249,24 +6214,8 @@ impl State {
         repository: Arc<RepositoryContext>,
         path: &str,
     ) -> Result<Node, StateError> {
-        let (found, held) = self
-            .find_relative(repository.clone(), ROOT_NODE, path)
-            .await?;
-        self.found_node(repository, &found, held).await
-    }
-
-    /// The node [`Self::find_relative`] found, read in the linked state it returned where it
-    /// crossed a link to reach the node.
-    pub(crate) async fn found_node(
-        &self,
-        repository: Arc<RepositoryContext>,
-        found: &NodeLink,
-        held: Option<LinkedState>,
-    ) -> Result<Node, StateError> {
-        match held {
-            Some((repository, state)) => state.node(repository, found.node).await,
-            None => self.node(repository, found.node).await,
-        }
+        let found = self.locate_node(repository.clone(), path).await?;
+        self.found_node(repository, &found).await
     }
 
     pub async fn node(
@@ -8338,20 +8287,14 @@ pub async fn gather_tree_paths(
     let (walk_state, walk_repository, parent_node_id, starts_linked) = if path.is_empty() {
         (state, repository, ROOT_NODE, false)
     } else {
-        let node_link = state
-            .find_node_link(repository.clone(), path.as_str())
-            .await?;
-        if !node_link.is_valid() {
+        let found = state.locate_node(repository.clone(), path.as_str()).await?;
+        if !found.is_valid() {
             return Err(NodeNotFound.into());
         }
-        if node_link.revision == state.revision() {
-            (state, repository, node_link.node, false)
-        } else {
-            let starts_linked = node_link.repository != repository.id;
-            let linked_repo = repository.to_link_context(node_link.repository).await;
-            let linked_state = State::deserialize(linked_repo.clone(), node_link.revision).await?;
-            (linked_state, linked_repo, node_link.node, starts_linked)
-        }
+        let own_id = repository.id;
+        let (node, (walk_repository, walk_state)) = found.held((repository, state)).into_parts();
+        let starts_linked = walk_repository.id != own_id;
+        (walk_state, walk_repository, node, starts_linked)
     };
 
     let mut walk = TreeWalk::default();
@@ -9417,35 +9360,21 @@ pub async fn diff(
     filter_mode: FilterMode,
 ) -> Result<DiffWalkStats, StateError> {
     if let Some(path) = path {
-        let from_link = state_from
-            .find_node_link(repository_from.clone(), path.as_str())
+        let (from_node, (repository_from, state_from)) = state_from
+            .locate_node(repository_from.clone(), path.as_str())
             .await
-            .unwrap_or(NodeLink::invalid());
-        let to_link = state_to
-            .find_node_link(repository_to.clone(), path.as_str())
+            .unwrap_or_default()
+            .held((repository_from, state_from))
+            .into_parts();
+        let (to_node, (repository_to, state_to)) = state_to
+            .locate_node(repository_to.clone(), path.as_str())
             .await
-            .unwrap_or(NodeLink::invalid());
+            .unwrap_or_default()
+            .held((repository_to, state_to))
+            .into_parts();
 
-        let mut repository_from = repository_from;
-        let state_from =
-            if !from_link.repository.is_zero() && from_link.repository != repository_from.id {
-                repository_from = repository_from.to_link_context(from_link.repository).await;
-                State::deserialize(repository_from.clone(), from_link.revision).await?
-            } else {
-                state_from
-            };
-
-        let mut repository_to = repository_to;
-        let state_to = if !to_link.repository.is_zero() && to_link.repository != repository_to.id {
-            repository_to = repository_to.to_link_context(to_link.repository).await;
-            State::deserialize(repository_to.clone(), to_link.revision).await?
-        } else {
-            state_to
-        };
-
-        let from =
-            node_change_state(&repository_from, &state_from, from_link.node, path.clone()).await;
-        let to = node_change_state(&repository_to, &state_to, to_link.node, path.clone()).await;
+        let from = node_change_state(&repository_from, &state_from, from_node, path.clone()).await;
+        let to = node_change_state(&repository_to, &state_to, to_node, path.clone()).await;
 
         diff::diff_subtree(from, to, path, graft, changes, filter_mode).await
     } else {
@@ -10007,20 +9936,29 @@ impl NodeMapping {
         }
     }
 
-    /// The node this mapping holds at `path`, or an invalid link where it holds none.
+    /// The node this mapping holds at `path`, or an invalid node where it holds none.
     ///
     /// `path` is spelled from the top-level repository instance root, as every change is, and the
     /// names below this mapping's own path are walked from `node`. Both are the tree's own
     /// spelling: a path taken from the file system answers for nothing where the two name a
     /// component with different case.
-    pub async fn node_at(&self, path: &RelativePath) -> NodeLink {
+    pub async fn node_at(&self, path: &RelativePath) -> FoundNode {
         let Some(below) = path.below(&self.path) else {
-            return NodeLink::invalid();
+            return FoundNode::default();
         };
         self.state
-            .find_relative_node_link(self.repository.clone(), self.node, below)
+            .locate_node_below(self.repository.clone(), self.node, below)
             .await
             .unwrap_or_default()
+    }
+
+    /// [`Self::node_at`] held by the pair that numbers it, `None` where this mapping holds no node
+    /// at `path`.
+    pub async fn held_at(&self, path: &RelativePath) -> Option<HeldNode> {
+        let found = self.node_at(path).await;
+        found
+            .is_valid()
+            .then(|| found.held((self.repository.clone(), self.state.clone())))
     }
 }
 
@@ -10939,7 +10877,7 @@ async fn diff_context_at(
     } else {
         let filter = &base.from.repository.filter;
         let parent_states = filter.parent_exclusion_states(&path);
-        let from = mapping_at(&base.from, &path).await?;
+        let from = mapping_at(&base.from, &path).await;
         // A path the tree tracks is past the ignore slot, as in a walk, whatever the rules match.
         let (is_directory, tracked) = if from.node.is_valid_or_root_node_id() {
             let node = from.state.node(from.repository.clone(), from.node).await?;
@@ -10963,7 +10901,7 @@ async fn diff_context_at(
         if excluded {
             return Ok(None);
         }
-        (from, mapping_at(&base.current, &path).await?, states)
+        (from, mapping_at(&base.current, &path).await, states)
     };
     Ok(Some(FilesystemDiffContext {
         operation: base.operation.clone(),
@@ -10983,25 +10921,13 @@ async fn diff_context_at(
 
 /// What the tree `side` names holds at `path`, through any link on the way: an invalid node where
 /// it holds nothing there.
-async fn mapping_at(side: &NodeMapping, path: &RelativePath) -> Result<NodeMapping, StateError> {
-    let node_link = side
-        .state
-        .find_node_link(side.repository.clone(), path.as_str())
+async fn mapping_at(side: &NodeMapping, path: &RelativePath) -> NodeMapping {
+    side.state
+        .locate_node(side.repository.clone(), path.as_str())
         .await
-        .unwrap_or(NodeLink {
-            node: INVALID_NODE,
-            repository: side.repository.id,
-            revision: side.state.revision(),
-        });
-    let (repository, state) = node_link
-        .resolve(side.repository.clone(), side.state.clone())
-        .await?;
-    Ok(NodeMapping {
-        repository,
-        state,
-        path: path.clone(),
-        node: node_link.node,
-    })
+        .unwrap_or_default()
+        .held((side.repository.clone(), side.state.clone()))
+        .into_mapping(path.clone())
 }
 
 /// Hands one diff to `operation`, which answers with the walk behind a stream.
@@ -11154,12 +11080,13 @@ impl FileDiffContext {
             return Ok(parent);
         }
         match file_path.parent() {
-            Some(parent) if !parent.is_empty() => Ok(self
+            Some(parent) if !parent.is_empty() => self
                 .state_from
-                .find_node_link(self.repository_from.clone(), parent)
+                .locate_node(self.repository_from.clone(), parent)
                 .await
                 .forward::<StateError>("scan add: parent directory node missing for nested add")?
-                .node),
+                .own_node()
+                .ok_or_else(|| NodeNotFound.into()),
             _ => Ok(ROOT_NODE),
         }
     }

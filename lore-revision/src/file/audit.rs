@@ -328,8 +328,8 @@ pub async fn audit(
 
     // A path the revision does not hold is a not-found path, whether it was
     // deleted or never added, and no walk runs for it.
-    let node_link = state
-        .find_node_link(repository.clone(), relative_path.as_str())
+    let found = state
+        .locate_node(repository.clone(), relative_path.as_str())
         .await
         .map_matched_err("resolving the audited path", |m| match m {
             MatchedStateErrors::NodeNotFound(traced) => AuditError::FileNotFound(
@@ -340,7 +340,7 @@ pub async fn audit(
             ),
             other => other.forward::<AuditError>("resolving the audited path"),
         })?;
-    if !node_link.is_valid() {
+    if !found.is_valid() {
         return Err(FileNotFound { resource: path }.into());
     }
 
@@ -349,19 +349,13 @@ pub async fn audit(
     let working = read_working_text(&repository, &relative_path, &options).await?;
 
     // A path resolving into a linked repository carries its own node ids and its
-    // own chain, so the walk continues against that repository's revision. The
-    // link is entered through the resolve the read path already uses, which
-    // leaves a path in the audit's own repository where it stands.
-    let linked = node_link.crosses_link(&repository, &state);
-    let (repository, state) = node_link
-        .resolve(repository, state)
-        .await
-        .forward::<AuditError>("Failed to enter the repository the path resolves into")?;
+    // own chain, so the walk continues against that repository's revision.
+    let linked = found.crossed_link();
+    let (node, (repository, state)) = found.held((repository, state)).into_parts();
 
-    let committed =
-        read_audited_content(repository.clone(), &state, node_link.node, &relative_path)
-            .await?
-            .into_text();
+    let committed = read_audited_content(repository.clone(), &state, node, &relative_path)
+        .await?
+        .into_text();
 
     let query = AuditQuery {
         repository: repository.id,
@@ -378,7 +372,7 @@ pub async fn audit(
     walk_predecessors(
         repository.clone(),
         state,
-        node_link.node,
+        node,
         unattributed,
         committed,
         &WalkRequest {

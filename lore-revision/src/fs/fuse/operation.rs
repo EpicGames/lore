@@ -1086,10 +1086,10 @@ impl FuseOperation {
         node: NodeID,
     ) -> Result<Option<Node>, FsError> {
         match revision
-            .find_relative_node_link(repository.clone(), ROOT_NODE, spelled.as_str())
+            .locate_node(repository.clone(), spelled.as_str())
             .await
         {
-            Ok(link) if link.revision == revision.revision() && link.node == node => revision
+            Ok(found) if found.own_node() == Some(node) => revision
                 .node(repository.clone(), node)
                 .await
                 .map(Some)

@@ -102,27 +102,18 @@ pub(crate) async fn dump_file(
             .await
             .forward::<DumpError>("deserializing state")?;
 
-    let node_link = state
-        .find_node_link(repository.clone(), relative_path.as_str())
+    let found = state
+        .locate_node(repository.clone(), relative_path.as_str())
         .await
         .forward::<DumpError>("invalid node")?;
 
-    if !node_link.is_valid() {
+    if !found.is_valid() {
         return Err(DumpError::internal("invalid node"));
     }
 
-    // A node inside a link is numbered in the linked tree.
-    let (repository, state) = node_link
-        .resolve(repository, state)
-        .await
-        .forward::<DumpError>("entering the link the path resolves into")?;
-
-    let node = state
-        .node(repository.clone(), node_link.node)
-        .await
-        .forward::<DumpError>("invalid node")?;
-
-    dump_address(repository, node.address).await?;
+    let held = found.held((repository, state));
+    let node = held.read().await.forward::<DumpError>("invalid node")?;
+    dump_address(held.repository().clone(), node.address).await?;
 
     Ok(())
 }

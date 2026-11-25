@@ -180,7 +180,7 @@ pub enum Effect {
     /// read lock, at a `seq` of its own.
     Named { node: NodeID, name: Name },
     /// A path's resolution found `found` carrying the hash `name` in `dir`, or no node, at a `seq`
-    /// of its own after the find: a hop of `State::find_relative_node_link`.
+    /// of its own after the find: a hop of `State::locate_node_below`.
     Hop {
         dir: NodeID,
         name: u64,

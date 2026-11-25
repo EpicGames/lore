@@ -39,17 +39,16 @@ pub async fn dump(
     .send();
 
     if let Some(path) = path {
-        let (node_link, (link_repository, link_state)) = state
-            .find_relative_held(repository.clone(), ROOT_NODE, path.as_str())
+        let held = state
+            .locate_held_node_below(repository.clone(), ROOT_NODE, path.as_str())
             .await?;
-        let entry_node = link_state
-            .node(link_repository.clone(), node_link.node)
-            .await?;
+        let entry_node = held.read().await?;
+        let (node_id, (link_repository, link_state)) = held.into_parts();
         let mut cycle = SiblingCycleGuard::new(entry_node.parent);
         dump_node(
             link_state,
             link_repository,
-            node_link.node,
+            node_id,
             entry_node.parent,
             RelativePathBuf::new(),
             0,

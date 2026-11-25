@@ -51,6 +51,7 @@ use crate::lore_debug;
 use crate::lore_warn;
 use crate::metadata;
 use crate::metadata::Metadata;
+use crate::node::INVALID_NODE;
 use crate::node::Node;
 use crate::node::NodeDelta;
 use crate::node::NodeFileMetadata;
@@ -1007,10 +1008,14 @@ pub(crate) async fn mount_node_change_state(
     path: &RelativePath,
 ) -> change::NodeChangeState {
     let mapping = state::NodeMapping::root(repository.clone(), state.clone());
-    let link = mapping.node_at(path).await;
-    let node = if link.node.is_valid_node_id() {
+    let node_id = mapping
+        .node_at(path)
+        .await
+        .own_node()
+        .unwrap_or(INVALID_NODE);
+    let node = if node_id.is_valid_node_id() {
         state
-            .node(repository.clone(), link.node)
+            .node(repository.clone(), node_id)
             .await
             .unwrap_or_default()
     } else {
@@ -1021,7 +1026,7 @@ pub(crate) async fn mount_node_change_state(
             repository: repository.clone(),
             state: state.clone(),
             path: path.clone(),
-            node: link.node,
+            node: node_id,
         },
         observed: None,
         flags: NodeFlags::from_bits_retain(node.flags),
@@ -2925,11 +2930,11 @@ async fn held_before_replacement(
         let Ok(state) = changed.state(repository, below).await else {
             return false;
         };
-        let link = match state
-            .find_node_link(repository.clone(), base.path.as_str())
+        let found = match state
+            .locate_node(repository.clone(), base.path.as_str())
             .await
         {
-            Ok(link) if link.is_valid() => link,
+            Ok(found) if found.is_valid() => found,
             Ok(_) => {
                 below = state.parent_self();
                 continue;
@@ -2940,7 +2945,10 @@ async fn held_before_replacement(
             }
             Err(_) => return false,
         };
-        return held_names(changed, &state, base, link.node, change, revision).await;
+        let Some(node) = found.own_node() else {
+            return false;
+        };
+        return held_names(changed, &state, base, node, change, revision).await;
     }
     false
 }

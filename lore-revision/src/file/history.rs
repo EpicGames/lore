@@ -330,9 +330,14 @@ async fn history_parent(
             .forward::<FileHistoryError>("Failed to deserialize state")?;
 
         let found = state_parent
-            .find_relative_held_if_present(repository.clone(), ROOT_NODE, relative_path.as_str())
+            .locate_held_node_below_if_present(
+                repository.clone(),
+                ROOT_NODE,
+                relative_path.as_str(),
+            )
             .await
-            .forward_any::<FileHistoryError>("finding the path")?;
+            .forward_any::<FileHistoryError>("finding the path")?
+            .map(state::HeldNode::into_parts);
         if let Some((node, (_, held))) = &found {
             // A node a link holds is numbered in the linked repository, so `state`'s delta
             // cannot say what happened to it.
@@ -560,9 +565,10 @@ async fn history_start(
     // revision(s), finding the node and if found, checking the delta block of this revision to see if that node was
     // deleted - if so print the history starting with delete and then going to parent revision(s) and continuing.
     let mut found = state_start
-        .find_relative_held_if_present(repository.clone(), ROOT_NODE, relative_path.as_str())
+        .locate_held_node_below_if_present(repository.clone(), ROOT_NODE, relative_path.as_str())
         .await
-        .forward_any::<FileHistoryError>("finding the path")?;
+        .forward_any::<FileHistoryError>("finding the path")?
+        .map(state::HeldNode::into_parts);
     if found.is_none() {
         let parent = state_start.parent_self();
 

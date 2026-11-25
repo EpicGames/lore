@@ -896,7 +896,7 @@ pub async fn find_dir(tree: &Tree, path: &str) -> Option<NodeID> {
 }
 
 /// The node at `path` below `root`, as a resolution entering links on the way finds it, as the
-/// commit resolves a staged path (`State::find_relative_node_link`): each hop the State records,
+/// commit resolves a staged path (`State::locate_node_below`): each hop the State records,
 /// each name's hash noted; the node and where it lies, in the call's State or in the revision a
 /// link it crossed pins, of another repository or at another revision than the call's State's;
 /// `None` where no node stands there. The path names one name at least and none empty or
@@ -911,25 +911,20 @@ pub async fn find_linked(tree: &Tree, root: NodeID, path: &str) -> Option<NodeLi
     call(&tree.state, (&super::FIND_LINKED, Some(root)), async {
         resolving_names(&tree.state, path.split('/').map(hash_string).collect());
         let found = (tree.state)
-            .find_relative_node_link(tree.repository.clone(), root, path)
+            .locate_node_below(tree.repository.clone(), root, path)
             .await;
         match found {
-            Ok(found)
-                if found.repository == tree.repository.id
-                    && found.revision == tree.state.revision() =>
-            {
-                (
-                    Some(found),
-                    Outcome::Answer(Answer::Found(Some(found.node))),
-                )
-            }
             Ok(found) => {
-                let answer = Answer::Linked {
-                    node: found.node,
-                    repository: found.repository,
-                    revision: found.revision,
+                let link = found.identity();
+                let answer = match found.own_node() {
+                    Some(node) => Answer::Found(Some(node)),
+                    None => Answer::Linked {
+                        node: link.node,
+                        repository: link.repository,
+                        revision: link.revision,
+                    },
                 };
-                (Some(found), Outcome::Answer(answer))
+                (Some(link), Outcome::Answer(answer))
             }
             Err(error) if error.is_node_not_found() => (None, Outcome::Answer(Answer::Found(None))),
             Err(error) => (None, failed(&error)),

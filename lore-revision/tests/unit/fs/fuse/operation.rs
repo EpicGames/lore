@@ -2051,6 +2051,36 @@ async fn an_add_below_a_directory_the_walk_did_not_list_marks_the_node_holding_i
     .await;
 }
 
+/// An add the walk reports two directories below one it did not list in `from` lands under the
+/// directory `from` adds for its parent, where the working tree holds it.
+#[tokio::test]
+async fn an_add_deep_below_a_directory_the_walk_did_not_list_lands_under_its_parent() {
+    in_context(async {
+        let w = working(FIXTURE).await;
+        let new = mkdir(&w.fs, ROOT_INO, "new").await;
+        let sub = mkdir(&w.fs, new, "sub").await;
+        write_new(&w.fs, sub, "file.txt", b"file").await;
+        let from = State::deserialize(w.repository.clone(), w.current.revision())
+            .await
+            .expect("the revision loads");
+        let unlisted = NodeMapping {
+            repository: w.repository.clone(),
+            state: from.clone(),
+            path: path("new"),
+            node: lore_revision::node::INVALID_NODE,
+        };
+
+        w.diff_from(unlisted, "new", FilesystemDiffIntent::MarkDirty)
+            .await;
+
+        assert_eq!(
+            children_named(&w.repository, &from, "new/sub", "file.txt").await,
+            1
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_local_content_node_with_the_from_address_is_not_a_change() {
     in_context(async {
