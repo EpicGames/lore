@@ -11,6 +11,7 @@ use lore_credential::token_store::TokenStoreError;
 use lore_credential::token_store::load_refresh_expires;
 use lore_credential::token_store::load_user_token;
 use lore_credential::token_store::load_user_token_from_store;
+use lore_credential::token_store::logins_in_map;
 use lore_credential::token_store::refresh_user_token;
 use lore_credential::token_store::remove_all_tokens_for_auth_url;
 use lore_credential::token_store::remove_user_token_if;
@@ -964,4 +965,50 @@ async fn receipt_round_trips_clamps_to_toml_max_and_legacy_entry_loads_as_empty(
         .expect("load legacy entry from disk");
     assert_eq!(reloaded.token, fresh);
     assert_eq!(reloaded.receipt, TokenReceipt::default());
+}
+
+#[test]
+fn logins_in_map_are_the_identity_tokens_the_domain_accepts() {
+    let login = |user_id: &str, domains: &[&str]| {
+        IdentityToken::new(
+            user_id,
+            "sealed",
+            domains.iter().map(|domain| domain.to_string()).collect(),
+            None,
+            None,
+        )
+    };
+    let map = TokenMap::new(vec![
+        RemoteIdentity::new(
+            "https://auth.example.com",
+            vec![
+                login("other-domain", &[".other.example", "auth.example.com"]),
+                login("accepted", &[".example.com"]),
+                login("legacy", &[]),
+                login("look-alike", &[".badexample.com"]),
+            ],
+        ),
+        RemoteIdentity::new(
+            "https://auth.example.com/0123456789abcdef0123456789abcdef",
+            vec![login("authorization", &[".example.com"])],
+        ),
+        RemoteIdentity::new(
+            "https://second.example.net",
+            vec![login("second", &["example.com"])],
+        ),
+    ]);
+
+    assert_eq!(
+        logins_in_map(&map, "lore.example.com"),
+        [
+            (
+                "https://auth.example.com".to_string(),
+                vec!["accepted".to_string()]
+            ),
+            (
+                "https://second.example.net".to_string(),
+                vec!["second".to_string()]
+            ),
+        ]
+    );
 }

@@ -191,6 +191,19 @@ async fn cached_token_map() -> MappedMutexGuard<'static, Option<TokenMap>> {
     MutexGuard::map(maps, |maps| maps.entry(cache_key()).or_default())
 }
 
+/// The cached token map, read from the store first when it is not cached. `None` when the store
+/// cannot be read.
+async fn loaded_token_map() -> MappedMutexGuard<'static, Option<TokenMap>> {
+    let mut store = cached_token_map().await;
+    if store.is_none()
+        && let Ok(guard) = lock_token_map().await
+        && let Ok(loaded_map) = load_token_map(&guard)
+    {
+        store.replace(loaded_map);
+    }
+    store
+}
+
 /// Base directory holding the auth store files (`tokenstore.toml` and the
 /// encryption-key fallback). The `LORE_AUTH_PATH` environment variable
 /// overrides the default per-user configuration directory.
@@ -296,13 +309,7 @@ pub async fn load_all_identities(
     include_token: bool,
 ) -> Result<Vec<StoredIdentityInfo>, TokenStoreError> {
     let identity_entries = {
-        let mut store = cached_token_map().await;
-        if store.is_none()
-            && let Ok(guard) = lock_token_map().await
-            && let Ok(loaded_map) = load_token_map(&guard)
-        {
-            store.replace(loaded_map);
-        }
+        let store = loaded_token_map().await;
 
         let mut entries = vec![];
         if let Some(map) = store.as_ref() {
@@ -342,6 +349,43 @@ pub async fn load_all_identities(
     }
 
     Ok(result)
+}
+
+/// The stored logins whose identity tokens `domain` accepts: each auth URL with the IDs of its
+/// users, in store order, read without decrypting any token.
+pub async fn logins_accepted_by_domain(domain: &str) -> Vec<(String, Vec<String>)> {
+    let store = loaded_token_map().await;
+    store
+        .as_ref()
+        .map_or_else(Vec::new, |map| logins_in_map(map, domain))
+}
+
+/// The logins in `map` whose identity tokens `domain` accepts: each auth URL with the IDs of its
+/// users, in map order.
+///
+/// A token stored without accepted root domains matches no domain here, unlike in
+/// [`tokens_only_for_recipient_domain`], since it would match every domain.
+#[lore_macro::test_pub]
+fn logins_in_map(map: &TokenMap, domain: &str) -> Vec<(String, Vec<String>)> {
+    let mut logins = vec![];
+    for remote in &map.remotes {
+        let (auth_url, resource) = split_remote_resource(&remote.remote);
+        if !resource.is_empty() {
+            continue;
+        }
+        let user_ids: Vec<String> = remote
+            .token
+            .iter()
+            .filter(|identity| {
+                crate::jwt::domain_in_root_domains(domain, &identity.acceptable_root_domains)
+            })
+            .map(|identity| identity.user_id.clone())
+            .collect();
+        if !user_ids.is_empty() {
+            logins.push((auth_url, user_ids));
+        }
+    }
+    logins
 }
 
 /// Clear token map and token store file.
@@ -828,13 +872,7 @@ where
     lore_trace!("Load user {identity} token for auth_endpoint {auth_endpoint}");
 
     let found = {
-        let mut store = cached_token_map().await;
-        if store.is_none()
-            && let Ok(guard) = lock_token_map().await
-            && let Ok(loaded_map) = load_token_map(&guard)
-        {
-            store.replace(loaded_map);
-        }
+        let store = loaded_token_map().await;
         if let Some(map) = store.as_ref()
             && let Some(remote) = map
                 .remotes
@@ -1174,13 +1212,7 @@ pub async fn load_identities(auth_endpoint: &str) -> Result<Vec<String>, TokenSt
 
     let mut identities = vec![];
 
-    let mut store = cached_token_map().await;
-    if store.is_none()
-        && let Ok(guard) = lock_token_map().await
-        && let Ok(loaded_map) = load_token_map(&guard)
-    {
-        store.replace(loaded_map);
-    }
+    let mut store = loaded_token_map().await;
 
     if let Some(map) = store.as_mut() {
         let auth_endpoint = auth_endpoint.to_string();
@@ -1207,13 +1239,7 @@ pub async fn load_identities(auth_endpoint: &str) -> Result<Vec<String>, TokenSt
 /// refresh token.
 pub async fn load_refresh_expires(auth_endpoint: &str, identity: &str) -> Option<u64> {
     let auth_endpoint = auth_endpoint.trim_end_matches('/');
-    let mut store = cached_token_map().await;
-    if store.is_none()
-        && let Ok(guard) = lock_token_map().await
-        && let Ok(loaded_map) = load_token_map(&guard)
-    {
-        store.replace(loaded_map);
-    }
+    let mut store = loaded_token_map().await;
     let entry = identity_entry(&mut store, auth_endpoint, identity)?;
     entry.refresh_token.as_ref()?;
     Some(entry.refresh_expires)

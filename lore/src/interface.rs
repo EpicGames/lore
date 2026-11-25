@@ -328,6 +328,10 @@ pub type LoreAuthLocalUserInfoArgs = crate::auth::LoreAuthLocalUserInfoArgs;
 /// authorization, use `lore_auth_user_info` which queries the remote
 /// authentication service.
 ///
+/// When `user_ids` is empty, the call resolves the current user:
+/// `globals.identity`, else the identity the repository's config records, else
+/// the first identity stored for the auth endpoint.
+///
 /// When `auth_endpoint` is empty, the call reads it from the repository's
 /// remote, and first refreshes an expired stored token unless the call
 /// supplies a token. The refresh contacts the auth service and replaces the
@@ -337,6 +341,18 @@ pub type LoreAuthLocalUserInfoArgs = crate::auth::LoreAuthLocalUserInfoArgs;
 /// with a locally stored token also with an `AUTH_USER_TOKEN` event. Its
 /// `token` holds the cached identity token when `with_identity_token` is set,
 /// and is empty otherwise.
+///
+/// With `globals.offline` set, or `globals.local` set and neither
+/// `with_access_token` nor `with_claims`, and an empty `auth_endpoint`, the
+/// identities resolve without connecting and no token is refreshed, from the
+/// stored logins whose token the domain of the repository's remote accepts. A
+/// supplied token is used as given. Without `globals.identity` or a recorded
+/// identity, the current user is the first such login at each auth URL. Without
+/// a supplied token, the call fails with `NotAuthenticated` when the current
+/// user has no such login, and a requested identity without one gets no
+/// `AUTH_USER_TOKEN` event. With `with_access_token` or `with_claims`, a
+/// `globals.offline` call fails with `NoRemote` after resolving the identities
+/// as above.
 ///
 /// When `with_access_token` or `with_claims` is set, the call requires a
 /// repository and additionally emits one `AUTH_IDENTITY` event for the
