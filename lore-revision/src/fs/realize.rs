@@ -4495,6 +4495,7 @@ async fn realize_moved_mount(
         let shown = mount_shown(change, current.as_ref(), staged.flatten().as_ref())
             .await?
             .flatten();
+        let link = Box::pin(open_pinned_link(&repository, node, path)).await?;
         remove_link_mount(
             operation,
             &change.from.mapping.repository.filter,
@@ -4510,7 +4511,7 @@ async fn realize_moved_mount(
             .create_dir_all(path)
             .await
             .forward::<SyncError>("Failed recreating the link directory")?;
-        return Box::pin(clone_added_link(&repository, operation, node, path)).await;
+        return Box::pin(clone_opened_link(link, operation, node, path)).await;
     }
 
     let from_node = change
@@ -4799,25 +4800,31 @@ fn realize_change_modify_add<'a>(
         };
 
         if (node.is_directory() || node.is_link()) && write_to_disk {
-            if !dry_run
-                && operation.create_dir_all(&to_path).await.is_err()
-                && operation
-                    .file_info(&to_path)
-                    .await
-                    .is_ok_and(|info| !info.is_dir())
-            {
-                return Err(SyncError::internal(format!(
-                    "Failed to create directory {path}"
-                )));
-            }
-
             // When a link is added, the linked contents are not marked
             // for add. That's why we can just clone the linked files
             if node.is_link() && change.action == change::FileAction::Add {
-                Box::pin(clone_added_link(&repository, &operation, &node, path)).await?;
-            } else if node.is_link() && !dry_run {
-                realize_moved_mount(&operation, &change, &node, moves.merge_current.as_ref())
+                Box::pin(realize_added_link(
+                    &repository,
+                    &operation,
+                    &node,
+                    path,
+                    dry_run,
+                ))
+                .await?;
+            } else {
+                if !dry_run {
+                    create_directory(&operation, path).await?;
+                }
+                // Boxed: a mount moves rarely, and its realize would grow every change's future.
+                if node.is_link() && !dry_run {
+                    Box::pin(realize_moved_mount(
+                        &operation,
+                        &change,
+                        &node,
+                        moves.merge_current.as_ref(),
+                    ))
                     .await?;
+                }
             }
         } else if node.is_file() && !dry_run && write_to_disk {
             if content_is_in_place(&change, renamed) {
@@ -4853,50 +4860,108 @@ fn realize_change_modify_add<'a>(
     }
 }
 
-/// Clones the content of the link `node` adds at `path` into the working tree.
-async fn clone_added_link(
+/// Creates the directory at `path`, where nothing but a directory stands.
+async fn create_directory(
+    operation: &Arc<InstanceOperationImpl>,
+    path: &RelativePath,
+) -> Result<(), SyncError> {
+    if operation.create_dir_all(path).await.is_err()
+        && operation
+            .file_info(path)
+            .await
+            .is_ok_and(|info| !info.is_dir())
+    {
+        return Err(SyncError::internal(format!(
+            "Failed to create directory {path}"
+        )));
+    }
+    Ok(())
+}
+
+/// Clones the link `node` adds at `path` into a mount created there, once the repository it pins
+/// is reached and its pinned revision read, so a link that can't be reached leaves no mount behind.
+async fn realize_added_link(
     repository: &Arc<RepositoryContext>,
     operation: &Arc<InstanceOperationImpl>,
     node: &Node,
     path: &RelativePath,
+    dry_run: bool,
 ) -> Result<(), SyncError> {
-    let link_id = node.address.context;
+    let link = open_pinned_link(repository, node, path).await?;
+    if !dry_run {
+        create_directory(operation, path).await?;
+    }
+    clone_opened_link(link, operation, node, path).await
+}
+
+/// The repository a link pins, connected to and read at the pinned revision.
+struct OpenedLink {
+    context: Arc<RepositoryContext>,
+    storage: Arc<lore_transport::StorageSession>,
+    state: Arc<State>,
+}
+
+/// Connects to the repository the link `node` at `path` pins and reads the revision it pins.
+async fn open_pinned_link(
+    repository: &Arc<RepositoryContext>,
+    node: &Node,
+    path: &RelativePath,
+) -> Result<OpenedLink, SyncError> {
     let link_revision = node.address.hash;
-
-    let link = repository.to_link_context(link_id.into()).await;
-    let link_remote = link
-        .remote()
+    let context = repository
+        .to_link_context(node.address.context.into())
+        .await;
+    let opened = async {
+        let link_remote = context
+            .remote()
+            .await
+            .forward::<SyncError>("Failed to connect to link remote")?;
+        let correlation_id = execution_context().globals().correlation_id.to_string();
+        let storage = link_remote
+            .session(context.id, &correlation_id)
+            .await
+            .forward::<SyncError>("Failed to connect to link remote")?;
+        let state = State::deserialize(context.clone(), link_revision)
+            .await
+            .forward_with::<SyncError, _>(|| {
+                format!("Failed to deserialize state {link_revision}")
+            })?;
+        Ok::<_, SyncError>((storage, state))
+    };
+    let (storage, state) = opened
         .await
-        .forward::<SyncError>("Failed to connect to link remote")?;
-    let correlation_id = execution_context().globals().correlation_id.to_string();
-    let link_storage = link_remote
-        .session(link.id, &correlation_id)
-        .await
-        .forward::<SyncError>("Failed to connect to link remote")?;
-    let link_state = State::deserialize(link.clone(), link_revision)
-        .await
-        .forward_with::<SyncError, _>(|| format!("Failed to deserialize state {link_revision}"))?;
+        .forward_with::<SyncError, _>(|| format!("Failed to fetch the link at {path}"))?;
+    Ok(OpenedLink {
+        context,
+        storage,
+        state,
+    })
+}
 
-    let clone_path = path.clone();
-
+/// Clones the content of the link `node` at `path` into the working tree.
+async fn clone_opened_link(
+    link: OpenedLink,
+    operation: &Arc<InstanceOperationImpl>,
+    node: &Node,
+    path: &RelativePath,
+) -> Result<(), SyncError> {
+    let OpenedLink {
+        context,
+        storage,
+        state,
+    } = link;
     let clone_ctx = CloneContext {
-        repository: link.clone(),
-        state: link_state,
+        repository: context.clone(),
+        state,
         operation: operation.clone(),
         options: Arc::default(),
         stats: Arc::default(),
         modified_times: operation.modified_times(),
     };
-    let clone_states = link.filter.mount_states(&clone_path);
-    clone::clone_node(
-        clone_ctx,
-        link_storage,
-        clone_path,
-        node.child,
-        clone_states,
-    )
-    .await
-    .forward::<SyncError>("Failed to sync link")
+    let clone_states = context.filter.mount_states(path);
+    clone::clone_node(clone_ctx, storage, path.clone(), node.child, clone_states)
+        .await
+        .forward_with::<SyncError, _>(|| format!("Failed to fetch the link at {path}"))
 }
 
 /// Stages a realized move by relinking `from_node`, the staged node at `from_path`, to `to_path`,

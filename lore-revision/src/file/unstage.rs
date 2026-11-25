@@ -1375,7 +1375,9 @@ async fn unstage_node(
                 link_metadata.revision,
             )
             .await
-            .forward::<UnstageError>("Failed to unstage link nodes")?;
+            .forward_with::<UnstageError, _>(|| {
+                format!("Failed to fetch the link at {node_path}")
+            })?;
 
         if was_staged_delete
             && !link_committed(

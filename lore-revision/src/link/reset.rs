@@ -208,27 +208,71 @@ async fn restore_link(
         ..
     } = at;
 
-    if operation
+    let at_mount = operation
         .file_info(&link_path)
         .await
-        .forward::<LinkError>("Failed to check the link path")?
-        .is_file()
-    {
-        if !overwrite_local {
-            lore_warn!(
-                "Link at '{link_path}' has local changes (use `lore reset {link_path}` to discard them)"
-            );
-            return Err(LocalModifications.into());
-        }
+        .forward::<LinkError>("Failed to check the link path")?;
+    let (file_at_mount, mount_existed) = (at_mount.is_file(), at_mount.is_dir());
+    if file_at_mount && !overwrite_local {
+        lore_warn!(
+            "Link at '{link_path}' has local changes (use `lore reset {link_path}` to discard them)"
+        );
+        return Err(LocalModifications.into());
+    }
+
+    let pin = if execution_context().globals().dry_run() {
+        None
+    } else {
+        let target = link::LinkPinRealizeTarget {
+            link_path: link_path.clone(),
+            old_signature: Hash::default(),
+            new_signature: current_link_node.address.hash,
+            current_node: current_link_node.child,
+            mount_source: link::LinkMountSource::Node(current_link_node.child),
+        };
+        // Boxed, as is the realize below: a link restore is a cold path.
+        let pin = Box::pin(link::ResolvedLinkPin::resolve(&linked_repository, target))
+            .await
+            .forward_with::<LinkError, _>(|| format!("Failed to fetch the link at {link_path}"))?;
+        Some(pin)
+    };
+
+    if file_at_mount {
         operation
             .remove(&link_path)
             .await
             .forward::<LinkError>("Failed to remove the file at the link path")?;
     }
+    let holds_state = operation.holds_state();
+    if !holds_state {
+        operation
+            .create_dir_all(&link_path)
+            .await
+            .forward::<LinkError>("Failed to recreate the link directory")?;
+    }
+
+    if let Some(pin) = pin {
+        let realized = Box::pin(link::realize_resolved_link_pin_in_operation(
+            operation,
+            repository.clone(),
+            linked_repository,
+            &pin,
+            overwrite_local,
+        ))
+        .await;
+        if let Err(error) = realized {
+            if !mount_existed && !holds_state {
+                let _ = operation.remove_empty_directory(&link_path).await;
+            }
+            return Err(error).forward_with::<LinkError, _>(|| {
+                format!("Failed to restore the link at {link_path}")
+            });
+        }
+    }
 
     state_staged
         .link_add(
-            repository.clone(),
+            repository,
             current_link_ref.repository,
             current_link_ref.branch,
             current_link_ref.signature,
@@ -238,30 +282,7 @@ async fn restore_link(
         .await
         .forward::<LinkError>("Failed to restore link registry entry")?;
 
-    if !operation.holds_state() {
-        operation
-            .create_dir_all(&link_path)
-            .await
-            .forward::<LinkError>("Failed to recreate the link directory")?;
-    }
-
-    if execution_context().globals().dry_run() {
-        return Ok(());
-    }
-    link::realize_link_pin_change_boxed(
-        operation,
-        repository,
-        linked_repository,
-        link::LinkPinRealizeTarget {
-            link_path,
-            old_signature: Hash::default(),
-            new_signature: current_link_node.address.hash,
-            current_node: current_link_node.child,
-            mount_source: link::LinkMountSource::SamePath,
-        },
-        overwrite_local,
-    )
-    .await
+    Ok(())
 }
 
 /// Puts a link whose pin, mount or registry row change was staged back to the pin, mount and row

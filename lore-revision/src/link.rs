@@ -1555,7 +1555,8 @@ async fn revision_state(
 
 /// The node of `target` at the path `node` has in `source`. A revision numbers its nodes as it
 /// pleases, so a mount is carried across revisions by path; fails with [`InvalidPath`] where
-/// `target` holds nothing there to mount.
+/// `target` holds nothing there to mount, and with [`NodeNotFound`] where `source` holds no folder
+/// at `node`.
 async fn carry_mount(
     link_context: &Arc<RepositoryContext>,
     source: &State,
@@ -1564,6 +1565,14 @@ async fn carry_mount(
 ) -> Result<NodeID, StateError> {
     if node == ROOT_NODE {
         return Ok(ROOT_NODE);
+    }
+    // `link_source_path` spells a node `source` does not hold as the root, which would mount the
+    // whole linked repository.
+    if !source
+        .holds_node(link_context, node, LoreNodeType::Directory)
+        .await?
+    {
+        return Err(NodeNotFound.into());
     }
     let path = link_source_path(link_context.clone(), source, node).await?;
     let invalid = || InvalidPath {

@@ -2057,12 +2057,11 @@ fn reset_walk_named_path(
                 {
                     if staged_link.crosses_link(&repository, &state_staged) {
                         return Err(NotSupported {
-                        operation: format!(
-                            "Resetting {relative_path} inside a link, which the target revision \
-                             does not hold"
-                        ),
-                    }
-                    .into());
+                            operation: format!(
+                                "Resetting a file added inside a link at {relative_path}"
+                            ),
+                        }
+                        .into());
                     }
                     // The flags alone, so the record is not held across the awaits below.
                     let (dirty_add, dirty_move, link, directory) = state_staged
