@@ -684,13 +684,13 @@ impl LoreBlobStore {
                             "lore get_resolved for {ns:?} delivered a leaf that cannot be framed: {message}"
                         );
                     }
-                    out.push(Some(bufs.remove(&id).unwrap_or_default()))
+                    out.push(Some(bufs.remove(&id).unwrap_or_default()));
                 }
                 Some((NOT_FOUND, _)) | None => {
                     // A missing terminal event is treated as a miss rather than an error: the
                     // caller's recovery for both is identical, and reporting a spurious hard
                     // error would fail a build that could still make progress.
-                    out.push(None)
+                    out.push(None);
                 }
                 Some((code, message)) => bail!(
                     "lore get_resolved failed for {ns:?}: {message} (code {code}, status={status})"

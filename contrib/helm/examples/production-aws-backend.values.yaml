@@ -58,6 +58,11 @@ auth:
   jwksEndpoint: "https://auth.example.com/.well-known/jwks.json"
   issuer: "https://auth.example.com/"
   audience: ["lore"]
+  resourceClaim: "resources"   # Tier 2: the token's resource grants authorize each repository
+  oidc:
+    clientId: "lore-cli"
+    scopes: ["openid", "offline_access"]
+    resourceTemplate: "https://lore.example.com/partitions/{id}"
 
 # Point every store at the AWS plugin. Adjust bucket/table names and region to your
 # resources. Each store has its own [plugins.aws.<store>] section.

@@ -492,6 +492,9 @@ since builds without a release stamp share a version. Medians leave out flagged 
 
 ## Tests
 
+The tests need a user other than root, since `bench-helper` reads the tests' settings only when
+it doesn't run as root, and GNU `time` at `/usr/bin/time`, which the agent runs each step under.
+
 ```sh
 python3 -m pytest -q -o addopts= -p no:cacheprovider -c /dev/null tests
 ```

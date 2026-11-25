@@ -113,6 +113,10 @@ Lore revision control server is deploying.
 
    Auth is enabled — log in first:
    lore login {{ $scheme }}://<SERVER>
+{{- if and (eq .Values.topology.mode "tiered") (or .Values.handler.servePublic .Values.handler.upstreamURL) }}
+
+   A handler finds no repository by name with auth on: clone through it by repository ID.
+{{- end }}
 {{- end }}
 
 {{- if eq .Values.service.type "ClusterIP" }}

@@ -20,7 +20,7 @@
 #      name, so the cert must be valid for
 #        *.lore-headless.<namespace>.svc.cluster.local
 #      (or set replication.tls.serverSni to a name the cert does cover).
-#   5. A loreserver newer than v0.12.0. Each server leaves itself out of the shared
+#   5. A loreserver newer than v0.14.0. Each server leaves itself out of the shared
 #      peer list with [topology.fixed] self_address, which older servers ignore.
 
 image:
@@ -98,3 +98,8 @@ auth:
   jwksEndpoint: "https://auth.example.com/.well-known/jwks.json"
   issuer: "https://auth.example.com/"
   audience: ["lore"]
+  resourceClaim: "resources"   # Tier 2: the token's resource grants authorize each repository
+  oidc:
+    clientId: "lore-cli"
+    scopes: ["openid", "offline_access"]
+    resourceTemplate: "https://lore.example.com/partitions/{id}"

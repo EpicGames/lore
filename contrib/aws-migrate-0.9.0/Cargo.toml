@@ -35,11 +35,13 @@ rand = "0.9.4"
 # test builds it the same way the store reads it rather than restating the struct's layout.
 zerocopy = "0.8.48"
 
-# Same vendored quinn-proto the Lore workspace patches in. A patch table belongs to a workspace
-# root, so standing outside that workspace means restating it: lore-aws reaches lore-transport,
-# which is written against the vendored crate rather than the published one.
+# Same vendored crates the Lore workspace patches in. A patch table belongs to a workspace root, so
+# standing outside that workspace means restating it: lore-aws reaches lore-transport, which is
+# written against the vendored quinn-proto, and lore-revision, whose view and ignore filters need
+# the vendored glob-match's `**` matching.
 [patch.crates-io]
 quinn-proto = { path = "../../vendor/quinn-proto" }
+glob-match = { path = "../../vendor/glob-match" }
 
 [features]
 default = []

@@ -17,7 +17,7 @@ helm install lore .
 The chart defaults to `ghcr.io/epicgames/lore/loreserver` at the chart's `appVersion`, which is public — nothing to configure and no pull secret. That tag is `linux/amd64` only and runs under emulation on arm64. On Graviton3 or newer, use the native arm64 build instead:
 
 ```sh
-helm install lore . --set image.tag=0.9.0-graviton
+helm install lore . --set image.tag=0.14.0-graviton
 ```
 
 The `-graviton` tag is tuned for Graviton3+ and faults with `SIGILL` on older arm64 CPUs, Apple Silicon and Ampere included.
@@ -121,6 +121,73 @@ result, so the handler can verify the data pod even with a self-signed cert. Wit
 that the handler fails with `InvalidCertificate(UnknownIssuer)` and reads through a
 handler return `Not found`.
 
+## Authentication
+
+With `auth.enabled=true` the server verifies every client's JWT. `auth.issuer` and
+`auth.audience` are required: the server refuses to start without them, and so does
+the install. Clients log in at one of two places, and the install fails with neither:
+
+| Tier | Clients log in at | Values beside `issuer` and `audience` |
+|------|-------------------|---------------------------------------|
+| Tier 1 | An OIDC provider | `auth.oidc.clientId`. Every token holder gets `read` and `write` on every repository, plus the actions in the token's `auth.permissionClaim`. `auth.issuer` is the provider's issuer URL. |
+| Tier 2 | An OIDC provider | As Tier 1, plus `auth.resourceClaim`, the claim carrying per-repository grants, and `auth.oidc.resourceTemplate` or `auth.oidc.scopeTemplate`. |
+| Authentication service | `auth.authUrl` | `auth.authUrl`, without `auth.resourceClaim`. The server asks the service to authorize every request. `auth.oidc` is optional. |
+
+The install fails on these values, which the server refuses at startup:
+
+- `auth.authUrl` with `auth.resourceClaim`, `auth.resourceClaim` without a template, or a
+  template without `auth.resourceClaim` or `auth.authUrl`.
+- With `auth.oidc.clientId` set: both templates, a template without `{id}`, or an
+  `auth.oidc.tokenExchangeIssuer` without a template or that isn't an http or https URL with a
+  host.
+- With `auth.oidc.clientId` set or `auth.jwksEndpoint` empty: an `auth.issuer` that isn't an
+  http or https URL with a host.
+
+`auth.jwksEndpoint` is optional: left empty, the server finds the signing keys through
+OIDC discovery against `auth.issuer`, which must then be an http or https issuer URL.
+`values.yaml` maps each value to its server setting, and the
+[server configuration reference](https://epicgames.github.io/lore/reference/lore-server-config/#authentication)
+describes each setting. A Tier 2 example:
+
+```yaml
+auth:
+  enabled: true
+  issuer: "https://auth.example.com/"
+  audience: ["lore"]
+  resourceClaim: "resources"
+  oidc:
+    clientId: "lore-cli"
+    scopes: ["openid", "offline_access"]
+    resourceTemplate: "https://lore.example.com/partitions/{id}"
+```
+
+In tiered mode the handlers reach the data pod as clients, so with auth on they need a login
+there, and the install fails without one unless `handler.upstreamURL` is set:
+
+```yaml
+handler:
+  identity:
+    secretName: lore-handler-identity
+```
+
+Each handler logs in as the first identity in that token store the data pod accepts. The identity
+needs access to every repository the handlers serve, and its login must name the data pod's
+in-cluster host, `<release>-0.<release>-headless.<namespace>.svc.cluster.local`, among the hosts it
+may be sent to, in its `root_domains` claim or else its `aud`. The server renews the login and
+writes it back, so the Secret only seeds `/data/auth` on the cache volume on a pod's first start.
+With auth on, a handler finds no repository by name, since lore-server sends no login with
+the lookup it makes at the data pod, so clone through a handler by repository ID. Make the
+Secret as for an [edge](#edge-servers):
+
+```sh
+LORE_AUTH_PATH=./handler-auth LORE_AUTH_STORE=fallback lore login lores://lore.example.com:41337
+kubectl create secret generic lore-handler-identity --from-file=./handler-auth
+```
+
+`lore push` and `lore repository create` fail through a handler, with or without auth, so run
+them at the data pod, or at the upstream when `handler.upstreamURL` is set. The public Service
+routes only to the data pod unless `handler.servePublic` or `handler.upstreamURL` is set.
+
 ## Common settings
 
 Override with `--set key=value`. See `values.yaml` for the full, commented list and `examples/` for ready-made sample values.yaml files.
@@ -141,7 +208,7 @@ Override with `--set key=value`. See `values.yaml` for the full, commented list 
 | `data.persistence.size` / `.storageClass` | `500Gi` / cluster default | Durable store size and class. Use fast disk (NVMe / provisioned-IOPS) for real workloads. |
 | `handler.persistence.size` / `.storageClass` / `.type` | `500Gi` / default / `pvc` | Cache size and class; `type: hostPath` puts the cache on node-local NVMe. |
 | `data.store.maxSize` / `handler.store.maxSize` | `""` (off) | Size cap that lets the store reclaim space. Off by default, and off means unbounded — see [Bounding the store](#bounding-the-store). |
-| `auth.enabled` | `false` | JWT auth. Off = open server. |
+| `auth.enabled` | `false` | JWT auth. Off = open server. See [Authentication](#authentication). |
 
 ### Storage
 
@@ -225,7 +292,7 @@ rest, and a cache miss asks the other servers before S3. The chart lists every d
 headless DNS name (`<release>-N.<release>-headless.<namespace>.svc.cluster.local`) as a `fixed`
 peer, adds any `replication.topology.fixed.peers` (servers in other clusters, say), and each pod
 leaves out its own entry with `[topology.fixed] self_address`. That key needs a **loreserver
-newer than v0.12.0**; an older server ignores it and also replicates to itself.
+newer than v0.14.0**; an older server ignores it and also replicates to itself.
 
 Peering runs over mutual TLS on the replication port, and each server uses the replication cert
 as its client cert too. Servers dial each other by name, so the cert must be valid for

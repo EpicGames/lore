@@ -12,8 +12,8 @@
 //! package breaks every cross-package reference. The short aliases at the bottom are what the
 //! rest of the code actually uses.
 
-// The generated doc comments are the protos' own comments, copied as their authors wrapped them.
-#![allow(clippy::doc_lazy_continuation)]
+// The generated doc comments are the protos' own comments, copied as their authors wrote them.
+#![allow(clippy::doc_lazy_continuation, clippy::doc_markdown)]
 
 pub mod build {
     pub mod bazel {

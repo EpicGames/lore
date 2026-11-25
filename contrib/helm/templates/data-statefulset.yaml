@@ -68,9 +68,8 @@ spec:
             # cannot write its default base path ($HOME/.config on /). Point it at the
             # writable /tmp emptyDir and use the file-based store (no OS keyring exists
             # in-container). Credentials here are transient cache, so emptyDir is fine.
-            {{- /* An edge's identity lives on its volume instead (lore.edgeIdentityInit). */}}
             - name: LORE_AUTH_PATH
-              value: {{ ternary "/data/auth" "/tmp/lore-auth" (eq (include "lore.edgeIdentity" .) "true") }}
+              value: {{ include "lore.authPath" (dict "ctx" . "name" "data") }}
             - name: LORE_AUTH_STORE
               value: fallback
             - name: LORE_CONFIG_PATH
@@ -197,12 +196,7 @@ spec:
           secret:
             secretName: {{ .Values.replication.tls.secretName }}
         {{- end }}
-        {{- if include "lore.edgeIdentity" . }}
-        - name: edge-identity
-          secret:
-            secretName: {{ .Values.backend.edge.identity.secretName }}
-            defaultMode: 0440  # readable by the pod user through fsGroup
-        {{- end }}
+        {{- with include "lore.identityVolume" (dict "ctx" . "name" "data") }}{{ . | nindent 8 }}{{ end }}
         {{- if include "lore.needsCaBundle" . }}
         - name: ca-bundle
           emptyDir: {}

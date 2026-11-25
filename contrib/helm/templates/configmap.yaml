@@ -45,18 +45,7 @@ data:
   {{- $primary := printf "%s://%s-0.%s.%s.svc.cluster.local:41337" $upstreamScheme $fullname $headless $ns }}
   data.toml: |-
     {{- if .Values.auth.enabled }}
-    {{- if or .Values.auth.issuer .Values.auth.audience }}
-    [server.auth]
-    {{- if .Values.auth.issuer }}
-    jwt_issuer = {{ .Values.auth.issuer | quote }}
-    {{- end }}
-    {{- if .Values.auth.audience }}
-    jwt_audience = [{{ range $idx, $aud := .Values.auth.audience }}{{ if $idx }}, {{ end }}{{ $aud | quote }}{{ end }}]
-    {{- end }}
-    {{- end }}
-
-    [server.auth.jwk]
-    endpoint = {{ .Values.auth.jwksEndpoint | quote }}
+    {{- include "lore.authToml" $ | nindent 4 }}
     {{- end }}
 
     {{- if ne .Values.tls.mode "ephemeral" }}
@@ -100,18 +89,7 @@ data:
     {{- end }}
   handler.toml: |-
     {{- if .Values.auth.enabled }}
-    {{- if or .Values.auth.issuer .Values.auth.audience }}
-    [server.auth]
-    {{- if .Values.auth.issuer }}
-    jwt_issuer = {{ .Values.auth.issuer | quote }}
-    {{- end }}
-    {{- if .Values.auth.audience }}
-    jwt_audience = [{{ range $idx, $aud := .Values.auth.audience }}{{ if $idx }}, {{ end }}{{ $aud | quote }}{{ end }}]
-    {{- end }}
-    {{- end }}
-
-    [server.auth.jwk]
-    endpoint = {{ .Values.auth.jwksEndpoint | quote }}
+    {{- include "lore.authToml" $ | nindent 4 }}
     {{- end }}
 
     {{- if ne .Values.tls.mode "ephemeral" }}
@@ -165,18 +143,7 @@ data:
 {{- else }}
   local.toml: |-
     {{- if .Values.auth.enabled }}
-    {{- if or .Values.auth.issuer .Values.auth.audience }}
-    [server.auth]
-    {{- if .Values.auth.issuer }}
-    jwt_issuer = {{ .Values.auth.issuer | quote }}
-    {{- end }}
-    {{- if .Values.auth.audience }}
-    jwt_audience = [{{ range $idx, $aud := .Values.auth.audience }}{{ if $idx }}, {{ end }}{{ $aud | quote }}{{ end }}]
-    {{- end }}
-    {{- end }}
-
-    [server.auth.jwk]
-    endpoint = {{ .Values.auth.jwksEndpoint | quote }}
+    {{- include "lore.authToml" $ | nindent 4 }}
     {{- end }}
 
     {{- if ne .Values.tls.mode "ephemeral" }}

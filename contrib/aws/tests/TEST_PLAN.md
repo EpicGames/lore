@@ -37,7 +37,7 @@ From the Lore repo root:
 
 ```bash
 cd /path/to/lore
-docker buildx build --platform linux/arm64 -f lore-server/Dockerfile -t loreserver:v0.8.7 --load .
+docker buildx build --platform linux/arm64 -f lore-server/Dockerfile -t loreserver:v0.14.0 --load .
 ```
 
 If building on an x86 host, register QEMU first:
@@ -57,7 +57,7 @@ docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
 ### 0.2 Verify image architecture
 
 ```bash
-docker inspect loreserver:v0.8.7 --format '{{.Architecture}}'
+docker inspect loreserver:v0.14.0 --format '{{.Architecture}}'
 ```
 
 **Expected:**
@@ -82,10 +82,10 @@ aws ecr create-repository --repository-name loreserver --region us-west-2 \
 ```bash
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 REGION=us-west-2
-ECR_URI="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/loreserver:v0.8.7"
+ECR_URI="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/loreserver:v0.14.0"
 
 aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin "$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
-docker tag loreserver:v0.8.7 "$ECR_URI"
+docker tag loreserver:v0.14.0 "$ECR_URI"
 docker push "$ECR_URI"
 ```
 
@@ -93,27 +93,27 @@ docker push "$ECR_URI"
 
 ```bash
 aws ecr describe-images --repository-name loreserver --region us-west-2 \
-  --query 'imageDetails[?imageTags[0]==`v0.8.7`].{tag:imageTags[0],pushed:imagePushedAt}' \
+  --query 'imageDetails[?imageTags[0]==`v0.14.0`].{tag:imageTags[0],pushed:imagePushedAt}' \
   --output table
 ```
 
 **Expected:**
 
 ```
-------------------------------------------------
-|                DescribeImages                |
-+------------------------------------+---------+
-|               pushed               |   tag   |
-+------------------------------------+---------+
-|  <today's date>                    |  v0.8.7 |
-+------------------------------------+---------+
+-------------------------------------------------
+|                DescribeImages                 |
++------------------------------------+----------+
+|               pushed               |   tag    |
++------------------------------------+----------+
+|  <today's date>                    |  v0.14.0 |
++------------------------------------+----------+
 ```
 
 One row with today's date confirms the image landed. If empty — the push failed or the tag is wrong.
 
 ### 0.5 Create terraform.tfvars
 
-> **Requires:** `$ECR_URI` set from Phase 0.4. If running in a fresh shell, reconstruct it: `ECR_URI="<ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/loreserver:v0.8.7"`
+> **Requires:** `$ECR_URI` set from Phase 0.4. If running in a fresh shell, reconstruct it: `ECR_URI="<ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/loreserver:v0.14.0"`
 
 ```bash
 cd contrib/aws
@@ -377,7 +377,7 @@ alias lore=/out/lore
 lore --version
 ```
 
-**Expected:** A version string like `lore 0.8.x-...`. The exact version depends on the Lore commit checked out during the build.
+**Expected:** A version string like `lore 0.14.x-nightly+local`. The exact version depends on the Lore source the build clones.
 
 All steps below (3.2–4.6) run inside this container prompt.
 
@@ -488,7 +488,7 @@ lore push
 lore history
 ```
 
-**Expected:** Shows at least the initial commit and the merge commit on the `main` branch. Branch-only commits (e.g., rev 2 on `e2e-feature`) may not appear in main's linear history depending on the Lore version's history walk strategy.
+**Expected:** Shows at least the initial revision and the merged revision on the `main` branch. Branch-only revisions (for example, revision 2 on `e2e-feature`) may not appear in main's linear history depending on the Lore version's history walk strategy.
 
 ### 4.5 Sync on primary clone ([step 9](https://epicgames.github.io/lore/tutorials/quickstart/#step-9-sync-the-second-working-tree))
 

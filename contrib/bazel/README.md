@@ -6,8 +6,8 @@ the actions against their own tier of that store, and everything cacheable is st
 resolved from a loreserver that any number of machines can share.
 
 A standalone workspace, outside the Lore workspace and built from within `contrib/bazel`: it
-reaches the Lore crates by path, restates the workspace's `quinn-proto` patch, and pins its
-dependencies in a committed `Cargo.lock`.
+reaches the Lore crates by path, restates the workspace's `quinn-proto` and `glob-match` patches,
+and pins its dependencies in a committed `Cargo.lock`.
 
 [reapi]: https://github.com/bazelbuild/remote-apis
 
@@ -213,8 +213,8 @@ lore-rbe              lifecycle: build, seed, up, workers, down, wipe-*, status,
 ## Prerequisites
 
 * Linux. The worker and `lore-rbe-index` use Unix file APIs and Linux extended attributes.
-* Rust with edition 2024, and nightly rustfmt for formatting.
-* This repository: the workspace depends on the Lore crates and `vendor/quinn-proto` by path.
+* The current stable Rust, as for Lore itself, and nightly rustfmt for formatting.
+* This repository: the workspace depends on the Lore crates, `vendor/quinn-proto` and `vendor/glob-match` by path.
 * For `seed`, `source-repo` and `deps-repos`: bazel, and the `lore` CLI.
 
 ## Build
@@ -229,8 +229,9 @@ here, and `loreserver` in the Lore root. Both run from within their workspace, b
 reads `.cargo/config.toml` from the working directory upwards, not from `--manifest-path`, and
 the root one sets the rustflags `loreserver` needs (`--cfg tokio_unstable`, `--cfg uuid_unstable`).
 
-`[patch.crates-io] quinn-proto` is restated in this workspace's manifest: `lore-transport` does
-not compile against the published quinn-proto, and a patch applies only from the workspace root.
+`[patch.crates-io]` is restated in this workspace's manifest, because a patch applies only from the
+workspace root: `lore-transport` does not compile against the published quinn-proto, and
+`lore-revision`'s view and ignore filters need the vendored glob-match's `**` matching.
 
 Tests, formatting and lints run from here too:
 

@@ -47,6 +47,6 @@ service:
 tls:
   mode: certManager   # requires cert-manager installed in the cluster
 
-# Open server (no auth). Set enabled: true + jwksEndpoint to require JWT.
+# Open server (no auth). To require a JWT, set enabled: true with the auth values in values.yaml.
 auth:
   enabled: false

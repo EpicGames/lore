@@ -1,5 +1,5 @@
 variable "container_image" {
-  description = "Loreserver container image URI (linux/arm64). Must be v0.8.7 or later — the release that reads the fragment state table this example creates — built from lore-server/Dockerfile."
+  description = "Loreserver container image URI (linux/arm64). Must be v0.9.0 or later — the release that reads the fragment state table this example creates — built from lore-server/Dockerfile."
   type        = string
 }
 

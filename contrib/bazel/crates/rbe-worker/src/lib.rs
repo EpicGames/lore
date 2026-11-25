@@ -65,7 +65,7 @@ use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
-/// stdout/stderr at or below this ride inline in the ActionResult instead of costing a store
+/// stdout/stderr at or below this ride inline in the `ActionResult` instead of costing a store
 /// round trip; most actions produce nothing at all.
 #[lore_macro::test_pub]
 const INLINE_OUTPUT_LIMIT: usize = 8 * 1024;

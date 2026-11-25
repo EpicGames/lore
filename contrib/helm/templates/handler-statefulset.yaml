@@ -63,7 +63,7 @@ spec:
             # writable /tmp emptyDir and use the file-based store (no OS keyring exists
             # in-container). Credentials here are transient cache, so emptyDir is fine.
             - name: LORE_AUTH_PATH
-              value: /tmp/lore-auth
+              value: {{ include "lore.authPath" (dict "ctx" . "name" "cache") }}
             - name: LORE_AUTH_STORE
               value: fallback
             - name: LORE_CONFIG_PATH
@@ -170,6 +170,7 @@ spec:
         - name: ca-bundle
           emptyDir: {}
         {{- end }}
+        {{- with include "lore.identityVolume" (dict "ctx" . "name" "cache") }}{{ . | nindent 8 }}{{ end }}
         - name: tmp
           emptyDir: {}
         {{- include "lore.storagePodVolume" (dict "p" .Values.handler.persistence "name" "cache") | nindent 8 }}

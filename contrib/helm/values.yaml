@@ -90,6 +90,11 @@ handler:
   # routes to the handlers only (servePublic is ignored), since the local data pod
   # is then unused.
   upstreamURL: ""
+  # Secret with a file-based token store logged in at the upstream, the data pod
+  # unless upstreamURL is set (see the README). Copied to /data/auth on a pod's
+  # first start. Required with auth.enabled=true unless upstreamURL is set.
+  identity:
+    secretName: ""
   # persistence: where the handler cache at /data lives.
   persistence:
     # type: how /data is backed.
@@ -321,7 +326,7 @@ replication:
     #   statefulset every other data pod of this release, by its headless DNS name,
     #               plus any fixed.peers (e.g. servers in other clusters). Each pod
     #               leaves itself out with [topology.fixed] self_address, so this
-    #               REQUIRES a loreserver release newer than v0.12.0. An older server
+    #               REQUIRES a loreserver release newer than v0.14.0. An older server
     #               ignores the key and replicates to itself as well.
     #   consul      the consul plugin (needs it in the image); see consul below.
     provider: none          # none | fixed | statefulset | consul
@@ -373,37 +378,72 @@ tls:
 
 # auth: client authentication.
 #
-# Lore is not an identity provider. When enabled, the server validates bearer
-# JWTs against an external IdP's JWKS endpoint (any OIDC-style issuer) and
-# authorizes each request per repository from the token's resource claims.
-# Clients obtain a token with `lore login` against your IdP.
+# Lore is not an identity provider. When enabled, the server verifies bearer JWTs
+# from an external issuer and authorizes each request from the token. Clients log
+# in at one of two places, and the server refuses to start without one:
+#   - an OIDC provider, which the server advertises from auth.oidc. Without
+#     resourceClaim every token holder gets read and write, plus the token's
+#     actions, on every repository (Tier 1); with it the token's resource grants
+#     authorize each repository (Tier 2).
+#   - an authentication service at authUrl, which the server asks to authorize
+#     every request.
+# See [server.auth] in docs/reference/lore-server-config.md.
 #
 # Default below = DISABLED: the server runs open and any client that can reach
 # it can read and write every repository. Enable auth for any shared deployment.
 auth:
   enabled: false
-  # jwksEndpoint: URL of the IdP's JWKS (its public signing keys). Required when
-  # enabled=true. Maps to [server.auth.jwk].endpoint.
-  jwksEndpoint: ""
-  # issuer: if set, the JWT `iss` claim must equal this. Maps to server.auth.jwt_issuer.
+  # issuer: the accepted JWT `iss` value. Required when enabled=true. With oidc it
+  # must be the provider's issuer URL. Maps to server.auth.jwt_issuer.
   issuer: ""
-  # audience: if set, the JWT `aud` claim must contain one of these. Maps to
-  # server.auth.jwt_audience.
+  # audience: the accepted JWT `aud` values. At least one is required when
+  # enabled=true. Maps to server.auth.jwt_audience.
   audience: []
+  # jwksEndpoint: URL of the issuer's JWKS (its public signing keys). "" resolves
+  # it through OIDC discovery against issuer, which must then be an http or https
+  # issuer URL. Maps to [server.auth.jwk].endpoint.
+  jwksEndpoint: ""
+  # authUrl: the authentication service clients log in at, such as
+  # "ucs-auth://auth.example.com". Leave resourceClaim unset with it. Maps to
+  # [environment.endpoint].auth_url.
+  authUrl: ""
+  # permissionClaim: Tier 1: dotted path of the claim carrying the caller's
+  # actions, such as "realm_access.roles". Tier 2: the field of each resource
+  # grant carrying its actions, "permission" when "". Maps to
+  # server.auth.permission_claim.
+  permissionClaim: ""
+  # resourceClaim: dotted path of the claim carrying per-repository grants, such as
+  # "resources". Set it for Tier 2, together with oidc.resourceTemplate or
+  # oidc.scopeTemplate. Maps to server.auth.resource_claim.
+  resourceClaim: ""
+  # oidc: the OIDC provider advertised to clients. Maps to [server.auth.oidc],
+  # written when clientId is set. Required when authUrl is "".
+  oidc:
+    clientId: ""                 # public client ID clients present to the provider
+    scopes: []                   # scopes requested at an interactive (device) login
+    clientCredentialsScopes: []  # scopes requested with the client credentials grant
+    preferred: false             # with authUrl set: whether clients log in through OIDC by default
+    resourceTemplate: ""         # Tier 2: a partition as an RFC 8707 resource, with {id} for the partition ID
+    scopeTemplate: ""            # Tier 2: a partition as a scope value, with {id}. Set this or resourceTemplate
+    tokenExchangeIssuer: ""      # Tier 2: issuer of a separate token-exchange service. "" uses issuer
 
-# Example — authenticate against a fictitious JWT IdP at auth.example.com.
+# Example — Tier 2 against a fictitious OIDC provider at auth.example.com.
 # Copy this into a values override (do not uncomment here) and adjust:
 #
 # auth:
 #   enabled: true
-#   jwksEndpoint: "https://auth.example.com/.well-known/jwks.json"
 #   issuer: "https://auth.example.com/"
 #   audience: ["lore"]
+#   resourceClaim: "resources"
+#   oidc:
+#     clientId: "lore-cli"
+#     scopes: ["openid", "offline_access"]
+#     resourceTemplate: "https://lore.example.com/partitions/{id}"
 #
-# Tokens must carry Lore resource claims to authorize repositories:
+# Tokens then carry Lore resource grants to authorize repositories:
 #   resources: [{ resource_id: "urc-<repositoryId>", permission: ["read","write"] }]
 # Use resource_id "urc-*" to grant access to every repository. Clients then run:
-#   lore login lores://<server>:41337     # obtain a token from your IdP
+#   lore login lores://<server>:41337     # obtain a token from your provider
 #   lore clone lores://<server>:41337/myrepo
 
 # resources: compute requests and limits.

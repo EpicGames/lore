@@ -143,6 +143,12 @@
           "type": "string",
           "description": "lore:// URL the handlers use for the durable/mutable store. Empty (default) auto-targets this release's data pod. Set to front an external/upstream lore server; the public Service then routes to the handlers only and servePublic is ignored."
         },
+        "identity": {
+          "type": "object",
+          "properties": {
+            "secretName": { "type": "string", "description": "Secret holding a file-based token store logged in at the upstream, the data pod unless upstreamURL is set. It seeds /data/auth on a pod's first start. Required with auth.enabled=true unless upstreamURL is set." }
+          }
+        },
         "persistence": {
           "type": "object",
           "description": "How the handler cache at /data is backed (one per handler pod).",
@@ -345,25 +351,110 @@
     },
     "auth": {
       "type": "object",
-      "description": "Client authentication. Lore is not an identity provider: when enabled it validates bearer JWTs against an external IdP's JWKS endpoint and authorizes per repository from the token's resource claims. Disabled by default, which leaves the server open.",
+      "description": "Client authentication. Lore is not an identity provider: when enabled it verifies bearer JWTs from an external issuer, and clients log in through the OIDC provider in oidc or the authentication service at authUrl. Disabled by default, which leaves the server open.",
       "properties": {
         "enabled": {
           "type": "boolean",
           "description": "Enable JWT authentication. When false the server runs open — any client that can reach it can read and write every repository."
         },
-        "jwksEndpoint": {
-          "type": "string",
-          "description": "URL of the IdP's JWKS (public signing keys). Required when enabled=true. Maps to [server.auth.jwk].endpoint."
-        },
         "issuer": {
           "type": "string",
-          "description": "Optional. If set, the JWT 'iss' claim must equal this. Maps to server.auth.jwt_issuer."
+          "description": "The accepted JWT 'iss' value. Required when enabled=true; with oidc, the provider's issuer URL. Maps to server.auth.jwt_issuer."
         },
         "audience": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Optional. If non-empty, the JWT 'aud' claim must contain one of these. Maps to server.auth.jwt_audience."
+          "description": "The accepted JWT 'aud' values. At least one is required when enabled=true. Maps to server.auth.jwt_audience."
+        },
+        "jwksEndpoint": {
+          "type": "string",
+          "description": "URL of the issuer's JWKS (public signing keys). Empty resolves it through OIDC discovery against issuer, which must then be an http or https issuer URL. Maps to [server.auth.jwk].endpoint."
+        },
+        "authUrl": {
+          "type": "string",
+          "description": "The authentication service clients log in at, which authorizes every request. Set this or oidc.clientId when enabled=true. Maps to [environment.endpoint].auth_url."
+        },
+        "permissionClaim": {
+          "type": "string",
+          "description": "Tier 1: dotted path of the claim carrying the caller's actions, beside read and write. Tier 2: the field of each resource grant carrying its actions, 'permission' when empty. Maps to server.auth.permission_claim."
+        },
+        "resourceClaim": {
+          "type": "string",
+          "description": "Dotted path of the claim carrying per-repository grants, which selects Tier 2 and needs oidc.resourceTemplate or oidc.scopeTemplate. Maps to server.auth.resource_claim."
+        },
+        "oidc": {
+          "type": "object",
+          "description": "The OIDC provider advertised to clients, written as [server.auth.oidc] when clientId is set.",
+          "properties": {
+            "clientId": { "type": "string", "description": "The public client ID clients present to the provider. Set this or authUrl when enabled=true. Maps to client_id." },
+            "scopes": { "type": "array", "items": { "type": "string" }, "description": "Scopes clients request at an interactive (device) login. Maps to scopes." },
+            "clientCredentialsScopes": { "type": "array", "items": { "type": "string" }, "description": "Scopes clients request with the client credentials grant. Maps to client_credentials_scopes." },
+            "preferred": { "type": "boolean", "description": "With authUrl set, whether clients log in through OIDC by default. Maps to preferred." },
+            "resourceTemplate": { "type": "string", "description": "Tier 2: a partition as an RFC 8707 resource, with {id} for the partition ID. Maps to resource_template." },
+            "scopeTemplate": { "type": "string", "description": "Tier 2: a partition as a scope value, with {id} for the partition ID. Set this or resourceTemplate. Maps to scope_template." },
+            "tokenExchangeIssuer": { "type": "string", "description": "Tier 2: the issuer of a separate token-exchange service. Empty uses issuer. Maps to token_exchange_issuer." }
+          }
         }
+      },
+      "if": {
+        "properties": { "enabled": { "const": true } },
+        "required": ["enabled"]
+      },
+      "then": {
+        "required": ["issuer", "audience"],
+        "properties": {
+          "issuer": { "minLength": 1 },
+          "audience": { "minItems": 1 }
+        },
+        "anyOf": [
+          { "required": ["authUrl"], "properties": { "authUrl": { "minLength": 1 } } },
+          {
+            "required": ["oidc"],
+            "properties": { "oidc": { "required": ["clientId"], "properties": { "clientId": { "minLength": 1 } } } }
+          }
+        ],
+        "allOf": [
+          {
+            "if": { "required": ["authUrl"], "properties": { "authUrl": { "minLength": 1 } } },
+            "then": { "properties": { "resourceClaim": { "maxLength": 0 } } }
+          },
+          {
+            "if": { "required": ["resourceClaim"], "properties": { "resourceClaim": { "minLength": 1 } } },
+            "then": { "required": ["oidc"], "properties": { "oidc": { "$ref": "#/definitions/oidcTemplate" } } }
+          },
+          {
+            "if": { "required": ["oidc"], "properties": { "oidc": { "$ref": "#/definitions/oidcTemplate" } }, "not": { "required": ["authUrl"], "properties": { "authUrl": { "minLength": 1 } } } },
+            "then": { "required": ["resourceClaim"], "properties": { "resourceClaim": { "minLength": 1 } } }
+          },
+          {
+            "if": { "required": ["oidc"], "properties": { "oidc": { "required": ["clientId"], "properties": { "clientId": { "minLength": 1 } } } } },
+            "then": {
+              "properties": {
+                "oidc": {
+                  "properties": {
+                    "resourceTemplate": { "pattern": "^$|\\{id\\}" },
+                    "scopeTemplate": { "pattern": "^$|\\{id\\}" },
+                    "tokenExchangeIssuer": { "if": { "minLength": 1 }, "then": { "$ref": "#/definitions/issuerUrl" } }
+                  },
+                  "allOf": [
+                    {
+                      "if": { "required": ["resourceTemplate"], "properties": { "resourceTemplate": { "minLength": 1 } } },
+                      "then": { "properties": { "scopeTemplate": { "maxLength": 0 } } }
+                    },
+                    {
+                      "if": { "required": ["tokenExchangeIssuer"], "properties": { "tokenExchangeIssuer": { "minLength": 1 } } },
+                      "then": { "$ref": "#/definitions/oidcTemplate" }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": { "anyOf": [{ "required": ["oidc"], "properties": { "oidc": { "required": ["clientId"], "properties": { "clientId": { "minLength": 1 } } } } }, { "not": { "required": ["jwksEndpoint"], "properties": { "jwksEndpoint": { "minLength": 1 } } } }] },
+            "then": { "properties": { "issuer": { "$ref": "#/definitions/issuerUrl" } } }
+          }
+        ]
       }
     },
     "resources": {
@@ -548,7 +639,7 @@
           "type": "object",
           "description": "Peer discovery for replication.",
           "properties": {
-            "provider": { "type": "string", "enum": ["none", "fixed", "statefulset", "consul"], "description": "none (no peers), fixed (static peer list), statefulset (every other data pod of this release plus fixed.peers; needs a loreserver newer than v0.12.0), or consul (needs the consul plugin in the image)." },
+            "provider": { "type": "string", "enum": ["none", "fixed", "statefulset", "consul"], "description": "none (no peers), fixed (static peer list), statefulset (every other data pod of this release plus fixed.peers; needs a loreserver newer than v0.14.0), or consul (needs the consul plugin in the image)." },
             "fixed": {
               "type": "object",
               "properties": {
@@ -636,7 +727,29 @@
       }
     }
   },
+  "if": {
+    "required": ["topology", "auth", "handler"],
+    "properties": {
+      "topology": { "properties": { "mode": { "const": "tiered" } } },
+      "auth": { "required": ["enabled"], "properties": { "enabled": { "const": true } } },
+      "handler": { "properties": { "upstreamURL": { "maxLength": 0 } } }
+    }
+  },
+  "then": {
+    "properties": {
+      "handler": { "required": ["identity"], "properties": { "identity": { "required": ["secretName"], "properties": { "secretName": { "minLength": 1 } } } } }
+    }
+  },
   "definitions": {
+    "issuerUrl": {
+      "type": "string",
+      "description": "An http or https URL with a host, as lore-server's is_issuer_url requires of an issuer. Like the URL parser, it takes the scheme in any case, leading control characters and spaces, tabs and newlines anywhere, and slashes or backslashes before the host. It doesn't check that the host and port are valid.",
+      "pattern": "^[\\x00-\\x20]*[Hh][\\t\\n\\r]*[Tt][\\t\\n\\r]*[Tt][\\t\\n\\r]*[Pp][\\t\\n\\r]*([Ss][\\t\\n\\r]*)?:[\\t\\n\\r/\\\\]*[^\\t\\n\\r/\\\\?#]"
+    },
+    "oidcTemplate": {
+      "description": "An auth.oidc with resourceTemplate or scopeTemplate set.",
+      "anyOf": [{ "required": ["resourceTemplate"], "properties": { "resourceTemplate": { "minLength": 1 } } }, { "required": ["scopeTemplate"], "properties": { "scopeTemplate": { "minLength": 1 } } }]
+    },
     "storeGc": {
       "type": "object",
       "description": "Caps that drive the local immutable store's background compactor and evictor. Every field defaults to off, and the server reads an absent cap as 0, which disables the corresponding task entirely.",

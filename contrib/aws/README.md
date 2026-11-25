@@ -13,7 +13,7 @@ This example uses **c8gd.8xlarge** Graviton instances (32 vCPU, 64 GB RAM, 1.9 T
 From the Lore repo root:
 
 ```sh
-docker buildx build --platform linux/arm64 -f lore-server/Dockerfile -t loreserver:v0.8.7 --load .
+docker buildx build --platform linux/arm64 -f lore-server/Dockerfile -t loreserver:v0.14.0 --load .
 ```
 
 > If building on an x86 host, [register QEMU](https://docs.docker.com/build/building/multi-platform/#qemu) first:
@@ -24,8 +24,8 @@ Push to ECR (replace `<ACCOUNT_ID>` and `<REGION>`):
 ```sh
 aws ecr get-login-password --region <REGION> | docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com
 aws ecr create-repository --repository-name loreserver --region <REGION>
-docker tag loreserver:v0.8.7 <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/loreserver:v0.8.7
-docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/loreserver:v0.8.7
+docker tag loreserver:v0.14.0 <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/loreserver:v0.14.0
+docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/loreserver:v0.14.0
 ```
 
 ### 2. Deploy
@@ -39,7 +39,7 @@ Edit `terraform.tfvars`:
 
 ```hcl
 region          = "us-west-2"
-container_image = "<ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/loreserver:v0.8.7"
+container_image = "<ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/loreserver:v0.14.0"
 allowed_cidrs   = ["10.0.0.0/8"]  # Your VPC or VPN CIDR
 ```
 
@@ -152,27 +152,76 @@ See `tests/TEST_PLAN.md` for the manual equivalent with AWS resource validation.
 |------|----------------|
 | Smaller instances (dev/test) | Set `instance_type = "c8gd.xlarge"` — same architecture, less capacity |
 | External access | Add an NLB in public subnets |
-| Authentication | Set `LORE__SERVER__AUTH__JWK__ENDPOINT` ([docs](https://epicgames.github.io/lore/reference/lore-server-config/#authentication)) |
+| Authentication | Add `[server.auth]` (see [Authentication](#authentication)) |
 | More edge nodes | Increase ASG `min_size`/`max_size`/`desired_capacity` + edge service `desired_count` |
 | Dynamic scaling | Add an `aws_ecs_capacity_provider` with managed scaling (see the capacity note in `compute.tf`) |
 | Faster edge startup | Consider adding a startup probe that polls `primary.lore.internal` before starting loreserver |
 | Presigned URLs | Already configured via HMAC key in Secrets Manager |
 | Production hardening | Add `deletion_protection_enabled = true` to DynamoDB tables |
-| Objects stored before v0.8.7 | Set `fragment_metadata_table` to the existing metadata table (see below) |
+| Objects stored before v0.9.0 | Set `fragment_metadata_table` to the existing metadata table (see below) |
 
 Full server configuration: [Lore Server config reference](https://epicgames.github.io/lore/reference/lore-server-config/)
 
-### Upgrading a deployment that predates v0.8.7
+### Authentication
 
-A fragment now travels on the S3 object that carries it, described by the `-fragment-state` table rather than the old `-metadata` table. A stack applied from an earlier revision of this example has objects written the old way, and only its metadata table can describe them.
+Without `[server.auth]` the servers verify no token, and any client that reaches them can read and write every repository. `[server.auth]` needs `jwt_issuer` and `jwt_audience`, and the server refuses to start without either. `jwt_audience` is a list, which no `LORE__` environment variable can carry, so put the settings in `local.toml` in the configuration directory `LORE_CONFIG_PATH` names, `/etc/lore/config`, for example by adding the file to the image.
 
-Nothing here creates that table any more, and `storage.tf` drops it from Terraform state without destroying it. Point the server back at it so those objects stay readable:
+Clients log in at an OIDC provider or at an authentication service, and the server refuses to start with neither:
 
-```hcl
-fragment_metadata_table = "lore-metadata"  # the table your earlier apply created
+| Tier | Clients log in at | Settings beside `jwt_issuer` and `jwt_audience` |
+|------|-------------------|--------------------------------------------------|
+| Tier 1 | The OIDC provider in `[server.auth.oidc]` | `client_id` under `[server.auth.oidc]`. Every token holder gets `read`, the actions in `implicit_actions` (`["write"]` by default) and those in the token's `permission_claim`, on every repository. `jwt_issuer` is the provider's issuer URL. |
+| Tier 2 | The OIDC provider in `[server.auth.oidc]` | As Tier 1, plus `resource_claim`, the claim carrying per-repository grants, and `resource_template` or `scope_template` under `[server.auth.oidc]`. |
+| Authentication service | `[environment.endpoint] auth_url` | `auth_url`, without `resource_claim`. The server asks the service to authorize every request. `[server.auth.oidc]` is optional. |
+
+A Tier 2 example:
+
+```toml
+[server.auth]
+jwt_issuer = "https://auth.example.com/"
+jwt_audience = ["lore"]
+resource_claim = "resources"
+
+[server.auth.oidc]
+client_id = "lore-cli"
+scopes = ["openid", "offline_access"]
+resource_template = "https://lore.example.com/partitions/{id}"
 ```
 
-The server reads it only for an object carrying no metadata of its own. Once every such object has been rewritten, unset the variable — an object with no metadata is then reported as damaged rather than described from a row that may not be about it.
+Give the primary and the edge the same settings. The edge's `remote` mutable store then authenticates at the primary as the first identity, in the token store of the user the edge runs as, that the primary accepts. The edge task definition here has no token store, so add one to it before turning on auth at the primary. See [Authentication](https://epicgames.github.io/lore/reference/lore-server-config/#authentication) in the server configuration reference for every setting.
+
+### Upgrading a deployment that predates v0.9.0
+
+From v0.9.0 a fragment travels on the S3 object that carries it, and the `-fragment-state` table records which hashes exist. Objects written before v0.9.0 are described only by the earlier `-metadata` table. Nothing here creates that table any more, and `storage.tf` drops it from Terraform state without destroying it. The [v0.9.0 release notes](../../docs/release-notes.md#v090-aug-28th-2026-782) set out the upgrade. The commands below use the names the default `name = "lore"` prefix produces.
+
+1. Name the existing metadata table in `terraform.tfvars`, so the server reads the objects stored before v0.9.0 through it:
+
+   ```hcl
+   fragment_metadata_table = "lore-metadata"  # the table your earlier apply created
+   ```
+
+2. Stop every task. Servers before v0.9.0 and servers from v0.9.0 on must never run at the same time, and an ECS rolling deployment runs them side by side:
+
+   ```sh
+   aws ecs update-service --cluster lore-cluster --service lore --desired-count 0 --region us-west-2
+   aws ecs update-service --cluster lore-cluster --service lore-edge --desired-count 0 --region us-west-2
+   aws ecs wait services-stable --cluster lore-cluster --services lore lore-edge --region us-west-2
+   ```
+
+3. Set `container_image` to the new image and run `terraform apply`. It creates the fragment state table, reads the metadata table, and starts both services on the new task definitions.
+
+4. Migrate the objects stored before v0.9.0 with `lore-aws-migrate`, as [its README](../aws-migrate-0.9.0/README.md) describes. The store must serve no traffic during the run, and no variable here sets maintenance mode, so scale both services to 0 again as in step 2, run the migration, and run `terraform apply` once it verifies to start them again:
+
+   ```sh
+   ../aws-migrate-0.9.0/target/release/lore-aws-migrate \
+     --s3-bucket "$(terraform output -raw s3_bucket)" \
+     --fragments-table lore-fragments \
+     --fragment-state-table lore-fragment-state \
+     --fragment-metadata-table lore-metadata \
+     --region us-west-2
+   ```
+
+5. Once the migration verifies, unset `fragment_metadata_table` and run `terraform apply`. An object with no metadata is then reported as damaged rather than described from a row that may not be about it. Delete the metadata table as the migration README's *Clean up* section describes.
 
 ## Destroy
 

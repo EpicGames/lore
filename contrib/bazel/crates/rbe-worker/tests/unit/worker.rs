@@ -252,7 +252,7 @@ fn declared_outputs_falls_back_to_the_union_of_the_split_lists() {
 }
 
 /// Small streams ride inline; large ones become a blob the result points at. Getting this
-/// backwards either bloats every ActionResult or costs a round trip on every action.
+/// backward either bloats every `ActionResult` or costs a round trip on every action.
 #[test]
 fn stream_output_is_inlined_only_below_the_limit() {
     let mut collected = Collected::default();

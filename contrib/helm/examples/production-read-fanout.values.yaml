@@ -10,7 +10,8 @@
 # / `branch list --remote` from its remote mutable store today — run those management
 # operations against the data pod directly, or keep servePublic=false until the
 # server supports remote list. Choose this profile when clone/pull throughput is the
-# priority and you accept that trade-off.
+# priority and you accept that trade-off. With auth on, a handler also finds no
+# repository by name: clone by repository ID (see the README's Authentication section).
 
 image:
   repository: ghcr.io/epicgames/lore/loreserver
@@ -22,6 +23,8 @@ topology:
 handler:
   replicas: 8
   servePublic: true            # fan client reads across the handler cache tier
+  identity:
+    secretName: lore-handler-identity  # the handlers' login at the data pod (see the README)
   persistence:
     type: hostPath             # fast node-local NVMe for the cache
     hostPath:
@@ -72,4 +75,8 @@ tls:
 auth:
   enabled: true
   jwksEndpoint: "https://auth.example.com/.well-known/jwks.json"
+  issuer: "https://auth.example.com/"
   audience: ["lore"]
+  oidc:                        # Tier 1: every token holder can read and write every repository
+    clientId: "lore-cli"
+    scopes: ["openid", "offline_access"]

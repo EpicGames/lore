@@ -68,3 +68,4 @@ auth:
   jwksEndpoint: "https://auth.example.com/.well-known/jwks.json"
   issuer: "https://auth.example.com/"
   audience: ["lore"]
+  authUrl: "ucs-auth://auth.example.com"   # the upstream's authentication service

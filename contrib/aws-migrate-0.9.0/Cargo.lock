@@ -33,15 +33,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
-name = "android_system_properties"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae221649c9976a6f6c56ae1facf410f3ddb33cc661c4b7b61020a912d4237fbc"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -873,10 +864,8 @@ version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
- "iana-time-zone",
  "num-traits",
  "serde",
- "windows-link",
 ]
 
 [[package]]
@@ -1314,9 +1303,9 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -1479,8 +1468,6 @@ checksum = "fc148d4ddd3930c52f9e5ae79b89805c6f07e9ff417e7b083e0348cea60a5aba"
 [[package]]
 name = "glob-match"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9985c9503b412198aa4197559e9a318524ebc4519c229bfa05a535828c950b9d"
 
 [[package]]
 name = "governor"
@@ -1706,30 +1693,6 @@ dependencies = [
  "tower-service",
  "tracing",
  "windows-registry",
-]
-
-[[package]]
-name = "iana-time-zone"
-version = "0.1.65"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e31bc9ad994ba00e440a8aa5c9ef0ec67d5cb5e5cb0cc7f8b744a35b389cc470"
-dependencies = [
- "android_system_properties",
- "core-foundation-sys",
- "iana-time-zone-haiku",
- "js-sys",
- "log",
- "wasm-bindgen",
- "windows-core",
-]
-
-[[package]]
-name = "iana-time-zone-haiku"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
-dependencies = [
- "cc",
 ]
 
 [[package]]
@@ -2073,7 +2036,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "lore-aws"
-version = "0.11.1-nightly"
+version = "0.14.1-nightly"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2084,7 +2047,6 @@ dependencies = [
  "aws-smithy-types",
  "aws-types",
  "bytes",
- "chrono",
  "dashmap",
  "hex",
  "lore-base",
@@ -2101,6 +2063,7 @@ dependencies = [
  "serde_dynamo",
  "smallvec",
  "thiserror",
+ "time",
  "tokio",
  "tracing",
  "zerocopy",
@@ -2126,7 +2089,7 @@ dependencies = [
 
 [[package]]
 name = "lore-base"
-version = "0.11.1-nightly"
+version = "0.14.1-nightly"
 dependencies = [
  "backtrace",
  "bitcode",
@@ -2134,7 +2097,6 @@ dependencies = [
  "blake3",
  "bytes",
  "cc",
- "chrono",
  "directories",
  "hex",
  "libc",
@@ -2146,6 +2108,7 @@ dependencies = [
  "rand 0.9.5",
  "serde",
  "thiserror",
+ "time",
  "tokio",
  "uuid",
  "windows-sys 0.61.2",
@@ -2154,15 +2117,17 @@ dependencies = [
 
 [[package]]
 name = "lore-credential"
-version = "0.11.1-nightly"
+version = "0.14.1-nightly"
 dependencies = [
  "apple-native-keyring-store",
  "base64 0.22.1",
  "jsonwebtoken",
  "keyring-core",
+ "libc",
  "linux-keyutils-keyring-store",
  "lore-base",
  "lore-error-set",
+ "lore-macro",
  "ring",
  "serde",
  "serde_json",
@@ -2192,8 +2157,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "lore-fuse"
+version = "0.14.1-nightly"
+dependencies = [
+ "dashmap",
+ "libc",
+ "lore-base",
+ "lore-macro",
+ "parking_lot",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "zerocopy",
+]
+
+[[package]]
 name = "lore-io"
-version = "0.11.1-nightly"
+version = "0.14.1-nightly"
 dependencies = [
  "bytes",
  "io-uring",
@@ -2205,7 +2185,7 @@ dependencies = [
 
 [[package]]
 name = "lore-macro"
-version = "0.11.1-nightly"
+version = "0.14.1-nightly"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2214,7 +2194,7 @@ dependencies = [
 
 [[package]]
 name = "lore-proto"
-version = "0.1.67"
+version = "0.1.69"
 dependencies = [
  "lore-base",
  "prost",
@@ -2226,8 +2206,9 @@ dependencies = [
 
 [[package]]
 name = "lore-revision"
-version = "0.11.1-nightly"
+version = "0.14.1-nightly"
 dependencies = [
+ "arc-swap",
  "async-stream",
  "async-trait",
  "base64 0.22.1",
@@ -2235,8 +2216,9 @@ dependencies = [
  "bitflags 2.13.2",
  "blake3",
  "bytes",
- "chrono",
+ "crossbeam-epoch",
  "crossbeam-queue",
+ "crossbeam-utils",
  "dashmap",
  "diffy",
  "fastcdc",
@@ -2251,6 +2233,7 @@ dependencies = [
  "lore-base",
  "lore-credential",
  "lore-error-set",
+ "lore-fuse",
  "lore-io",
  "lore-macro",
  "lore-proto",
@@ -2260,6 +2243,7 @@ dependencies = [
  "open",
  "opentelemetry",
  "parking_lot",
+ "pin-project",
  "prost-types",
  "quinn",
  "rand 0.9.5",
@@ -2285,7 +2269,7 @@ dependencies = [
 
 [[package]]
 name = "lore-storage"
-version = "0.11.1-nightly"
+version = "0.14.1-nightly"
 dependencies = [
  "async-trait",
  "bitcode",
@@ -2324,7 +2308,7 @@ dependencies = [
 
 [[package]]
 name = "lore-telemetry"
-version = "0.11.1-nightly"
+version = "0.14.1-nightly"
 dependencies = [
  "axum",
  "http",
@@ -2347,7 +2331,7 @@ dependencies = [
 
 [[package]]
 name = "lore-transport"
-version = "0.11.1-nightly"
+version = "0.14.1-nightly"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2355,9 +2339,13 @@ dependencies = [
  "bitcode",
  "bytes",
  "crossbeam-epoch",
+ "crossbeam-queue",
+ "crossbeam-utils",
  "dashmap",
  "futures",
  "http",
+ "hyper-util",
+ "libc",
  "lore-base",
  "lore-credential",
  "lore-error-set",
@@ -2384,6 +2372,7 @@ dependencies = [
  "tower",
  "url",
  "webpki-roots",
+ "windows-sys 0.61.2",
  "zerocopy",
 ]
 
@@ -2836,9 +2825,9 @@ dependencies = [
 
 [[package]]
 name = "pulldown-cmark"
-version = "0.13.5"
+version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "278e9268c93b9e498a2da46c34d90ba93a3255eb99009646398f34bc73ab36eb"
+checksum = "3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b"
 dependencies = [
  "bitflags 2.13.2",
  "memchr",
@@ -3976,9 +3965,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",
@@ -4141,41 +4130,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
 dependencies = [
  "rustls-pki-types",
-]
-
-[[package]]
-name = "windows-core"
-version = "0.62.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
-dependencies = [
- "windows-implement",
- "windows-interface",
- "windows-link",
- "windows-result",
- "windows-strings",
-]
-
-[[package]]
-name = "windows-implement"
-version = "0.60.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "windows-interface"
-version = "0.59.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f316c4a2570ba26bbec722032c4099d8c8bc095efccdc15688708623367e358"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]

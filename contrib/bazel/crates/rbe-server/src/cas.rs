@@ -91,7 +91,7 @@ fn internal(e: impl std::fmt::Display) -> Status {
 }
 
 /// zstd level for what this server compresses on the way out: zstd's own default, which
-/// compresses much faster than WiFi or 5 GbE can carry the result.
+/// compresses much faster than Wi-Fi or 5 Gbit/s Ethernet can carry the result.
 const ZSTD_LEVEL: i32 = 3;
 
 /// Above this, compressing, decompressing and hashing a blob move to the blocking pool: a level-3
@@ -499,7 +499,7 @@ impl ContentAddressableStorage for CasService {
     }
 }
 
-/// A parsed ByteStream resource name.
+/// A parsed `ByteStream` resource name.
 #[lore_macro::test_pub]
 #[derive(Debug)]
 struct Resource {
@@ -563,9 +563,9 @@ fn parse_resource(name: &str) -> Result<Resource, Status> {
             )));
         }
     };
-    let size: i64 = size
-        .parse()
-        .map_err(|_| Status::invalid_argument(format!("bad size in resource name: {name}")))?;
+    let size: i64 = size.parse().map_err(|_invalid| {
+        Status::invalid_argument(format!("bad size in resource name: {name}"))
+    })?;
 
     Ok(Resource {
         hash: hash.to_string(),
@@ -832,7 +832,7 @@ impl Capabilities for CapabilitiesService {
     }
 }
 
-/// Helper shared with the worker-facing paths: read one blob or fail with NOT_FOUND.
+/// Helper shared with the worker-facing paths: read one blob or fail with `NOT_FOUND`.
 pub async fn read_blob(store: &LoreBlobStore, d: &Digest) -> Result<Vec<u8>, Status> {
     if is_empty_digest(d) {
         return Ok(Vec::new());

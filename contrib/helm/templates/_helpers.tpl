@@ -258,51 +258,77 @@ key and silently drop one. Call with (dict "ctx" . "p" <persistence> "name" "dat
 {{- define "lore.initContainers" -}}
 {{- $hostPath := include "lore.hostPathInit" . -}}
 {{- $caBundle := include "lore.caBundleInit" .ctx -}}
-{{- $edgeIdentity := "" -}}
-{{- if eq .name "data" -}}
-{{- $edgeIdentity = include "lore.edgeIdentityInit" .ctx -}}
-{{- end -}}
-{{- if or (trim $hostPath) (trim $caBundle) (trim $edgeIdentity) }}
+{{- $identity := include "lore.identityInit" . -}}
+{{- if or (trim $hostPath) (trim $caBundle) (trim $identity) }}
 initContainers:
 {{- $caBundle }}
 {{- $hostPath }}
-{{- $edgeIdentity }}
+{{- $identity }}
 {{- end }}
 {{- end -}}
 
 {{/*
-True when an edge has an identity Secret, seeded into /data/auth. Root context.
+The Secret seeding a tier's token store at /data/auth, the login its remote stores
+present upstream: backend.edge.identity for an edge's data pods, handler.identity for
+the handlers. Empty when the tier has none. Call with (dict "ctx" . "name" "data|cache").
 */}}
-{{- define "lore.edgeIdentity" -}}
-{{- if and (eq .Values.backend.type "edge") .Values.backend.edge.identity.secretName -}}true{{- end -}}
+{{- define "lore.identitySecret" -}}
+{{- if eq .name "cache" -}}
+{{- .ctx.Values.handler.identity.secretName -}}
+{{- else if eq .ctx.Values.backend.type "edge" -}}
+{{- .ctx.Values.backend.edge.identity.secretName -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
-Init container that copies the identity Secret to /data/auth unless a token store is
-already there: the server renews the login in place, so the copy on the volume is the
-newer one. Runs after lore.hostPathInit. Root context.
+The token store directory of a tier: /data/auth when lore.identitySecret seeds it,
+else the /tmp emptyDir. Call with (dict "ctx" . "name" "data|cache").
 */}}
-{{- define "lore.edgeIdentityInit" -}}
-{{- if include "lore.edgeIdentity" . }}
-  - name: init-edge-identity
-    image: {{ include "lore.image" . | quote }}
-    imagePullPolicy: {{ .Values.imagePullPolicy }}
+{{- define "lore.authPath" -}}
+{{- ternary "/data/auth" "/tmp/lore-auth" (ne (include "lore.identitySecret" .) "") -}}
+{{- end -}}
+
+{{/*
+The pod volume of a tier's identity Secret, read by lore.identityInit. Renders nothing
+without one. Call with (dict "ctx" . "name" "data|cache").
+*/}}
+{{- define "lore.identityVolume" -}}
+{{- with include "lore.identitySecret" . -}}
+- name: identity
+  secret:
+    secretName: {{ . }}
+    defaultMode: 0440  # readable by the pod user through fsGroup
+{{- end -}}
+{{- end -}}
+
+{{/*
+Init container that copies the tier's identity Secret to /data/auth unless a token
+store is already there: the server renews the login in place, so the copy on the
+volume is the newer one. Runs after lore.hostPathInit.
+Call with (dict "ctx" . "p" <persistence> "name" "data|cache").
+*/}}
+{{- define "lore.identityInit" -}}
+{{- $ctx := .ctx -}}
+{{- if include "lore.identitySecret" . }}
+  - name: init-identity
+    image: {{ include "lore.image" $ctx | quote }}
+    imagePullPolicy: {{ $ctx.Values.imagePullPolicy }}
     command:
       - sh
       - -c
-      - 'if [ -e /data/auth/tokenstore.toml ]; then echo "keeping the token store on the volume"; else mkdir -p /data/auth && chmod 700 /data/auth && cp /etc/lore/edge-identity/* /data/auth/ && chmod 600 /data/auth/* && echo "seeded the token store from the identity Secret"; fi'
+      - 'if [ -e /data/auth/tokenstore.toml ]; then echo "keeping the token store on the volume"; else mkdir -p /data/auth && chmod 700 /data/auth && cp /etc/lore/identity/* /data/auth/ && chmod 600 /data/auth/* && echo "seeded the token store from the identity Secret"; fi'
     securityContext:
-      {{- toYaml .Values.securityContext | nindent 6 }}
+      {{- toYaml $ctx.Values.securityContext | nindent 6 }}
     volumeMounts:
-      - name: edge-identity
-        mountPath: /etc/lore/edge-identity
+      - name: identity
+        mountPath: /etc/lore/identity
         readOnly: true
-      - name: data
+      - name: {{ .name }}
         mountPath: /data
-        {{- if eq (include "lore.storageType" .Values.data.persistence) "hostPath" }}
+        {{- if eq (include "lore.storageType" .p) "hostPath" }}
         subPathExpr: $(POD_NAME)
         {{- end }}
-    {{- if eq (include "lore.storageType" .Values.data.persistence) "hostPath" }}
+    {{- if eq (include "lore.storageType" .p) "hostPath" }}
     env:
       - name: POD_NAME
         valueFrom:
@@ -395,6 +421,66 @@ presigned_url_min_ttl_seconds = {{ $ctx.Values.presignedUrl.minTtlSeconds }}
 presigned_url_default_ttl_seconds = {{ $ctx.Values.presignedUrl.defaultTtlSeconds }}
 presigned_url_max_ttl_seconds = {{ $ctx.Values.presignedUrl.maxTtlSeconds }}
 {{- end }}
+{{- end -}}
+
+{{/*
+The auth tables of the server config, from .Values.auth: [environment.endpoint] when
+authUrl is set, [server.auth], [server.auth.jwk] when jwksEndpoint is set, and
+[server.auth.oidc] when oidc.clientId is set. Callers gate this on
+.Values.auth.enabled. Root context.
+*/}}
+{{- define "lore.authToml" -}}
+{{- $auth := .Values.auth -}}
+{{- $oidc := $auth.oidc | default dict -}}
+{{- with $auth.authUrl -}}
+[environment.endpoint]
+auth_url = {{ . | quote }}
+
+{{ end -}}
+[server.auth]
+jwt_issuer = {{ $auth.issuer | quote }}
+jwt_audience = {{ include "lore.tomlStrings" $auth.audience }}
+{{- with $auth.permissionClaim }}
+permission_claim = {{ . | quote }}
+{{- end }}
+{{- with $auth.resourceClaim }}
+resource_claim = {{ . | quote }}
+{{- end }}
+{{- with $auth.jwksEndpoint }}
+
+[server.auth.jwk]
+endpoint = {{ . | quote }}
+{{- end }}
+{{- if $oidc.clientId }}
+
+[server.auth.oidc]
+client_id = {{ $oidc.clientId | quote }}
+{{- with $oidc.scopes }}
+scopes = {{ include "lore.tomlStrings" . }}
+{{- end }}
+{{- with $oidc.clientCredentialsScopes }}
+client_credentials_scopes = {{ include "lore.tomlStrings" . }}
+{{- end }}
+{{- if $oidc.preferred }}
+preferred = true
+{{- end }}
+{{- with $oidc.resourceTemplate }}
+resource_template = {{ . | quote }}
+{{- end }}
+{{- with $oidc.scopeTemplate }}
+scope_template = {{ . | quote }}
+{{- end }}
+{{- with $oidc.tokenExchangeIssuer }}
+token_exchange_issuer = {{ . | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+A list of strings as a TOML array.
+*/}}
+{{- define "lore.tomlStrings" -}}
+[{{ range $idx, $value := . }}{{ if $idx }}, {{ end }}{{ $value | quote }}{{ end }}]
 {{- end -}}
 
 {{/*
@@ -503,7 +589,7 @@ peers = {{ include "lore.fixedPeersToml" . }}
 {{- end -}}
 
 {{/*
-Render-time checks for combinations the server would accept but run wrongly.
+Render-time checks for combinations the server refuses or would run wrongly.
 Included from configmap.yaml, which every install renders. Root context.
 */}}
 {{- define "lore.validate" -}}
@@ -557,6 +643,76 @@ Included from configmap.yaml, which every install renders. Root context.
 {{- end -}}
 {{- if and .Values.replication.enabled .Values.replication.verifyClientCerts (not .Values.replication.tls.secretName) -}}
 {{- fail "replication.enabled=true with replication.verifyClientCerts=true needs replication.tls.secretName: the server refuses to start its replication endpoints without a certificate, key and CA chain for mutual TLS. Set replication.verifyClientCerts=false only on an isolated network, to accept unauthenticated replication." -}}
+{{- end -}}
+{{- if .Values.auth.enabled -}}
+{{- if not .Values.auth.issuer -}}
+{{- fail "auth.enabled=true needs auth.issuer: the server refuses [server.auth] without jwt_issuer, since it would accept tokens from any issuer." -}}
+{{- end -}}
+{{- if not .Values.auth.audience -}}
+{{- fail "auth.enabled=true needs auth.audience: the server refuses [server.auth] without jwt_audience, since it would accept tokens minted for any service." -}}
+{{- end -}}
+{{- if not (or .Values.auth.authUrl (.Values.auth.oidc).clientId) -}}
+{{- fail "auth.enabled=true needs auth.authUrl or auth.oidc.clientId: without an authentication service the server requires [server.auth.oidc], since clients have no other way to log in." -}}
+{{- end -}}
+{{- include "lore.validateAuthTier" .Values.auth -}}
+{{- if and (eq .Values.topology.mode "tiered") (not .Values.handler.upstreamURL) (not .Values.handler.identity.secretName) -}}
+{{- fail "topology.mode=tiered with auth.enabled=true needs handler.identity.secretName: the handlers reach the data pod as clients, and it refuses them without a login." -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Render-time checks of the auth tier: Tier 2 is auth.resourceClaim with a template,
+auth.authUrl takes no resourceClaim, and a template needs one of the two. With
+oidc.clientId set, which writes [server.auth.oidc], at most one template is set and it
+contains {id}, and oidc.tokenExchangeIssuer needs a template and is an issuer URL.
+auth.issuer is an issuer URL when oidc.clientId is set or auth.jwksEndpoint is empty.
+lore.isIssuerUrl checks issuer URLs. Call with .Values.auth.
+*/}}
+{{- define "lore.validateAuthTier" -}}
+{{- $oidc := .oidc | default dict -}}
+{{- if and .authUrl .resourceClaim -}}
+{{- fail "auth.authUrl and auth.resourceClaim are both set: with an authentication service the server asks it to authorize every request, and refuses resource_claim. Unset one." -}}
+{{- end -}}
+{{- $template := or $oidc.resourceTemplate $oidc.scopeTemplate -}}
+{{- if and .resourceClaim (not $template) -}}
+{{- fail "auth.resourceClaim needs auth.oidc.resourceTemplate or auth.oidc.scopeTemplate: it selects Tier 2, which authorizes each repository from a partition-scoped token, and the server refuses it unless clients ask for one through a template." -}}
+{{- end -}}
+{{- if and $template (not .resourceClaim) (not .authUrl) -}}
+{{- fail "auth.oidc.resourceTemplate and auth.oidc.scopeTemplate need auth.resourceClaim or auth.authUrl: in Tier 1 the server never reads the partition-scoped tokens they ask for, and refuses them." -}}
+{{- end -}}
+{{- if $oidc.clientId -}}
+{{- if and $oidc.resourceTemplate $oidc.scopeTemplate -}}
+{{- fail "auth.oidc.resourceTemplate and auth.oidc.scopeTemplate are both set: the server takes one way to name a partition in a token request. Unset one." -}}
+{{- end -}}
+{{- if and $oidc.tokenExchangeIssuer (not $template) -}}
+{{- fail "auth.oidc.tokenExchangeIssuer needs auth.oidc.resourceTemplate or auth.oidc.scopeTemplate: it issues the partition-scoped tokens clients ask for through a template, and the server refuses it without one." -}}
+{{- end -}}
+{{- range $key := list "resourceTemplate" "scopeTemplate" -}}
+{{- $value := index $oidc $key -}}
+{{- if and $value (not (contains "{id}" $value)) -}}
+{{- fail (printf "auth.oidc.%s must contain {id}, which stands for the partition ID, got %q: the server refuses a template without it." $key $value) -}}
+{{- end -}}
+{{- end -}}
+{{- if and $oidc.tokenExchangeIssuer (not (include "lore.isIssuerUrl" $oidc.tokenExchangeIssuer)) -}}
+{{- fail (printf "auth.oidc.tokenExchangeIssuer must be an http or https URL with a host, got %q: the server refuses any other value." $oidc.tokenExchangeIssuer) -}}
+{{- end -}}
+{{- end -}}
+{{- if and (or $oidc.clientId (not .jwksEndpoint)) (not (include "lore.isIssuerUrl" .issuer)) -}}
+{{- fail (printf "auth.issuer must be an http or https URL with a host when auth.oidc.clientId is set or auth.jwksEndpoint is empty, got %q: the server reads it as the OIDC provider's issuer URL, and refuses any other value." .issuer) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+"true" when a value is an http or https URL with a host, as lore-server's is_issuer_url
+requires, and "" otherwise. Like the URL parser, it takes the scheme in any case, leading
+control characters and spaces, tabs and newlines anywhere, and any number of slashes or
+backslashes before the host. It doesn't check that the host and port are valid, as the
+parser does.
+*/}}
+{{- define "lore.isIssuerUrl" -}}
+{{- if regexMatch `^[\x00-\x20]*[Hh][\t\n\r]*[Tt][\t\n\r]*[Tt][\t\n\r]*[Pp][\t\n\r]*([Ss][\t\n\r]*)?:[\t\n\r/\\]*[^\t\n\r/\\?#]` (toString .) -}}
+true
 {{- end -}}
 {{- end -}}
 
