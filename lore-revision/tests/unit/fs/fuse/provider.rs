@@ -41,6 +41,7 @@ use lore_revision::fs::fuse::read::FETCH_DEADLINE;
 use lore_revision::fs::fuse::read::RecentMisses;
 use lore_revision::fs::fuse::read::read_file;
 use lore_revision::fs::fuse::spelling::DEFAULT_TIMEOUTS;
+use lore_revision::lore::RepositoryId;
 use lore_revision::node::Node;
 use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
@@ -62,6 +63,8 @@ use crate::fs::fuse::fuse_fixture;
 use crate::fs::fuse::fuse_fixture::RepositoryContextCreationArgsExt;
 use crate::fs::fuse::fuse_test_util;
 use crate::fs::fuse::fuse_test_util::req;
+use crate::helper::in_memory;
+use crate::helper::in_memory::Linked;
 
 const BASE_TIME: u64 = 1_700_000_000_000;
 
@@ -1129,7 +1132,7 @@ async fn read_of_remote_only_fragment_without_fetch_is_would_fetch() {
                 .scope(
                     fuse_fixture::setup_test_execution(),
                     read_file(
-                        &snapshot,
+                        &snapshot.repository,
                         fs.fragment_cache(),
                         &RecentMisses::default(),
                         99,
@@ -1739,8 +1742,8 @@ async fn attach_link(
         .expect("attach the link");
 }
 
-/// A link is served as an empty directory with no write bit, whether its directory's listing
-/// holds it or it was attached since: the mount does not serve a link's content.
+/// A link whose pinned revision cannot be read is served as an empty directory with no write
+/// bit, whether its directory's listing holds it or it was attached since.
 #[tokio::test]
 async fn a_link_is_served_as_an_empty_read_only_directory() {
     let (fixture, fs) = mounted(&[("keep.txt", b"k")]).await;
@@ -1775,6 +1778,191 @@ async fn a_link_is_served_as_an_empty_read_only_directory() {
             "nothing is found below {name}"
         );
     }
+}
+
+/// Attaches a link named `name` under `parent` to the root of the revision `pin` of `linked`, as
+/// a sync bringing a revision that holds it leaves it.
+async fn attach_link_to(
+    fs: &FuseFilesystem,
+    repository: &Arc<RepositoryContext>,
+    (parent, name): (NodeID, &str),
+    linked: RepositoryId,
+    pin: Hash,
+) {
+    fs.state()
+        .node_attach(
+            repository.clone(),
+            parent,
+            in_memory::link_node(name, linked, pin),
+            name,
+        )
+        .await
+        .expect("attach the link");
+}
+
+/// [`in_memory::linked_revision_storing`] in an execution context of its own.
+async fn storing(
+    repository: &Arc<RepositoryContext>,
+    linked: RepositoryId,
+    entries: &[(&str, Linked<'_>)],
+) -> Hash {
+    lore_base::runtime::LORE_CONTEXT
+        .scope(
+            fuse_fixture::setup_test_execution(),
+            in_memory::linked_revision_storing(repository, linked, entries),
+        )
+        .await
+}
+
+/// The names READDIR of `ino` answers, sorted.
+async fn names_in(fs: &FuseFilesystem, ino: u64) -> Vec<String> {
+    let mut names: Vec<String> = readdir(fs, ino, 0, 4096)
+        .await
+        .iter()
+        .map(|record| String::from_utf8_lossy(&record.name).into_owned())
+        .collect();
+    names.sort_unstable();
+    names
+}
+
+/// A link is served with the content of the revision it pins (ADR-00036): LOOKUP, READDIR and
+/// READ below it answer what that revision holds, read from the linked repository's store, and
+/// nothing at or below it has a write bit.
+#[tokio::test]
+async fn a_link_serves_the_content_of_the_revision_it_pins() {
+    let (fixture, fs) = mounted(&[("keep.txt", b"k")]).await;
+    let linked = RepositoryId::from(uuid::Uuid::now_v7());
+    let pin = storing(
+        &fixture.repository,
+        linked,
+        &[
+            ("top.txt", Linked::File(b"top")),
+            ("src/lib.txt", Linked::File(b"linked one")),
+        ],
+    )
+    .await;
+    attach_link_to(&fs, &fixture.repository, (ROOT_NODE, "vendor"), linked, pin).await;
+
+    let vendor = fs
+        .lookup(&req(), ROOT_INO, b"vendor")
+        .await
+        .expect("vendor");
+    assert_eq!(vendor.attr.mode, libc::S_IFDIR | 0o555);
+    assert_eq!(
+        names_in(&fs, vendor.ino).await,
+        [".", "..", "src", "top.txt"]
+    );
+    let src = fs.lookup(&req(), vendor.ino, b"src").await.expect("src");
+    assert_eq!(
+        src.attr.mode,
+        libc::S_IFDIR | 0o555,
+        "a directory below a link has no write bit"
+    );
+    assert_eq!(names_in(&fs, src.ino).await, [".", "..", "lib.txt"]);
+    let lib = fs
+        .lookup(&req(), src.ino, b"lib.txt")
+        .await
+        .expect("lib.txt");
+    assert_eq!(lib.attr.mode & libc::S_IFMT, libc::S_IFREG);
+    assert_eq!(
+        lib.attr.mode & 0o222,
+        0,
+        "a file below a link has no write bit"
+    );
+    assert_eq!(lib.attr.size, 10);
+    let attr = fs.getattr(&req(), lib.ino).await.expect("getattr").attr;
+    assert_eq!(attr.mode, lib.attr.mode);
+    assert_eq!(
+        read(&fs, lib.ino, 0, 64, true)
+            .await
+            .map_err(errno)
+            .expect("read"),
+        b"linked one"
+    );
+    let top = fs
+        .lookup(&req(), vendor.ino, b"top.txt")
+        .await
+        .expect("top.txt");
+    assert_eq!(
+        read(&fs, top.ino, 1, 64, true)
+            .await
+            .map_err(errno)
+            .expect("read"),
+        b"op"
+    );
+    assert_eq!(
+        fs.lookup(&req(), vendor.ino, b"keep.txt")
+            .await
+            .map(|entry| entry.ino),
+        Ok(0),
+        "the instance's own files are not served below the link"
+    );
+}
+
+/// A link the linked revision holds is served with the content of the revision it pins in turn.
+#[tokio::test]
+async fn a_nested_link_serves_the_content_of_the_revision_it_pins() {
+    let (fixture, fs) = mounted(&[("keep.txt", b"k")]).await;
+    let inner = RepositoryId::from(uuid::Uuid::now_v7());
+    let inner_pin = storing(
+        &fixture.repository,
+        inner,
+        &[("deep.txt", Linked::File(b"deep"))],
+    )
+    .await;
+    let outer = RepositoryId::from(uuid::Uuid::now_v7());
+    let outer_pin = storing(
+        &fixture.repository,
+        outer,
+        &[
+            ("lib/inner", Linked::Link(inner, inner_pin)),
+            ("lib/own.txt", Linked::File(b"own")),
+        ],
+    )
+    .await;
+    attach_link_to(
+        &fs,
+        &fixture.repository,
+        (ROOT_NODE, "vendor"),
+        outer,
+        outer_pin,
+    )
+    .await;
+
+    let vendor = fs
+        .lookup(&req(), ROOT_INO, b"vendor")
+        .await
+        .expect("vendor");
+    let lib = fs.lookup(&req(), vendor.ino, b"lib").await.expect("lib");
+    assert_eq!(
+        names_in(&fs, lib.ino).await,
+        [".", "..", "inner", "own.txt"]
+    );
+    let nested = fs.lookup(&req(), lib.ino, b"inner").await.expect("inner");
+    assert_eq!(nested.attr.mode, libc::S_IFDIR | 0o555);
+    assert_eq!(names_in(&fs, nested.ino).await, [".", "..", "deep.txt"]);
+    let deep = fs
+        .lookup(&req(), nested.ino, b"deep.txt")
+        .await
+        .expect("deep.txt");
+    assert_eq!(
+        read(&fs, deep.ino, 0, 64, true)
+            .await
+            .map_err(errno)
+            .expect("read"),
+        b"deep"
+    );
+    let own = fs
+        .lookup(&req(), lib.ino, b"own.txt")
+        .await
+        .expect("own.txt");
+    assert_eq!(
+        read(&fs, own.ino, 0, 64, true)
+            .await
+            .map_err(errno)
+            .expect("read"),
+        b"own"
+    );
 }
 
 /// The node blocks cached listings hold count against the cache's budget once each, however many

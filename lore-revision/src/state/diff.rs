@@ -206,6 +206,11 @@ bitflags! {
         /// delete in a directory that view excludes and that holds something it places carries
         /// [`change::Flags::KeptBeside`] ([`deletes_kept_beside`]).
         const PlacesDirectories = 0b100000;
+        /// The walk descends a link whose pin or source differs and reports what changes below
+        /// it, as without this flag, and, where it reports no change of the link node itself,
+        /// notes one beside them, flagged [`change::Flags::LinkNode`], for a caller that replaces
+        /// the link node whole.
+        const NotesLinkNodes = 0b1000000;
     }
 }
 
@@ -1944,6 +1949,20 @@ async fn add_change_for_paired_nodes(
                         lore_debug!("Diff node {subpath} pin left to the link registry");
                     } else {
                         lore_debug!("Diff node {subpath} has linked changes, recurse diff");
+                        if flags.contains(DiffFlags::NotesLinkNodes)
+                            && !node_reported
+                            && (!hash_equal || !mount_equal)
+                        {
+                            emit_change(
+                                from.clone(),
+                                to.clone(),
+                                action,
+                                measured | change::Flags::LinkNode,
+                                changes,
+                                filter_mode,
+                            )
+                            .await?;
+                        }
                         dispatch_subtree_diff(
                             from,
                             to,

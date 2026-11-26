@@ -44,6 +44,7 @@ use crate::hash::hash_string;
 use crate::infer::ConflictMarkers;
 use crate::lore::Address;
 use crate::lore::Context;
+use crate::lore::Hash;
 use crate::lore_debug;
 use crate::lore_trace;
 use crate::lore_warn;
@@ -1422,6 +1423,86 @@ impl InstanceOperationImpl {
     /// ([`FilesystemProvider::holds_state`]).
     pub fn holds_state(&self) -> bool {
         self.holds_state
+    }
+
+    /// Serves `link`, a link node of the instance's own tree, at `path`, in place of what stands
+    /// there, or takes away the link standing at `path` where `None`, where the provider holds
+    /// its state in a `State` ([`FilesystemProvider::holds_state`]): such a provider serves a link
+    /// from its node, so a command changing a link changes what it serves (ADR-00036). A link
+    /// placed over a local change is refused unless `force`, which discards the change. A path
+    /// through a link takes nothing, as the link's pin serves it. Nothing for other providers,
+    /// which write a link's files, nor in a dry run. Counts as a change.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
+    pub async fn place_link(
+        &self,
+        path: &RelativePath,
+        link: Option<&Node>,
+        force: bool,
+    ) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch
+            && self.holds_state
+        {
+            self.record_change();
+            // Boxed: kept out of the future of every caller, a change's realize among them.
+            // Type-erased: a caller's `Send` check of it overflows the recursion limit.
+            let placed: crate::BoxFuture<'_, Result<(), FsError>> =
+                Box::pin(this.place_link(path, link, force));
+            return placed.await;
+        }
+        let _ = (path, link, force);
+        Ok(())
+    }
+
+    /// Serves at `path` a copy of the node `side` names, with every node below it, where nothing
+    /// stands there and the provider holds its state in a `State`
+    /// ([`FilesystemProvider::holds_state`]): what a reset puts back of the current revision where
+    /// a link staged in its place goes, which other providers create on disk. A path through a
+    /// link takes nothing. Nothing for other providers, nor in a dry run. Counts as a change.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
+    pub async fn place_copy(
+        &self,
+        path: &RelativePath,
+        side: &crate::state::NodeMapping,
+    ) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch
+            && self.holds_state
+        {
+            self.record_change();
+            return this.place_copy(path, side).await;
+        }
+        let _ = (path, side);
+        Ok(())
+    }
+
+    /// [`Self::place_link`] of the link standing at `path` moved to the revision `pin`, mounting
+    /// its node `source`; nothing where no link stands there.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
+    pub async fn repin_link(
+        &self,
+        path: &RelativePath,
+        pin: Hash,
+        source: NodeID,
+    ) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch
+            && self.holds_state
+        {
+            self.record_change();
+            return this.repin_link(path, pin, source).await;
+        }
+        let _ = (path, pin, source);
+        Ok(())
     }
 
     /// Starts warming what `plan` names into the local store in the background, for a provider

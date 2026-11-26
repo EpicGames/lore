@@ -1473,6 +1473,85 @@ pub mod in_memory {
         commit(&linked, &state, Hash::default(), branch_id()).await
     }
 
+    /// What [`linked_revision_storing`] places at a path.
+    pub enum Linked<'a> {
+        /// A file holding these bytes, which the store holds.
+        File(&'a [u8]),
+        /// A link to the root of the revision of the repository.
+        Link(RepositoryId, Hash),
+    }
+
+    /// A revision of the repository `link_repository` holding each of `entries` at its path, with
+    /// the directories leading to it. The store holds each file's content, so a read finds it, and
+    /// the revision's link list holds each link.
+    pub async fn linked_revision_storing(
+        repository: &Arc<RepositoryContext>,
+        link_repository: RepositoryId,
+        entries: &[(&str, Linked<'_>)],
+    ) -> Hash {
+        let linked = repository.to_link_context(link_repository).await;
+        let state = State::new();
+        for (path, entry) in entries {
+            let (directories, name) = path.rsplit_once('/').unwrap_or(("", path));
+            let mut parent = ROOT_NODE;
+            for step in directories.split('/').filter(|step| !step.is_empty()) {
+                parent = match state
+                    .find_subnode(linked.clone(), parent, hash_string(step))
+                    .await
+                {
+                    Ok(found) => found,
+                    Err(_) => add(&state, linked.clone(), parent, directory(step), step).await,
+                };
+            }
+            let node = match entry {
+                Linked::File(content) => {
+                    let address = Address {
+                        hash: lore_storage::hash::hash_slice(content),
+                        context: Context::from(link_repository),
+                    };
+                    linked
+                        .immutable_store()
+                        .put(
+                            linked.id,
+                            address,
+                            lore_storage::Fragment {
+                                flags:
+                                    lore_storage::fragment_flags::FragmentFlags::PayloadStoredLocal
+                                        .bits(),
+                                size_payload: content.len() as u32,
+                                size_content: content.len() as u64,
+                            },
+                            Some(bytes::Bytes::copy_from_slice(content)),
+                            false,
+                        )
+                        .await
+                        .expect("storing the file's content must succeed");
+                    Node {
+                        size: content.len() as u64,
+                        address,
+                        ..file(name)
+                    }
+                }
+                Linked::Link(nested, pin) => link_node(name, *nested, *pin),
+            };
+            let node_id = add(&state, linked.clone(), parent, node, name).await;
+            if let Linked::Link(nested, pin) = entry {
+                state
+                    .link_add(
+                        linked.clone(),
+                        *nested,
+                        BranchId::default(),
+                        *pin,
+                        node_id,
+                        lore_revision::link::LinkFlags::NoFlags,
+                    )
+                    .await
+                    .expect("registering the link must succeed");
+            }
+        }
+        commit(&linked, &state, Hash::default(), branch_id()).await
+    }
+
     /// Adds `node` as `name` under `parent`, staged as an add. Every write verb marks its staged
     /// action and dirties the ancestors, which is what the freeze walks; `node_add` alone leaves
     /// neither.

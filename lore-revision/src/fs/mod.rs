@@ -10,6 +10,7 @@ pub mod filesystem_provider;
 pub mod fuse;
 pub mod hold;
 pub mod invalid_filesystem_provider;
+pub mod linked;
 pub mod mount_manager;
 pub mod mount_manager_state;
 pub mod os;

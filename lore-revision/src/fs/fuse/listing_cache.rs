@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! A bytes-bounded cache of built [`Listing`]s keyed by the directory's node id, which a
-//! directory keeps for the life of the filesystem State.
+//! A bytes-bounded cache of built [`Listing`]s keyed by the directory's node id in the State it is
+//! read from ([`ListingKey`]), which a directory keeps for the life of that State.
 //!
 //! A hit takes one map shard's read lock and marks the entry referenced, writing only a clear
 //! bit. Eviction is the provider's shared CLOCK (`clock.rs`). Two budgets bound the cache apart:
@@ -32,18 +32,34 @@ pub const LISTING_CACHE_BYTES: usize = 256 << 20;
 /// the listings' own budget they evicted listings the build walked again.
 pub const LISTING_BLOCK_BYTES: usize = 1 << 30;
 
+/// A directory a listing lists: node `node` of the State numbered `source`, 0 for the filesystem
+/// State and otherwise the linked state a link entered under that number
+/// ([`LinkedStates`](crate::fs::linked::LinkedStates)). A node id alone keys a directory of the
+/// filesystem State.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ListingKey {
+    pub source: u32,
+    pub node: NodeID,
+}
+
+impl From<NodeID> for ListingKey {
+    fn from(node: NodeID) -> Self {
+        Self { source: 0, node }
+    }
+}
+
 #[lore_macro::test_pub]
 struct Slot {
     listing: Arc<Listing>,
     referenced: AtomicBool,
 }
 
-/// Node-keyed cache of built directory listings, bounded to `max_bytes` of the listings' own
+/// Directory-keyed cache of built directory listings, bounded to `max_bytes` of the listings' own
 /// bytes ([`Listing::bytes`]) and `max_pinned` of the node blocks they hold.
 #[lore_macro::test_pub]
 pub struct ListingCache {
-    slots: DashMap<NodeID, Slot>,
-    clock: Clock<NodeID>,
+    slots: DashMap<ListingKey, Slot>,
+    clock: Clock<ListingKey>,
     bytes: AtomicUsize,
     /// Bytes of the node blocks the listings of this cache and those it shares the charge with
     /// hold, each counted once.
@@ -73,15 +89,15 @@ impl ListingCache {
 
     /// The listing cached for directory `node`, if any. A hit marks the entry referenced; never
     /// allocates.
-    pub fn get(&self, node: NodeID) -> Option<Arc<Listing>> {
-        let slot = self.slots.get(&node)?;
+    pub fn get(&self, node: impl Into<ListingKey>) -> Option<Arc<Listing>> {
+        let slot = self.slots.get(&node.into())?;
         clock::mark(&slot.referenced);
         Some(slot.listing.clone())
     }
 
     /// Caches `listing` under directory `node`, then evicts until the cache is back within its
     /// budgets.
-    pub fn insert(&self, node: NodeID, listing: Arc<Listing>) {
+    pub fn insert(&self, node: impl Into<ListingKey>, listing: Arc<Listing>) {
         self.insert_if(node, listing, || true);
     }
 
@@ -89,10 +105,11 @@ impl ListingCache {
     /// no reader sees a listing it refuses. False where it refused.
     pub fn insert_if(
         &self,
-        node: NodeID,
+        node: impl Into<ListingKey>,
         listing: Arc<Listing>,
         admit: impl FnOnce() -> bool,
     ) -> bool {
+        let node = node.into();
         // Charged before the shard lock, which then covers only the decision and the insert.
         self.admit(&listing);
         let slot = Slot {
@@ -122,8 +139,8 @@ impl ListingCache {
     }
 
     /// Drops the listing of directory `node`; its key leaves the clock when the hand reaches it.
-    pub fn remove(&self, node: NodeID) {
-        if let Some((_, slot)) = self.slots.remove(&node) {
+    pub fn remove(&self, node: impl Into<ListingKey>) {
+        if let Some((_, slot)) = self.slots.remove(&node.into()) {
             self.release(&slot.listing);
         }
     }

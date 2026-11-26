@@ -34,14 +34,22 @@ pub enum InodeKind {
         filter_state: u8,
         /// The line the view slot's verdict was decided at (`view::view_line`).
         view_line: u16,
-        /// The directory's node in the filesystem State, keying its listing.
+        /// The directory's node in the State `source` numbers, keying its listing.
         node: NodeID,
         /// Whether the directory was added under `write/`, whose host directory answers its
         /// mode and times.
         local: bool,
-        /// Whether the directory is a link, whose content the mount does not serve and which
-        /// no write changes.
+        /// Whether the directory is a link, which no write changes.
         link: bool,
+        /// Whether the link was entered: `node` and `source` name the directory it mounts in the
+        /// linked state, or the link, served empty, where it mounts no directory or its links nest
+        /// too deep. A link whose pin could not be read is not entered.
+        entered: bool,
+        /// The State the directory is read from: 0 for the filesystem State, and otherwise the
+        /// number of the linked state a link entered ([`LinkedStates`]), which no write changes.
+        ///
+        /// [`LinkedStates`]: crate::fs::linked::LinkedStates
+        source: u32,
     },
     File {
         address: Address,
@@ -50,10 +58,17 @@ pub enum InodeKind {
         /// Whether the bytes live under `write/` (`NodeExtFlags::LocalContent`): the host file
         /// answers READ, and its `fstat` the size and times.
         local: bool,
+        /// The State the file is read from, as a directory's `source` numbers it: the linked
+        /// repository's context reads a linked file's content.
+        source: u32,
     },
     /// A symbolic link under `write/`.
     Symlink,
 }
+
+// `source` fits in the room the variants leave. The size is pinned so that a new field cannot grow
+// every inode.
+const _: () = assert!(std::mem::size_of::<InodeKind>() == 64);
 
 impl InodeKind {
     /// A directory the revision holds.
@@ -64,6 +79,8 @@ impl InodeKind {
             node,
             local: false,
             link: false,
+            entered: false,
+            source: 0,
         }
     }
 
@@ -89,6 +106,19 @@ impl InodeKind {
     /// Whether this is a link.
     pub fn is_link(&self) -> bool {
         matches!(self, Self::Dir { link: true, .. })
+    }
+
+    /// The State this is read from, as [`Self::Dir`]'s `source` numbers it; 0 for a symlink.
+    pub fn source(&self) -> u32 {
+        match self {
+            Self::Dir { source, .. } | Self::File { source, .. } => *source,
+            Self::Symlink => 0,
+        }
+    }
+
+    /// Whether no write changes this: a link, or what a link serves.
+    pub fn is_read_only(&self) -> bool {
+        self.is_link() || self.source() != 0
     }
 }
 

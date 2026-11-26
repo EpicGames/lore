@@ -31,8 +31,9 @@ use crate::util::path::RelativePath;
 
 /// Removes the link at `link_path` and the files it tracks in its mount, which a local change to
 /// any of them refuses unless forced. A provider holding its state serves the link from its node,
-/// so nothing at or below the mount is read or written
-/// ([`holds_state`](crate::fs::filesystem_provider::FilesystemProvider::holds_state)).
+/// so nothing below the mount is read or written: the link it serves there is taken away, or, for
+/// a link inside another, the outermost link moves to the pin that drops it
+/// ([`InstanceOperationImpl::place_link`]).
 pub(crate) async fn remove(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -81,7 +82,12 @@ pub(crate) async fn remove(
     // the mount is then deleted from, and the staged state is stored before it finalizes, as an
     // SWFS instance serves links from what is stored then (ADR-00042).
     with_operation::<_, LinkError, _>(repository.file_system(), async |operation| {
-        if !operation.holds_state() {
+        if operation.holds_state() {
+            operation
+                .place_link(&mount, None, false)
+                .await
+                .forward::<LinkError>("Failed taking away the link")?;
+        } else {
             if !execution_context().globals().force() {
                 verify_no_local_changes_under_link(&operation, shown.clone(), &mount).await?;
             }
@@ -121,6 +127,7 @@ pub(crate) async fn remove(
         // Fold nested link revisions up into the top-level state (no-op if flat).
         crate::link::propagate_link_chain(&chain, token, crate::link::LinkPinRealize::StateOnly)
             .await?;
+        crate::link::serve_outermost_link(&operation, &chain).await?;
 
         state_staged.reparent_onto(state_current.revision());
 

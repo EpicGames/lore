@@ -20,6 +20,7 @@ use crate::BoxFuture;
 use crate::filter::FilterStates;
 use crate::fs::fuse::FuseProviderError;
 use crate::fs::fuse::filesystem::ListingHook;
+use crate::fs::fuse::listing_cache::ListingKey;
 use crate::fs::fuse::served::Served;
 use crate::fs::fuse::view::child_filter;
 use crate::fs::fuse::view::filter_states_to_u8;
@@ -33,7 +34,9 @@ use crate::node::NodeBlock;
 use crate::node::NodeExtFlags;
 use crate::node::NodeID;
 use crate::node::PatchKind;
+use crate::repository::RepositoryContext;
 use crate::state::Absent;
+use crate::state::State;
 use crate::state::StateNodeChildrenWithNameIterator;
 use crate::state::drop_repeated_nodes;
 use crate::util::path::RelativePath;
@@ -53,8 +56,8 @@ pub mod entry_flags {
     pub const LOCAL: u8 = 4;
     /// The child is a symbolic link under `write/`.
     pub const SYMLINK: u8 = 8;
-    /// The child is a link: a directory whose content the mount does not serve, and which no
-    /// write changes.
+    /// The child is a link: a directory served with the content of the revision it pins
+    /// (ADR-00036), which no write changes.
     pub const LINK: u8 = 16;
 }
 
@@ -101,6 +104,9 @@ pub struct Listing {
     pub node_ids: Box<[NodeID]>,
     /// The directory listed.
     pub dir: NodeID,
+    /// The State `dir` is read from: 0 for the filesystem State, and otherwise the number of the
+    /// linked state a link entered ([`LinkedStates`](crate::fs::linked::LinkedStates)).
+    pub source: u32,
     /// The directory's log position when the build began: the patches from it on are the
     /// changes the listing does not hold.
     pub log_seq: u32,
@@ -172,6 +178,7 @@ impl Listing {
             names,
             node_ids,
             dir: NO_DIR,
+            source: 0,
             log_seq: 0,
             detaches: 0,
             respells: 0,
@@ -192,16 +199,22 @@ impl Listing {
         if node.is_discarded() || node.child().is_some() {
             return None;
         }
-        Some(Arc::new(Self::holding_nothing(dir, mark, dir_block)))
+        Some(Arc::new(Self::holding_nothing((dir, 0), mark, dir_block)))
     }
 
-    /// The listing of `dir`, held in `dir_block`, holding no entry, from the log position `mark`.
-    fn holding_nothing(dir: NodeID, mark: LogMark, dir_block: Arc<NodeBlock>) -> Self {
+    /// The listing of `dir`, of the State `source` numbers, held in `dir_block`, holding no
+    /// entry, from the log position `mark`.
+    fn holding_nothing(
+        (dir, source): (NodeID, u32),
+        mark: LogMark,
+        dir_block: Arc<NodeBlock>,
+    ) -> Self {
         Self {
             entries: Box::new([]),
             names: Box::new([]),
             node_ids: Box::new([]),
             dir,
+            source,
             log_seq: mark.seq,
             detaches: mark.detaches,
             respells: mark.respells,
@@ -210,6 +223,14 @@ impl Listing {
             skipped_invalid: 0,
             dir_block: Some(dir_block),
             blocks: Box::new([]),
+        }
+    }
+
+    /// The directory listed, in the State it is read from.
+    pub fn key(&self) -> ListingKey {
+        ListingKey {
+            source: self.source,
+            node: self.dir,
         }
     }
 
@@ -478,8 +499,9 @@ impl Listing {
         pack_entry(node, 0, name_len, (0, 0), false)
     }
 
-    /// Builds a listing from `parent`'s live children. A link lists nothing: the mount does not
-    /// serve a link's content.
+    /// Builds a listing from `parent`'s live children in the filesystem State. A link lists
+    /// nothing: what it mounts is listed from the linked state it enters
+    /// ([`Self::build_in`]).
     ///
     /// `parent_filter` is the mounted view's state at `parent`, and
     /// `parent_path` its path; both feed [`child_filter`] to decide each
@@ -508,12 +530,35 @@ impl Listing {
         parent_path: &RelativePath,
         walk_hook: Option<&ListingHook>,
     ) -> Result<Arc<Listing>, FuseProviderError> {
+        Self::build_in(
+            (&served.state, &served.repository, 0),
+            &served.repository,
+            parent,
+            parent_filter,
+            parent_path,
+            walk_hook,
+        )
+        .await
+    }
+
+    /// [`Self::build_with`] of `parent` in `state`, read through `repository`, the State `source`
+    /// numbers ([`Self::source`]): the filesystem State, or the linked state a link entered, whose
+    /// directory at `parent_path` the mount serves at that path. Each child is filtered by the view
+    /// of `viewed`, the served repository, as every path the mount serves is: a linked state's
+    /// context holds the view in force when its link was entered.
+    pub async fn build_in(
+        (state, repository, source): (&Arc<State>, &Arc<RepositoryContext>, u32),
+        viewed: &RepositoryContext,
+        parent: NodeID,
+        parent_filter: FilterStates,
+        parent_path: &RelativePath,
+        walk_hook: Option<&ListingHook>,
+    ) -> Result<Arc<Listing>, FuseProviderError> {
         let mut collected: Vec<CollectedChild> = Vec::new();
         let mut skipped_unrepresentable: u32 = 0;
         let mut skipped_staged: u32 = 0;
-        let dir_block = served
-            .state
-            .block(served.repository.clone(), NodeBlock::index(parent))
+        let dir_block = state
+            .block(repository.clone(), NodeBlock::index(parent))
             .await
             .forward_any::<FuseProviderError>("reading the directory")?;
         // The mark is read before the walk, so a patch landing during it is replayed.
@@ -522,7 +567,11 @@ impl Listing {
             (mark, node.is_link())
         };
         if link {
-            return Ok(Arc::new(Self::holding_nothing(parent, mark, dir_block)));
+            return Ok(Arc::new(Self::holding_nothing(
+                (parent, source),
+                mark,
+                dir_block,
+            )));
         }
         if let Some(hook) = walk_hook {
             hook(parent).await;
@@ -531,21 +580,15 @@ impl Listing {
         // Boxed and type-erased: the load holds a children iterator of its own, and inline it
         // would grow the future of every request that can build a listing, in size and in the
         // type depth a caller's `Send` check walks.
-        let load: BoxFuture<'_, _> = Box::pin(
-            served
-                .state
-                .load_children_with_nametables(served.repository.clone(), parent),
-        );
+        let load: BoxFuture<'_, _> =
+            Box::pin(state.load_children_with_nametables(repository.clone(), parent));
         let resident = load
             .await
             .forward_any::<FuseProviderError>("loading directory children")?;
-        let mut iter = StateNodeChildrenWithNameIterator::new(
-            served.state.clone(),
-            served.repository.clone(),
-            parent,
-        )
-        .await
-        .forward_any::<FuseProviderError>("opening directory children")?;
+        let mut iter =
+            StateNodeChildrenWithNameIterator::new(state.clone(), repository.clone(), parent)
+                .await
+                .forward_any::<FuseProviderError>("opening directory children")?;
 
         loop {
             let next = iter
@@ -567,12 +610,8 @@ impl Listing {
             // so doing it before the copy-and-drop below holds no lock across
             // anything it should not.
             let child_path = parent_path.join(&*name_lock);
-            let (child_state, view_excluded) = child_filter(
-                &served.repository,
-                parent_filter,
-                &child_path,
-                !node.is_file(),
-            );
+            let (child_state, view_excluded) =
+                child_filter(viewed, parent_filter, &child_path, !node.is_file());
             // A local change stays listed outside the view, as an ordinary working tree keeps a
             // local file a view leaves out: a sync narrowing the view past one refuses unless it
             // forwards local changes, which keeps it.
@@ -616,9 +655,8 @@ impl Listing {
         let mut blocks = Vec::with_capacity(block_indices.len());
         for &index in &block_indices {
             blocks.push(
-                served
-                    .state
-                    .block(served.repository.clone(), index)
+                state
+                    .block(repository.clone(), index)
                     .await
                     .forward_any::<FuseProviderError>("reading a directory child")?,
             );
@@ -656,6 +694,7 @@ impl Listing {
             names: names.into_boxed_slice(),
             node_ids: node_ids.into_boxed_slice(),
             dir: parent,
+            source,
             log_seq: mark.seq,
             detaches: mark.detaches,
             respells: mark.respells,

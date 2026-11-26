@@ -21,6 +21,7 @@ use lore_base::types::Context;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
+use lore_fuse::abi::file::open_flags;
 use lore_fuse::codec::dirent::DirentWriter;
 use lore_fuse::filesystem::Filesystem;
 use lore_fuse::reply::Errno;
@@ -177,6 +178,41 @@ impl Swapping {
         )
         .await
         .expect("swap");
+    }
+
+    /// [`Self::swap_to`], answering each change it reported as `<action> <path>`, sorted.
+    async fn swap_reporting(&self, target: &Arc<State>) -> Vec<String> {
+        use lore_revision::event::LoreEvent;
+        use lore_revision::interface::ExecutionContext;
+        use lore_revision::interface::LoreGlobalArgs;
+        use lore_revision::relay::EventDispatcher;
+
+        let reported = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let execution = Arc::new(ExecutionContext::new_client_with_user_id(
+            LoreGlobalArgs::default(),
+            EventDispatcher::new(Some(Box::new({
+                let reported = reported.clone();
+                move |event: &LoreEvent| {
+                    if let LoreEvent::RevisionSyncFile(file) = event {
+                        reported
+                            .lock()
+                            .expect("the reported files")
+                            .push(format!("{:?} {}", file.action, file.path));
+                    }
+                }
+            }))),
+            "test-user".to_string(),
+        ));
+        LORE_CONTEXT
+            .scope(
+                execution.clone(),
+                self.swap_to(target, Arc::new(RecordingSink::default())),
+            )
+            .await;
+        execution.dispatcher.drain().await;
+        let mut reported = reported.lock().expect("the reported files").clone();
+        reported.sort();
+        reported
     }
 
     async fn lookup(&self, parent: u64, name: &str) -> Result<u64, Errno> {
@@ -339,10 +375,10 @@ fn served_as_link(s: &Swapping, ino: u64) -> bool {
         .is_some_and(|entry| entry.kind.is_link())
 }
 
-/// A swap to a revision holding links serves each as a link with its pin, which lists nothing:
-/// one the revision adds, and one in place of a directory. A swap back takes them away and
-/// restores the directory. Each swap orphans the inode the kernel held where a directory turned
-/// into a link or back.
+/// A swap to a revision holding links serves each as a link with its pin, which lists what the
+/// pin holds and nothing of the directory it replaced: one the revision adds, and one in place of a
+/// directory. A swap back takes them away and restores the directory. Each swap orphans the inode
+/// the kernel held where a directory turned into a link or back.
 #[tokio::test]
 async fn a_swap_serves_each_link_the_revision_holds_as_a_link() {
     swapping(
@@ -365,13 +401,14 @@ async fn a_swap_serves_each_link_the_revision_holds_as_a_link() {
                 assert!(node.is_link(), "{name} is served as a link");
                 assert_eq!(node.address.hash, pin, "{name} keeps its pin");
                 let ino = s.lookup(ROOT_INO, name).await.expect(name);
-                for below in ["l.txt", "x.txt"] {
-                    assert_eq!(
-                        s.lookup(ino, below).await,
-                        Err(Errno::ENOENT),
-                        "nothing is served below {name}"
-                    );
-                }
+                s.lookup(ino, "l.txt").await.unwrap_or_else(|errno| {
+                    panic!("the pin's file is served below {name}: {errno:?}")
+                });
+                assert_eq!(
+                    s.lookup(ino, "x.txt").await,
+                    Err(Errno::ENOENT),
+                    "nothing of the directory is served below {name}"
+                );
             }
 
             let link = s.lookup(ROOT_INO, "dir").await.expect("dir");
@@ -455,7 +492,18 @@ async fn mounting(s: &Swapping, linked: RepositoryId, pin: Hash, source: NodeID)
         child: source,
         ..in_memory::link_node("vendor", linked, pin)
     };
-    in_memory::add(&state, writer.clone(), ROOT_NODE, link, "vendor").await;
+    let node = in_memory::add(&state, writer.clone(), ROOT_NODE, link, "vendor").await;
+    state
+        .link_add(
+            writer.clone(),
+            linked,
+            lore_revision::lore::BranchId::default(),
+            pin,
+            node,
+            lore_revision::link::LinkFlags::NoFlags,
+        )
+        .await
+        .expect("registering the link");
     let revision = in_memory::commit(&writer, &state, base, in_memory::branch_id()).await;
     State::deserialize(repository, revision)
         .await
@@ -484,6 +532,301 @@ async fn a_swap_places_the_subtree_a_link_mounts() {
                 "mounting {what}: the subtree it mounts"
             );
         }
+    })
+    .await;
+}
+
+/// What a sync of an ordinary instance from `from` to `to`, two revisions of `s`'s repository,
+/// reports: each change of the diff between them, as `<action> <path>`, sorted.
+async fn reported_by_a_sync(s: &Swapping, from: &Arc<State>, to: &Arc<State>) -> Vec<String> {
+    let changes = state::diff_collect(
+        s.repository(),
+        from.clone(),
+        s.repository(),
+        to.clone(),
+        None,
+        FilterMode::empty(),
+    )
+    .await
+    .expect("the diff");
+    let mut reported: Vec<String> = changes
+        .iter()
+        .map(|change| {
+            let action = lore_revision::interface::LoreFileAction::from(change.action);
+            format!("{action:?} {}", change.path())
+        })
+        .collect();
+    reported.sort();
+    reported
+}
+
+/// A swap moving a served link's pin serves the link at the new pin, with the files the new pin
+/// holds below it and none the old pin alone holds. The inode the kernel held for the link at the
+/// old pin is orphaned. It reports what a sync of an ordinary instance reports: each linked file
+/// that changed, and nothing of the link node.
+#[tokio::test]
+async fn a_swap_moving_a_links_pin_serves_the_link_at_the_new_pin() {
+    swapping(&[("keep.txt", b"k")], async |s: Swapping| {
+        let writer = writer(&s.repository());
+        let linked = RepositoryId::from(uuid::Uuid::now_v7());
+        let first_pin = in_memory::linked_revision_holding(&writer, linked, &["l.txt"]).await;
+        let moved_pin = in_memory::linked_revision_holding(&writer, linked, &["two.txt"]).await;
+        let first = mounting(&s, linked, first_pin, ROOT_NODE).await;
+        let moved = mounting(&s, linked, moved_pin, ROOT_NODE).await;
+
+        s.swap_to(&first, Arc::new(RecordingSink::default())).await;
+        let old = s.lookup(ROOT_INO, "vendor").await.expect("vendor");
+        s.lookup(old, "l.txt")
+            .await
+            .expect("the first pin's file is served");
+        let reported = s.swap_reporting(&moved).await;
+        assert_eq!(
+            reported,
+            reported_by_a_sync(&s, &first, &moved).await,
+            "the swap reports what a sync of an ordinary instance does"
+        );
+        assert_eq!(
+            reported,
+            ["Add vendor/two.txt", "Delete vendor/l.txt"],
+            "each linked file the move changes is reported, and the link node is not"
+        );
+        assert!(
+            s.fs.inodes().get(old).is_some_and(|entry| entry.orphaned),
+            "the inode of the link at the old pin is orphaned"
+        );
+
+        let held = served_node(&s, "vendor").await;
+        assert!(held.is_link(), "vendor is served as a link");
+        assert_eq!(
+            held.address.hash, moved_pin,
+            "vendor is served at the new pin"
+        );
+        let vendor = s.lookup(ROOT_INO, "vendor").await.expect("vendor");
+        s.lookup(vendor, "two.txt")
+            .await
+            .expect("the new pin's file is served");
+        assert_eq!(
+            s.lookup(vendor, "l.txt").await,
+            Err(Errno::ENOENT),
+            "the old pin's file is not"
+        );
+    })
+    .await;
+}
+
+/// A swap moving a served link's pin to a revision whose content is the first pin's reports
+/// nothing, as a sync of an ordinary instance does, and still serves the link at the new pin.
+#[tokio::test]
+async fn a_swap_moving_a_links_pin_to_the_same_content_reports_nothing_and_moves_the_pin() {
+    swapping(&[("keep.txt", b"k")], async |s: Swapping| {
+        let writer = writer(&s.repository());
+        let linked = RepositoryId::from(uuid::Uuid::now_v7());
+        let first_pin = in_memory::linked_revision_holding(&writer, linked, &["l.txt"]).await;
+        let link_context = writer.to_link_context(linked).await;
+        let same = in_memory::revision_state(&link_context, first_pin).await;
+        let moved_pin =
+            in_memory::commit(&link_context, &same, first_pin, in_memory::branch_id()).await;
+        assert_ne!(moved_pin, first_pin);
+        let first = mounting(&s, linked, first_pin, ROOT_NODE).await;
+        let moved = mounting(&s, linked, moved_pin, ROOT_NODE).await;
+
+        s.swap_to(&first, Arc::new(RecordingSink::default())).await;
+        let reported = s.swap_reporting(&moved).await;
+        assert_eq!(
+            reported,
+            reported_by_a_sync(&s, &first, &moved).await,
+            "the swap reports what a sync of an ordinary instance does"
+        );
+        assert!(reported.is_empty(), "nothing is reported: {reported:?}");
+
+        let held = served_node(&s, "vendor").await;
+        assert_eq!(
+            held.address.hash, moved_pin,
+            "vendor is served at the new pin"
+        );
+        let vendor = s.lookup(ROOT_INO, "vendor").await.expect("vendor");
+        s.lookup(vendor, "l.txt")
+            .await
+            .expect("the pin's file is served");
+    })
+    .await;
+}
+
+/// What is served below a link is filtered by the view the mount serves, as below any directory:
+/// a view change after the mount entered the link hides below it what the new view leaves out,
+/// and shows what the new view brings in.
+#[tokio::test]
+async fn a_view_change_after_a_link_is_entered_filters_below_it_by_the_new_view() {
+    for excluding in [true, false] {
+        view_change_below_an_entered_link(excluding).await;
+    }
+}
+
+/// [`a_view_change_after_a_link_is_entered_filters_below_it_by_the_new_view`]: the link entered
+/// under the whole view, then a view leaving out `vendor/Docs/` where `excluding`, and the other
+/// way round where not.
+async fn view_change_below_an_entered_link(excluding: bool) {
+    use crate::helper::in_memory::Linked;
+
+    swapping(&[("keep.txt", b"k")], async |s: Swapping| {
+        let linked = RepositoryId::from(uuid::Uuid::now_v7());
+        let pin = in_memory::linked_revision_storing(
+            &writer(&s.repository()),
+            linked,
+            &[
+                ("Docs/x.txt", Linked::File(b"x")),
+                ("top.txt", Linked::File(b"t")),
+            ],
+        )
+        .await;
+        let target = mounting(&s, linked, pin, ROOT_NODE).await;
+        let narrow = s.viewed(&["vendor/Docs/"]);
+        let (entered_under, changed_to) = match excluding {
+            true => (s.repository(), narrow),
+            false => (narrow, s.repository()),
+        };
+        for (view, shown) in [(entered_under, excluding), (changed_to, !excluding)] {
+            swap(
+                &s.fs,
+                &s.operation,
+                view,
+                target.clone(),
+                Arc::new(RecordingSink::default()),
+            )
+            .await
+            .expect("swap");
+            let vendor = s.lookup(ROOT_INO, "vendor").await.expect("vendor");
+            s.lookup(vendor, "top.txt")
+                .await
+                .expect("the link's file is served");
+            assert_eq!(
+                s.lookup(vendor, "Docs").await.is_ok(),
+                shown,
+                "vendor/Docs is served where the view shows it (excluding: {excluding})"
+            );
+        }
+    })
+    .await;
+}
+
+/// A link whose pinned revision the mount cannot read when it first enters the link, as while the
+/// store fails for a moment, is entered again on the next request, and serves its content once
+/// the pin reads.
+#[tokio::test]
+async fn a_link_the_mount_failed_to_enter_is_entered_again_on_the_next_request() {
+    swapping(&[("keep.txt", b"k")], async |s: Swapping| {
+        let linked = RepositoryId::from(uuid::Uuid::now_v7());
+        let pin = in_memory::linked_revision(&writer(&s.repository()), linked).await;
+        let target = mounting(&s, linked, pin, ROOT_NODE).await;
+        let store = GatedImmutable::new(s.repository().immutable_store());
+        let fs = FuseFilesystem::new(s.through(store.clone()), target, attr_context())
+            .await
+            .expect("provider");
+        // The inode a lookup answers; 0 for a cached negative entry.
+        let lookup = async |parent: u64, name: &str| {
+            fs.lookup_at(&fs.served(), parent, name.as_bytes())
+                .await
+                .map(|entry| entry.ino)
+        };
+        let vendor = lookup(ROOT_INO, "vendor").await.expect("vendor");
+
+        store.failing.store(true, Ordering::SeqCst);
+        let failed = lookup(vendor, "l.txt").await;
+        store.failing.store(false, Ordering::SeqCst);
+        assert_eq!(
+            failed,
+            Err(Errno::ENOENT),
+            "nothing is served below the link while its pin cannot be read, and the kernel caches \
+             no negative entry, so the next lookup reaches the mount"
+        );
+        let served = lookup(vendor, "l.txt").await;
+        assert!(
+            matches!(served, Ok(ino) if ino != 0),
+            "the link's file is served once its pin reads: {served:?}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_kernel_caches_no_listing_of_a_link_the_mount_has_not_entered() {
+    swapping(&[("keep.txt", b"k")], async |s: Swapping| {
+        let linked = RepositoryId::from(uuid::Uuid::now_v7());
+        let pin = in_memory::linked_revision(&writer(&s.repository()), linked).await;
+        let target = mounting(&s, linked, pin, ROOT_NODE).await;
+        let store = GatedImmutable::new(s.repository().immutable_store());
+        let fs = FuseFilesystem::new(s.through(store.clone()), target, attr_context())
+            .await
+            .expect("provider");
+        let vendor = fs
+            .lookup_at(&fs.served(), ROOT_INO, b"vendor")
+            .await
+            .expect("vendor")
+            .ino;
+        let flags = |ino| fs.opendir(&req(), ino).expect("opendir").flags;
+
+        store.failing.store(true, Ordering::SeqCst);
+        let failed = fs
+            .lookup_at(&fs.served(), vendor, b"l.txt")
+            .await
+            .map(|entry| entry.ino);
+        store.failing.store(false, Ordering::SeqCst);
+        assert!(
+            !matches!(failed, Ok(ino) if ino != 0),
+            "nothing is served below the link while its pin cannot be read: {failed:?}"
+        );
+        assert_eq!(
+            flags(vendor),
+            0,
+            "a link the mount failed to enter is opened uncached, so its next listing reaches the \
+             mount"
+        );
+        fs.lookup_at(&fs.served(), vendor, b"l.txt")
+            .await
+            .expect("the link's file, once its pin reads");
+        assert_eq!(
+            flags(vendor),
+            open_flags::CACHE_DIR | open_flags::KEEP_CACHE,
+            "an entered link is cached as any directory"
+        );
+    })
+    .await;
+}
+
+/// A READDIRPLUS stream of a directory a link serves answers each entry with its attributes and
+/// counts its lookup, as one of a directory of the instance's own tree does.
+#[tokio::test]
+async fn a_readdirplus_stream_below_a_link_answers_its_entries_with_attributes() {
+    swapping(&[("dir/a.txt", b"a")], async |s: Swapping| {
+        let linked = RepositoryId::from(uuid::Uuid::now_v7());
+        let pin = in_memory::linked_revision(&writer(&s.repository()), linked).await;
+        let target = mounting(&s, linked, pin, ROOT_NODE).await;
+        let fs = FuseFilesystem::new(s.repository(), target, attr_context())
+            .await
+            .expect("provider");
+        let mut answered = Vec::new();
+        for dir in ["dir", "vendor"] {
+            let ino = fs
+                .lookup_at(&fs.served(), ROOT_INO, dir.as_bytes())
+                .await
+                .expect(dir)
+                .ino;
+            let fh = fs.opendir(&req(), ino).expect("opendir").fh;
+            let (counted, rows) = plus_rows(&fs, ino, fh, 0).await.expect("readdirplus");
+            let rows: Vec<(String, bool)> = rows
+                .into_iter()
+                .map(|(name, nodeid, _)| (name, nodeid != 0))
+                .collect();
+            answered.push((dir, counted, rows));
+        }
+        assert_eq!(
+            answered,
+            [
+                ("dir", 1, vec![("a.txt".to_string(), true)]),
+                ("vendor", 1, vec![("l.txt".to_string(), true)]),
+            ],
+            "each directory: the lookups counted, and each entry with whether it has an inode"
+        );
     })
     .await;
 }

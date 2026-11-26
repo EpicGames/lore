@@ -220,6 +220,7 @@ pub(crate) async fn update(
 
         // Fold nested link revisions up into the top-level state (no-op if flat).
         link::propagate_link_chain(&chain, token, link::LinkPinRealize::StateOnly).await?;
+        link::serve_outermost_link(&operation, &chain).await?;
 
         state_staged.reparent_onto(state_current.revision());
 

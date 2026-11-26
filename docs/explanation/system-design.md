@@ -1766,9 +1766,15 @@ file, and the mount serves one that holds the revision's content from the store 
 file a commit stores. A recorded time stands only for content read after no write could still carry
 that time, and only for the revision the mount serves, and a file returns to the store only while
 it still shows the time that was read, so no write racing a status, a stage or a commit is missed.
-It holds a link as the link's node alone, so nothing at or below a link is a change of its working
-tree, and nothing of a link is written through it: a merge bringing one, or a link's update or
-removal, changes the node.
+It holds a link as the link's node, and serves the link read-only with the content of the revision
+it pins, read from the linked repository at the pin the staged state holds, or the current
+revision's where nothing is staged, as an SWFS instance serves it
+([ADR-00036](../developing/decisions/00036-swfs-serve-links-and-layers.md)). A link whose pin cannot
+be read is served empty. Nothing at or below a link is a change of its working tree, and nothing of
+a link is written through it: a command changing a link, as a merge bringing one or a link's update,
+removal or reset does, places the node or takes it away, and the mount serves the change at once,
+where an ordinary instance writes it. A link a command would place where local changes stand is
+refused unless forced.
 
 #### 15.3 Paths into the dirty set
 

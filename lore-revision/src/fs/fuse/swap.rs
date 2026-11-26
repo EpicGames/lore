@@ -181,7 +181,8 @@ fn plan_swap_into(
 /// `None`). A file whose content changes keeps its inode, which takes the new content: where
 /// it holds other content than `after`, or where `rewrites`, the change's own content differs,
 /// whatever the inode holds now. A directory whose node is in `kept` stays as it is; one that
-/// turns into a file goes.
+/// turns into a file goes. A link, or anything it serves, goes whatever `after` holds: the swap
+/// placed the link again, and a lookup enters the one the target holds afresh.
 fn plan_path(
     plan: &mut SwapPlan,
     inodes: &InodeTable,
@@ -217,6 +218,9 @@ fn plan_path(
     let (stale, content_changed) = match (&entry.kind, after) {
         // Local content wins over whatever the target revision holds here.
         (InodeKind::File { local: true, .. } | InodeKind::Symlink, _) => (false, false),
+        // A link a change reaches was placed again, and what it served goes with it: a lookup
+        // enters the link the target holds afresh.
+        (kind, _) if kind.is_read_only() => (true, false),
         (InodeKind::Dir { node, .. }, _) if kept.binary_search(node).is_ok() => (false, false),
         (_, None) => (true, false),
         (InodeKind::Dir { .. }, Some(after)) => (is_file(after), false),
@@ -478,7 +482,7 @@ async fn swap_through(
         }
         read = Some(revision);
     }
-    let (applied, before) = fs
+    let (applied, links, before) = fs
         .scoped(hold::changes(
             held,
             (&repository, &target),
@@ -515,7 +519,6 @@ async fn swap_through(
             .await
             .forward_any::<FsError>("reporting what holding the target changes");
     }
-
     // The time is recorded for content served from the store. A copy-up later stamps the
     // content's host file in the staging directory and moves it under `write/`, so the time is
     // probed there: a file written after the swap reports a later time than the swap's. A
@@ -563,10 +566,12 @@ async fn swap_through(
     let mut reconciled = Vec::new();
     let mut overwritten = Vec::new();
     let mut kept = Vec::new();
+    // A link whose pin or source moved is placed again whole, as the diff reports only the linked
+    // content that changed: applied and planned, not reported.
     let result = fs
         .scoped(Box::pin(hold::apply(
             (&host, paths),
-            &applied,
+            (&applied, &links),
             (options, &matching),
             &mut applying.changed,
             reads,
@@ -617,6 +622,7 @@ async fn swap_through(
     drop(served);
 
     plan_swap_into(&mut plan, fs.inodes(), fs.spellings(), &changes, &kept);
+    plan_swap_into(&mut plan, fs.inodes(), fs.spellings(), &links, &kept);
     for (path, detached) in &overwritten {
         plan_overwritten(&mut plan, fs, path, *detached);
     }
@@ -659,6 +665,7 @@ async fn swap_through(
                 size,
                 executable,
                 local: false,
+                source: 0,
             } = &mut entry.kind
         {
             *address = written.address;
@@ -827,6 +834,8 @@ async fn kept_directories(
             continue;
         };
         let node = match inodes.get(ino).map(|entry| match entry.kind {
+            // A link and what it serves are read from no node of the served State.
+            ref kind if kind.is_read_only() => None,
             InodeKind::Dir { node, .. } => Some(node),
             InodeKind::File { .. } | InodeKind::Symlink => None,
         }) {

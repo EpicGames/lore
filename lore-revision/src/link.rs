@@ -2574,8 +2574,8 @@ struct LinkPinDiff {
 /// Deserializes the old and new link states, computes a 2-way diff scoped to
 /// the linked node and spelled from the mount, verifies filesystem consistency,
 /// and realizes the changes on disk. A provider holding its state is written
-/// nothing, and neither revision is read for it, as it serves the link from its node
-/// ([`holds_state`](crate::fs::filesystem_provider::FilesystemProvider::holds_state)).
+/// nothing of the link's content: it serves the link from its node, which moves to the new pin
+/// ([`serve_link_pin`]).
 ///
 /// Opens the filesystem operation the realize takes, so a caller already holding one calls
 /// [`realize_link_pin_change_in_operation`] instead.
@@ -2585,7 +2585,10 @@ pub async fn realize_link_pin_change(
     pin_change: LinkPinRealizeTarget,
 ) -> Result<(), LinkError> {
     if repository.file_system().holds_state() {
-        return Ok(());
+        return with_operation(repository.file_system(), async |operation| {
+            serve_link_pin(&operation, &link_context, pin_change).await
+        })
+        .await;
     }
     let pin = ResolvedLinkPin::resolve(&link_context, pin_change).await?;
     realize_resolved_link_pin(repository, link_context, &pin).await
@@ -2598,7 +2601,10 @@ pub(crate) async fn realize_resolved_link_pin(
     pin: &ResolvedLinkPin,
 ) -> Result<(), LinkError> {
     if repository.file_system().holds_state() {
-        return Ok(());
+        return with_operation(repository.file_system(), async |operation| {
+            serve_resolved_link_pin(&operation, pin).await
+        })
+        .await;
     }
     let diff = link_pin_diff(&link_context, pin).await?;
     with_operation(repository.file_system(), async |operation| {
@@ -2631,7 +2637,7 @@ pub(crate) async fn realize_link_pin_change_in_operation(
     overwrite_local: bool,
 ) -> Result<(), LinkError> {
     if operation.holds_state() {
-        return Ok(());
+        return serve_link_pin(operation, &link_context, pin_change).await;
     }
     let pin = ResolvedLinkPin::resolve(&link_context, pin_change).await?;
     realize_resolved_link_pin_in_operation(
@@ -2653,7 +2659,7 @@ pub(crate) async fn realize_resolved_link_pin_in_operation(
     overwrite_local: bool,
 ) -> Result<(), LinkError> {
     if operation.holds_state() {
-        return Ok(());
+        return serve_resolved_link_pin(operation, pin).await;
     }
     let diff = link_pin_diff(&link_context, pin).await?;
     realize_link_pin_diff(
@@ -2665,6 +2671,78 @@ pub(crate) async fn realize_resolved_link_pin_in_operation(
         overwrite_local,
     )
     .await
+}
+
+/// Serves the link at `target`'s mount at its new pin through `operation`, whose provider holds
+/// its state and serves a link from its node (ADR-00036): the link moves to the pin, mounting the
+/// subtree `target` names, and a link whose new pin is none is taken away. The linked revisions
+/// are read only to find a subtree mounted by its path.
+async fn serve_link_pin(
+    operation: &InstanceOperationImpl,
+    link_context: &Arc<RepositoryContext>,
+    target: LinkPinRealizeTarget,
+) -> Result<(), LinkError> {
+    if target.new_signature == Hash::default() {
+        return operation
+            .place_link(&target.link_path, None, false)
+            .await
+            .forward::<LinkError>("Failed taking away the link");
+    }
+    let source = match target.mount_source {
+        LinkMountSource::Node(node) => node,
+        LinkMountSource::SamePath if target.current_node == ROOT_NODE => ROOT_NODE,
+        LinkMountSource::SamePath => {
+            return serve_resolved_link_pin(
+                operation,
+                &ResolvedLinkPin::resolve(link_context, target).await?,
+            )
+            .await;
+        }
+    };
+    operation
+        .repin_link(&target.link_path, target.new_signature, source)
+        .await
+        .forward::<LinkError>("Failed serving the link at its new pin")
+}
+
+/// Serves through `operation` the outermost link `chain` crosses, as the staged state holds it
+/// once a change below it is folded up into its pin ([`propagate_link_chain`]), where the provider
+/// holds its state: such a provider serves a nested link through the outermost link's pin
+/// (ADR-00036). Nothing where `chain` crosses no link.
+pub(crate) async fn serve_outermost_link(
+    operation: &InstanceOperationImpl,
+    chain: &ResolvedLinkChain,
+) -> Result<(), LinkError> {
+    let Some(outermost) = chain.levels.first() else {
+        return Ok(());
+    };
+    if !operation.holds_state() {
+        return Ok(());
+    }
+    let node = outermost
+        .state
+        .node(outermost.repository.clone(), outermost.link_node_id)
+        .await
+        .forward::<LinkError>("Failed reading the outermost link")?;
+    operation
+        .place_link(
+            &outermost.mount,
+            Some(&node),
+            execution_context().globals().force(),
+        )
+        .await
+        .forward::<LinkError>("Failed serving the outermost link")
+}
+
+/// [`serve_link_pin`] of a pin already read against both revisions.
+async fn serve_resolved_link_pin(
+    operation: &InstanceOperationImpl,
+    pin: &ResolvedLinkPin,
+) -> Result<(), LinkError> {
+    operation
+        .repin_link(&pin.link_path, pin.new_signature, pin.node_target)
+        .await
+        .forward::<LinkError>("Failed serving the link at its new pin")
 }
 
 /// [`realize_link_pin_change_in_operation`] for a cold path, boxed so it doesn't grow the future of
@@ -2797,13 +2875,17 @@ async fn realize_link_pin_diff(
 
 /// Realizes each of `pins`, a pin move of the linked repository its context names, verifying the
 /// working tree at every mount before it writes to any, so a local modification at one leaves
-/// every mount as it was.
+/// every mount as it was. Where the provider holds its state, serves each link at its new pin
+/// instead ([`serve_resolved_link_pin`]).
 pub(crate) async fn realize_resolved_link_pins_in_operation(
     operation: &Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     pins: &[(Arc<RepositoryContext>, ResolvedLinkPin)],
 ) -> Result<(), LinkError> {
     if operation.holds_state() {
+        for (_, pin) in pins {
+            serve_resolved_link_pin(operation, pin).await?;
+        }
         return Ok(());
     }
     let verified = futures::future::try_join_all(pins.iter().map(async |(link_context, pin)| {

@@ -1678,28 +1678,44 @@ Open follow-ups from milestone 3:
   below, so the mount lists it, empty where it holds nothing in view, where an ordinary instance
   creates no directory it finds nothing in (`child_filter`, `view.rs`). Left: hide such a
   directory until something below it is in view, which takes a walk below it per listing.
-- **Links.** A link is served as an empty, read-only directory, at the root too, and the mount
-  warns once for each link it serves (`Listing::build_with`, `fs/fuse/listing.rs`;
-  `warn_unserved_link`, `fs/fuse/filesystem.rs`). A write at or below one is `EROFS`. Nothing at
-  or below a link is staged or reported changed (`stage_child_directory`, `stage.rs`;
-  `changes_from_filesystem_to_state`, `fs/fuse/operation.rs`), and nothing of a link is written
-  through the instance's operations: a merge bringing one, `lore link update`, `lore link remove`
-  and a reset undoing one change the link node alone (`realize_change_modify_add`,
-  `fs/realize.rs`; `realize_resolved_link_pin_in_operation`, `link.rs`; `remove`,
-  `link/remove.rs`; `restore_link`, `link/reset.rs`), and a reset walks nothing below a link
-  (`reset_walk_node`, `file/reset.rs`). Adding a link (`add`, `link/add.rs`) and a commit of a
-  link alone (`refused`, `fs/hold.rs`) are refused.
-  Left: serve the linked revision's content (lore-6ib), and writes below a link (lore-zhjq).
-- **A link a commit or swap changes.** A link a commit adds, moves to another pin or removes
-  shows on a running mount only after the next remount: the commit's hand-over reconciles the
-  files it read and the directories it was handed, and no link is among them
-  (`FuseFilesystem::committed`, `fs/fuse/write.rs`). Until that remount, status reports no file
-  created at the mount path of a link the commit added, as the status diff leaves a path alone
-  where either side holds a link (`DiffFlags::FilesystemTo`, `state/diff.rs`). A swap whose target
-  moves a link to another pin keeps serving the old pin: the changes a hold applies name the
-  pinned content, not the link node (`changes`, `fs/hold.rs`). Left (lore-6ib): the commit hands the
-  provider the link paths it staged, the hand-over places them as a hold places a node, and a swap
-  that moves a pin updates the served link.
+- **Links.** A link is served read-only with the content of the revision it pins, at the root
+  too, as SWFS serves it (ADR-00036). A lookup below a link enters the linked repository's state
+  at the pin, which the mount opens once for each repository and pin, and reads its files
+  through that repository's store (`enter_link`, `fs/fuse/filesystem.rs`; `LinkedStates`,
+  `fs/linked.rs`). The mount's view filters what is served below a link, as it filters every
+  path, and a view change filters it anew (`Listing::build_in`, `fs/fuse/listing.rs`). A link
+  whose source is itself a link is followed up to the depth links allow (`LinkedStates::enter`);
+  a link inside a linked directory is entered as any link is, at whatever depth. A link whose
+  chain of sources runs deeper, that mounts no directory, or whose pin cannot be read, is served
+  empty, and the mount warns once for it when it first enters it, on the first lookup below the
+  link or listing of it, not when it lists the link in its parent (`warn_unserved_link`). A pin
+  that cannot be read is read again on the next lookup below the link or listing of it, as SWFS
+  reads it again on each resolve: until the mount enters the link, the kernel caches neither its
+  listing nor a miss below it (`opendir`, `negative_entry`). A write at or below a link is
+  `EROFS`. Nothing at or below a link is staged or reported changed (`stage_child_directory`,
+  `stage.rs`; `changes_from_filesystem_to_state`, `fs/fuse/operation.rs`), and a reset walks
+  nothing below one (`reset_walk_node`, `file/reset.rs`). Adding a link (`add`, `link/add.rs`)
+  and a commit of a link alone (`refused`, `fs/hold.rs`) are refused.
+  Left: writes below a link (lore-zhjq). The mount keeps each linked state it entered until it
+  is mounted again, one for each repository and pin its links pinned while it ran (lore-rmrlv).
+- **A link a command, commit or swap changes.** A command changing a link on the mount serves
+  the change at once, as an ordinary instance writes it at stage: a merge bringing a link,
+  `lore link update`, `lore link remove`, and a reset undoing a link change place the link node in
+  the served State, or take it away, inside the command's operation (`place_link`,
+  `fs/fuse/operation.rs` and `fs/hold.rs`), nothing of the link written to `write/`. A reset of
+  a link a merge staged in place of a committed directory serves the directory again as the
+  revision holds it, clean, with what it holds (`place_copy`, same files). A link
+  placed where local changes stand, at or below its path or a local file above it, is refused
+  unless forced, as a hold's check refuses it (`Resolver::replaced_by_link`, `fs/hold.rs`);
+  forced, the changes go, the file above with them. A mount serves each link at
+  the pin the staged state holds when it starts, and takes away each link the staged state
+  removes (`place_staged_links`, `take_away_unstaged_links`, `fs/fuse/filesystem.rs`); a staged
+  link where local changes stand is left unserved, with a warning. A commit serves what its stage
+  placed. A swap whose target adds a link, removes one, or moves one to another pin or source
+  places the target's link node and drops the inode the kernel holds for the old one. For a
+  move, the diff reports what of the linked content changes, as a sync of an ordinary instance
+  does, and notes the link node beside it, which the swap applies but neither checks nor reports
+  (`DiffFlags::NotesLinkNodes`, `state/diff.rs`; `hold::changes`).
 - **Detached slots of the served State.** A request dropped or refused part way can leave a slot
   detached or taken and never published, and an unlinked node's slot is never reused within a
   mount. The State node module frees such slots with a sweep at quiescent points
@@ -1933,9 +1949,8 @@ Reads, listings and prefetch:
   the build's own misses share it: UnrealBuildTool compiled in 14.3 s with READs fetching at
   priority (18.2 s at normal priority), against 12.6-13.2 s on an ordinary instance. Listing builds
   for kernel requests and for the prefetch's paths share the priority streams.
-- **Repository links** (lore-6ib). A link is served as an empty, read-only directory
-  (`Listing::build_with`, `listing.rs`), as Remaining work describes. READLINK answers local
-  symlinks only.
+- **Repository links** (lore-zhjq). A link is served read-only, as Remaining work describes.
+  READLINK answers local symlinks only.
 - **Kernel readahead cap.** An unprivileged mount gets 128 KiB kernel readahead whatever
   `max_readahead` negotiates. Kernel behaviour: only root can raise the mount's `read_ahead_kb`,
   so it is not tracked.

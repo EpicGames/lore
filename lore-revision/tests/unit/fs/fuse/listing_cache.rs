@@ -266,7 +266,7 @@ fn eviction_returns_when_the_hand_is_empty_while_over_budget() {
     cache.insert(node(1), listing_with_entries(1));
     cache.bytes.fetch_add(unit_bytes, Ordering::SeqCst);
     cache.slots.insert(
-        node(2),
+        node(2).into(),
         Slot {
             listing: listing_with_entries(1),
             referenced: AtomicBool::new(false),

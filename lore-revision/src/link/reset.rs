@@ -28,9 +28,10 @@ use crate::state::State;
 
 /// Removes a staged link add from the registry and the link's files from the mount, where they
 /// hold no local change unless `overwrite_local` says to discard it. Files the link does not hold
-/// stay, and with them the mount. A provider holding its state holds nothing of the link, so its
-/// mount stays as it is
-/// ([`holds_state`](crate::fs::filesystem_provider::FilesystemProvider::holds_state)).
+/// stay, and with them the mount. A provider holding its state serves the link from its node,
+/// which is taken away ([`link::realize_link_pin_change_in_operation`]), and the committed
+/// directory the link replaced goes back as the revision holds it
+/// ([`InstanceOperationImpl::place_copy`]).
 pub(crate) async fn reset_staged_add_link(
     operation: &Arc<InstanceOperationImpl>,
     at: NodeMapping,
@@ -66,8 +67,20 @@ pub(crate) async fn reset_staged_add_link(
     if let Some(committed_node_id) = committed_directory_node {
         // Restore the committed directory: recreate the empty placeholder on
         // disk and clear the staged-delete on its node so it returns to its
-        // clean committed state.
-        if !dry_run {
+        // clean committed state. A provider holding its state serves the
+        // committed node again, as the revision holds it.
+        if !dry_run && operation.holds_state() {
+            let committed = NodeMapping {
+                repository: repository.clone(),
+                state: state_current.clone(),
+                path: link_path.clone(),
+                node: committed_node_id,
+            };
+            operation
+                .place_copy(&link_path, &committed)
+                .await
+                .forward::<LinkError>("serving the committed directory again")?;
+        } else if !dry_run {
             operation
                 .create_dir_all(&link_path)
                 .await
@@ -139,8 +152,8 @@ async fn drop_staged_link(
 /// Restores the link registry entry a staged removal dropped and re-realizes the pinned content
 /// at the mount, refusing to replace a file standing there or a local change to a file the link
 /// holds unless `overwrite_local` says to discard it. A provider holding its state serves the link
-/// from its node, so nothing of it is written
-/// ([`holds_state`](crate::fs::filesystem_provider::FilesystemProvider::holds_state)).
+/// from its node, which goes back at the mount, so nothing of its content is written
+/// ([`InstanceOperationImpl::place_link`]).
 ///
 /// Realizes through `operation`, the caller's: a filesystem holds one operation at a time and
 /// unstaging opens one for the whole walk.
@@ -221,7 +234,9 @@ async fn restore_link(
         return Err(LocalModifications.into());
     }
 
-    let pin = if execution_context().globals().dry_run() {
+    // A provider holding its state serves the link from its node, so its pin is not read.
+    let holds_state = operation.holds_state();
+    let pin = if holds_state || execution_context().globals().dry_run() {
         None
     } else {
         let target = link::LinkPinRealizeTarget {
@@ -244,7 +259,6 @@ async fn restore_link(
             .await
             .forward::<LinkError>("Failed to remove the file at the link path")?;
     }
-    let holds_state = operation.holds_state();
     if !holds_state {
         operation
             .create_dir_all(&link_path)
@@ -283,6 +297,13 @@ async fn restore_link(
         .await
         .forward::<LinkError>("Failed to restore link registry entry")?;
 
+    // A provider holding its state serves the link from its node, which goes back at the mount.
+    if holds_state {
+        return operation
+            .place_link(&link_path, Some(&current_link_node), overwrite_local)
+            .await
+            .forward::<LinkError>("Failed to serve the restored link");
+    }
     Ok(())
 }
 

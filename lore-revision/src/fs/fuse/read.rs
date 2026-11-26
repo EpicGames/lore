@@ -23,7 +23,6 @@ use lore_fuse::reply::ReadFault;
 use crate::fs::fuse::fragment_cache::FragmentCache;
 use crate::fs::fuse::inode::InodeEntry;
 use crate::fs::fuse::inode::claim_once;
-use crate::fs::fuse::served::Served;
 use crate::immutable::Cached;
 use crate::immutable::cache_counted;
 use crate::lore_debug;
@@ -109,11 +108,12 @@ pub fn start_readahead(repository: Arc<RepositoryContext>, address: Address) {
     });
 }
 
-/// Reads `address`'s bytes at `offset` into `out`, clamped to `size`; a read at or past the
-/// end is short, not an error. A fetch of an address in `misses` fails at once.
+/// Reads `address`'s bytes at `offset` into `out`, clamped to `size`, through `repository`, the
+/// context of the repository the file is read from; a read at or past the end is short, not an
+/// error. A fetch of an address in `misses` fails at once.
 #[allow(clippy::too_many_arguments)]
 pub async fn read_file(
-    served: &Served,
+    repository: &Arc<RepositoryContext>,
     cache: &FragmentCache,
     misses: &RecentMisses,
     ino: u64,
@@ -129,7 +129,6 @@ pub async fn read_file(
     if len == 0 {
         return Ok(0);
     }
-    let repository = &served.repository;
     let out = &mut out[..len];
 
     if !fetch {

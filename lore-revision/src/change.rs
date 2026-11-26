@@ -101,6 +101,10 @@ bitflags! {
         // revision, something the view places. Set by a walk placing directories, see
         // `DiffFlags::PlacesDirectories`.
         const KeptBeside = 0b1000000000000;
+        // The change of a link node whose pin or source differs, noted by a walk under
+        // `DiffFlags::NotesLinkNodes` beside the changes it reports below the link, for a caller
+        // that replaces the link node whole. No change carrying it is reported.
+        const LinkNode = 0b10000000000000;
     }
 }
 bitflagsops!(Flags, u16);

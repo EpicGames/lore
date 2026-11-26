@@ -34,6 +34,7 @@ use lore_fuse::transport::Notifier;
 use lore_fuse::transport::device::DeviceTransport;
 use lore_revision::fs::fuse::attr::AttrContext;
 use lore_revision::fs::fuse::filesystem::FuseFilesystem;
+use lore_revision::node::ROOT_NODE;
 
 #[path = "support/fuse_fixture.rs"]
 mod fuse_fixture;
@@ -121,10 +122,28 @@ struct Mounted {
 }
 
 async fn mount() -> Mounted {
+    Box::pin(mount_over(committed().await)).await
+}
+
+/// [`mount`] with a link `vendor` beside the revision's files, pinning that revision of the
+/// mounted repository itself, so the link serves files its commit stored as any revision's.
+async fn mount_with_a_link() -> Mounted {
+    let m = Box::pin(mount()).await;
+    let repository = m._fixture.repository.clone();
+    let link = helper::in_memory::link_node("vendor", repository.id, m.fs.state().revision());
+    m.fs.state()
+        .node_attach(repository, ROOT_NODE, link, "vendor")
+        .await
+        .expect("attaching the link");
+    m
+}
+
+/// The revision [`mount`] serves.
+async fn committed() -> fuse_fixture::FuseFixture {
     let warm = contents(1);
     let measured = contents(2);
     let fragmented = fuse_test_util::incompressible(FRAGMENTED_LEN, FRAGMENTED_SEED);
-    let fixture = fuse_fixture::committed(&[
+    fuse_fixture::committed(&[
         ("warm.bin", &warm),
         ("measured.bin", &measured),
         ("fragmented.bin", &fragmented),
@@ -132,7 +151,11 @@ async fn mount() -> Mounted {
         ("forget/warmup.txt", b"w"),
         ("forget/measured.txt", b"m"),
     ])
-    .await;
+    .await
+}
+
+/// A read-only provider over `fixture`'s state on a mount with one worker.
+async fn mount_over(fixture: fuse_fixture::FuseFixture) -> Mounted {
     let fs = LORE_CONTEXT
         .scope(
             fuse_fixture::setup_test_execution(),
@@ -543,6 +566,80 @@ mod needs_fuse {
             );
         }
         assert!(m.fs.inodes().len() > 1);
+        m.shutdown().await;
+    }
+
+    /// Warm LOOKUP, GETATTR, READDIRPLUS and hot READ of what a link serves allocate nothing: the
+    /// warm-up enters the linked state once, and each request finds it again by its number.
+    #[tokio::test(flavor = "current_thread")]
+    async fn warm_lookup_getattr_readdirplus_and_read_inside_a_link_allocate_zero() {
+        skip_without_fuse!();
+        let _counting = COUNTING.lock().await;
+        let m = Box::pin(mount_with_a_link()).await;
+        let vendor = m.root.join("vendor");
+        // Eight pages span at most two leaves, each at least 32 KiB, which the default keeps.
+        let offsets: Arc<Vec<u64>> =
+            Arc::new((0..8).map(|i| (1 << 20) + i * PAGE as u64).collect());
+        let expected = Arc::new(fuse_test_util::incompressible(
+            FRAGMENTED_LEN,
+            FRAGMENTED_SEED,
+        ));
+
+        // Warm-up, uncounted: enters the link, builds its listings, creates every inode the
+        // measured pass touches and reads the leaves the measured READs reach.
+        let (held, vendor_ino, dir_ino) = blocking({
+            let (vendor, offsets, expected) = (vendor.clone(), offsets.clone(), expected.clone());
+            move || {
+                list_with_attributes(&vendor);
+                list_with_attributes(&vendor);
+                read_direct(&vendor.join("fragmented.bin"), PAGE, &offsets, &expected);
+                let held = std::fs::File::open(vendor.join("dir/held.txt")).expect("open held");
+                forced_getattr(&held);
+                (held, ino_of(&vendor), ino_of(&vendor.join("dir")))
+            }
+        })
+        .await;
+        // Make the kernel ask again: drop the held file's dentry, which its open fd keeps the
+        // inode of, and the link's cached directory pages.
+        m.notifier
+            .inval_entry(dir_ino, b"held.txt", false)
+            .expect("inval_entry");
+        m.notifier
+            .inval_inode(vendor_ino, 0, 0)
+            .expect("inval_inode");
+
+        const MEASURED: [Opcode; 4] = [
+            Opcode::Lookup,
+            Opcode::Getattr,
+            Opcode::Readdirplus,
+            Opcode::Read,
+        ];
+        let counts_before = MEASURED.map(|op| m.session.metrics().snapshot(op).count);
+        lore_base::allocator::set_allocation_counting(true);
+        let restore = DisableCountingOnDrop;
+        let held = blocking(move || {
+            std::fs::symlink_metadata(vendor.join("dir/held.txt")).expect("lookup");
+            forced_getattr(&held);
+            list_with_attributes(&vendor);
+            read_direct(&vendor.join("fragmented.bin"), PAGE, &offsets, &expected);
+            held
+        })
+        .await;
+        drop(restore);
+        drop(held);
+
+        let metrics = m.session.metrics();
+        for (op, before) in MEASURED.iter().zip(counts_before) {
+            let snapshot = metrics.snapshot(*op);
+            assert!(
+                snapshot.count > before,
+                "{op:?} must run in the measured pass"
+            );
+            assert_eq!(
+                snapshot.max_allocations, 0,
+                "{op:?} below a link must not allocate: {snapshot:?}"
+            );
+        }
         m.shutdown().await;
     }
 

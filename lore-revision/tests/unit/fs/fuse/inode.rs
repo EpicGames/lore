@@ -44,6 +44,7 @@ fn file(marker: u64) -> InodeKind {
         size: 10,
         executable: false,
         local: false,
+        source: 0,
     }
 }
 
@@ -536,6 +537,7 @@ fn a_local_file_orphan_is_never_revived() {
         size: 0,
         executable: false,
         local: true,
+        source: 0,
     };
     let table = InodeTable::new();
     let f = insert(&table, ROOT_INO, "f", local());

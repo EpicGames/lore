@@ -60,6 +60,7 @@ fn file(size: u64, executable: bool) -> InodeKind {
         size,
         executable,
         local: false,
+        source: 0,
     }
 }
 

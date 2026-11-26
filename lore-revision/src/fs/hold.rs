@@ -67,30 +67,35 @@ pub type Before = Option<Arc<State>>;
 /// The changes that carry `held`, a State at a revision with its local changes, to `target`: the
 /// unfiltered diff from that revision, read clean, so neither a view nor the local changes decide
 /// it, with each path of `unsettled`, which an incomplete apply changed or a reset re-places
-/// ([`add_reset_paths`]), applied again. Sorted by path. With them, that revision's State, read
+/// ([`add_reset_paths`]), applied again. Sorted by path. Beside them, the change of each link node
+/// whose pin or source moved where the diff names what of the linked content changes, as a sync of
+/// an ordinary instance reports, and nothing of the node, which the same walk notes
+/// ([`state::DiffFlags::NotesLinkNodes`]): a hold serves a link from its node, so the apply
+/// replaces the node, and the swap drops the inode the kernel holds for it. Those are neither
+/// checked for local changes nor reported. Sorted by path. With them, that revision's State, read
 /// clean, where the revision moves: `read` where given, which it is.
 pub async fn changes(
     held: (&Arc<RepositoryContext>, &Arc<State>),
     target: (&Arc<RepositoryContext>, &Arc<State>),
     unsettled: &BTreeMap<String, bool>,
     read: Option<Arc<State>>,
-) -> Result<(Vec<NodeChange>, Before), StateError> {
+) -> Result<(Vec<NodeChange>, Vec<NodeChange>, Before), StateError> {
     let revision = held.1.revision();
     let moves = target.1.revision() != revision;
     if !moves && unsettled.is_empty() {
-        return Ok((Vec::new(), None));
+        return Ok((Vec::new(), Vec::new(), None));
     }
     let (mut changes, before) = if moves {
         let current = match read {
             Some(read) => read,
             None => State::deserialize(held.0.clone(), revision).await?,
         };
-        let changes = state::diff_collect(
+        let changes = state::diff_collect_flagged(
             held.0.clone(),
             current.clone(),
             target.0.clone(),
             target.1.clone(),
-            None,
+            state::DiffFlags::NotesLinkNodes,
             FilterMode::empty(),
         )
         .await?;
@@ -108,7 +113,141 @@ pub async fn changes(
         }
         crate::change::sort_by_path(&mut changes);
     }
-    Ok((changes, before))
+    let links = changes
+        .extract_if(.., |change| change.flags.contains(Flags::LinkNode))
+        .collect();
+    Ok((changes, links, before))
+}
+
+/// What a provider holding its state places at a name of the State it serves.
+#[derive(Clone, Copy)]
+pub enum Placing<'a> {
+    /// A link node, in place of what stands there, or, for `None`, the taking away of the link
+    /// standing there ([`place_link`]).
+    Link(Option<&'a Node>),
+    /// A copy of the node a State names, with every node below it, where nothing stands there
+    /// ([`place_copy`]).
+    Copy(&'a state::NodeMapping),
+}
+
+/// Places `link` as `name` below directory `parent` of `state`, a State a provider serves, in place
+/// of what stands there, or takes away the link standing there where `None`, as a swap places a
+/// link its target holds: the copy is clean and serves the link from its node (ADR-00036), and
+/// what it replaces goes whole and counts as no local deletion. Answers whether `state` changed:
+/// not where the same link stands, nor, for `None`, where no link does.
+pub async fn place_link(
+    (repository, state): (&Arc<RepositoryContext>, &State),
+    parent: NodeID,
+    name: &str,
+    link: Option<&Node>,
+) -> Result<bool, StateError> {
+    let name_hash = hash_string(name);
+    let held = match state
+        .find_subnode(repository.clone(), parent, name_hash)
+        .await
+    {
+        Ok(found) => Some((found, state.node(repository.clone(), found).await?)),
+        Err(error) if error.is_node_not_found() => None,
+        Err(error) => return Err(error),
+    };
+    match (&held, link) {
+        (Some((_, held)), Some(link)) if same_link(held, link) => return Ok(false),
+        (Some((_, held)), None) if !held.is_link() => return Ok(false),
+        (None, None) => return Ok(false),
+        _ => {}
+    }
+    if let Some((found, _)) = held
+        && !detach_if(state, repository, found, Detach::Always).await?
+    {
+        return Err(StateError::internal(format!(
+            "taking away what stands at '{name}' for a link failed"
+        )));
+    }
+    let Some(link) = link else {
+        return Ok(true);
+    };
+    let copy = Node {
+        name_hash,
+        ..copy_of(link)
+    };
+    match state
+        .swap()
+        .node_attach_tree(repository.clone(), parent, &copy, name)
+        .await?
+    {
+        TreeAttach::Building(build) => match build.publish().await? {
+            AttachOutcome::Attached(_) => Ok(true),
+            AttachOutcome::Exists(_) => Err(attached_meanwhile(name)),
+        },
+        TreeAttach::Exists(_) => Err(attached_meanwhile(name)),
+    }
+}
+
+/// Places a copy of the node `side` names, with every node below it, as `name` below directory
+/// `parent` of `state`, a State a provider serves, where nothing stands there, as a swap places
+/// what its target holds: the copy is clean. Answers whether it placed it: not where something
+/// stands at the name, which stays.
+pub async fn place_copy(
+    (repository, state): (&Arc<RepositoryContext>, &State),
+    parent: NodeID,
+    name: &str,
+    side: &state::NodeMapping,
+) -> Result<bool, StateError> {
+    let node = side.state.node(side.repository.clone(), side.node).await?;
+    let copy = Node {
+        name_hash: hash_string(name),
+        ..copy_of(&node)
+    };
+    let mut build = match state
+        .swap()
+        .node_attach_tree(repository.clone(), parent, &copy, name)
+        .await?
+    {
+        TreeAttach::Building(build) => build,
+        TreeAttach::Exists(_) => return Ok(false),
+    };
+    if node.is_directory()
+        && let Err(error) = fill_with(&mut build, side, (None, &mut 0)).await
+    {
+        Box::pin(build.abandon()).await;
+        return Err(error);
+    }
+    match build.publish().await? {
+        AttachOutcome::Attached(_) => Ok(true),
+        AttachOutcome::Exists(_) => Ok(false),
+    }
+}
+
+/// The error of a link placed where something was attached since what stood there was taken
+/// away.
+fn attached_meanwhile(name: &str) -> StateError {
+    StateError::internal(format!(
+        "placing a link at '{name}' found a node attached there meanwhile"
+    ))
+}
+
+/// The side of a change at `path` holding `held`, node and record, of `state`, or nothing.
+fn side_of(
+    (repository, state): (&Arc<RepositoryContext>, &Arc<State>),
+    held: Option<(NodeID, &Node)>,
+    path: &RelativePath,
+) -> NodeChangeState {
+    let absent = NodeChangeState {
+        mapping: state::NodeMapping {
+            repository: repository.clone(),
+            state: state.clone(),
+            path: path.clone(),
+            node: INVALID_NODE,
+        },
+        observed: None,
+        flags: NodeFlags::NoFlags,
+        address: Default::default(),
+        mode: 0,
+    };
+    match held {
+        Some((id, node)) => absent.from_child(id, node, path.clone()),
+        None => absent,
+    }
 }
 
 /// Adds to `replaced` each path at which the held State `paths` resolves holds a local change to a
@@ -375,6 +514,36 @@ impl<'a> Resolver<'a> {
         Ok(found)
     }
 
+    /// The path of the local change a link placed at `path` would replace: a local file or link
+    /// standing above `path`, or `path` where one stands at or below it, a directory added locally
+    /// included; `None` where it replaces none.
+    pub async fn replaced_by_link(
+        &mut self,
+        path: &RelativePath,
+    ) -> Result<Option<RelativePath>, StateError> {
+        if let Some(above) = self.local_above(path).await? {
+            return Ok(Some(above));
+        }
+        Ok(match self.at(path).await? {
+            Some((node, record)) if self.holds_local_change(node, &record, true).await? => {
+                Some(path.clone())
+            }
+            _ => None,
+        })
+    }
+
+    /// Whether `link` stands at `path` as it is ([`same_link`]).
+    pub async fn holds_link(
+        &mut self,
+        path: &RelativePath,
+        link: &Node,
+    ) -> Result<bool, StateError> {
+        Ok(self
+            .at(path)
+            .await?
+            .is_some_and(|(_, held)| same_link(&held, link)))
+    }
+
     /// What stands at `path`, with its record.
     async fn at(&mut self, path: &RelativePath) -> Result<Option<(NodeID, Node)>, StateError> {
         match self.dir(&path.parent_path()).await? {
@@ -383,12 +552,15 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// Whether a local file or link stands above `path` in place of a directory, which a change at
-    /// `path` would replace.
-    async fn below_local(&mut self, path: &RelativePath) -> Result<bool, StateError> {
+    /// The path of the local file or link standing above `path` in place of a directory, which a
+    /// change at `path` would replace; `None` where none does.
+    async fn local_above(
+        &mut self,
+        path: &RelativePath,
+    ) -> Result<Option<RelativePath>, StateError> {
         let parent = path.parent_path();
         if self.dir(&parent).await?.is_some() {
-            return Ok(false);
+            return Ok(None);
         }
         let parent = parent.as_str();
         let mut dir = ROOT_NODE;
@@ -402,12 +574,13 @@ impl<'a> Resolver<'a> {
                 dir = found;
                 continue;
             }
-            return Ok(self
+            let local = self
                 .child(dir, ancestor.name())
                 .await?
-                .is_some_and(|(_, held)| !held.is_directory() && is_local(&held)));
+                .is_some_and(|(_, held)| !held.is_directory() && is_local(&held));
+            return Ok(local.then_some(ancestor));
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Whether a child of the root is dirty. A local change dirties each of its ancestors but the
@@ -552,7 +725,7 @@ async fn replaces_local<'c, H: HoldHost>(
                     && !holds_side(host, path, &record, [Some(&change.from), None], matching)
                         .await?
             }
-            None => paths.below_local(path).await?,
+            None => paths.local_above(path).await?.is_some(),
         };
         if replaced {
             return Ok(Some(path));
@@ -571,7 +744,7 @@ async fn replaces_local<'c, H: HoldHost>(
             paths.holds_local_change(node, &record, true).await?
                 && !holds_side(host, path, &record, [replaced, Some(&change.to)], matching).await?
         }
-        None => paths.below_local(path).await?,
+        None => paths.local_above(path).await?.is_some(),
     };
     Ok(replaced.then_some(path))
 }
@@ -797,23 +970,11 @@ async fn side_at(
         Err(error) if error.is_node_not_found() => None,
         Err(error) => return Err(error),
     };
-    let absent = NodeChangeState {
-        mapping: state::NodeMapping {
-            repository: repository.clone(),
-            state: state.clone(),
-            path: path.clone(),
-            node: INVALID_NODE,
-        },
-        observed: None,
-        flags: NodeFlags::NoFlags,
-        address: Default::default(),
-        mode: 0,
-    };
     let Some(id) = id else {
-        return Ok(Some(absent));
+        return Ok(Some(side_of((repository, state), None, path)));
     };
     let node = state.node(repository.clone(), id).await?;
-    Ok(Some(absent.from_child(id, &node, path.clone())))
+    Ok(Some(side_of((repository, state), Some((id, &node)), path)))
 }
 
 /// The refusal of what a provider holding whole revisions cannot do, `what` phrased as a verb.
@@ -915,11 +1076,13 @@ pub type SwapHook = Arc<dyn Fn(SwapPhase) -> BoxFuture<'static, bool> + Send + S
 /// `reconciled`, each local file a forced hold overwrote to `overwritten`, and each local file a
 /// change leaves in place to `kept`. Each local file of
 /// `matching`, which [`check`] found holding what a change replaces or brings, is overwritten or
-/// removed as a forced hold does. `hook`, a test's, runs after each pass and around each copy;
-/// `false` fails the apply there.
+/// removed as a forced hold does. `links`, the changes of link nodes the diff noted
+/// ([`state::DiffFlags::NotesLinkNodes`]), each placing a link whole, are applied after `changes`
+/// in each pass. `hook`, a test's, runs after each pass and around each copy; `false` fails the
+/// apply there.
 pub async fn apply<H: HoldHost>(
     (host, paths): (&H, Resolver<'_>),
-    changes: &[NodeChange],
+    (changes, links): (&[NodeChange], &[NodeChange]),
     (options, matching): (HoldOptions, &Matching),
     changed: &mut BTreeMap<String, bool>,
     reads: &mut u64,
@@ -932,7 +1095,7 @@ pub async fn apply<H: HoldHost>(
     hook: Option<SwapHook>,
 ) -> Result<(), StateError> {
     let mut dirs = Directories::new((host, paths), (options, matching), changed, unsettled, hook);
-    let result = apply_passes(&mut dirs, changes).await;
+    let result = apply_passes(&mut dirs, (changes, links)).await;
     *reads = dirs.paths.reads();
     reconciled.append(&mut dirs.reconciled);
     overwritten.append(&mut dirs.overwritten);
@@ -942,9 +1105,9 @@ pub async fn apply<H: HoldHost>(
 
 async fn apply_passes<H: HoldHost>(
     dirs: &mut Directories<'_, H>,
-    changes: &[NodeChange],
+    (changes, links): (&[NodeChange], &[NodeChange]),
 ) -> Result<(), StateError> {
-    for change in changes {
+    for change in changes.iter().chain(links) {
         let removed = match change.action {
             FileAction::Delete => Some(change.path()),
             FileAction::Move => change.move_source(),
@@ -955,7 +1118,7 @@ async fn apply_passes<H: HoldHost>(
         }
     }
     dirs.phase(SwapPhase::Removed).await?;
-    for change in changes {
+    for change in changes.iter().chain(links) {
         let path = change.path();
         let absent = match change.action {
             FileAction::Delete => continue,
@@ -1068,12 +1231,7 @@ impl<'a, H: HoldHost> Directories<'a, H> {
 
     /// Runs the test hook at `phase`, failing the apply where it answers false.
     async fn phase(&self, phase: SwapPhase) -> Result<(), StateError> {
-        match &self.hook {
-            Some(hook) if !hook(phase).await => Err(StateError::internal(format!(
-                "the swap hook failed the apply at {phase:?}"
-            ))),
-            _ => Ok(()),
-        }
+        run_hook(self.hook.as_ref(), phase).await
     }
 
     /// Whether the local file at `path` is overwritten, or removed, as a forced hold does: where
@@ -1838,19 +1996,29 @@ async fn copy_subtree<H: HoldHost>(
     Ok(Copied::Attached(attached))
 }
 
-/// Adds below `build`'s root, a copy of node `side.node` of `side.state`, a copy of every node
-/// below that one.
+/// [`fill_with`] for an apply, which runs its test hook and counts its reads.
 async fn fill<H: HoldHost>(
     dirs: &mut Directories<'_, H>,
     build: &mut TreeBuild<'_>,
     side: &state::NodeMapping,
 ) -> Result<(), StateError> {
+    fill_with(build, side, (dirs.hook.as_ref(), &mut dirs.paths.reads)).await
+}
+
+/// Adds below `build`'s root, a copy of node `side.node` of `side.state`, a copy of every node
+/// below that one. Before it reads each, runs `hook`, where given, at [`SwapPhase::Fill`], and
+/// counts the read in `reads`.
+async fn fill_with(
+    build: &mut TreeBuild<'_>,
+    side: &state::NodeMapping,
+    (hook, reads): (Option<&SwapHook>, &mut u64),
+) -> Result<(), StateError> {
     let mut pending = vec![(build.root(), side.node)];
     let (from, from_repository) = (&side.state, &side.repository);
     while let Some((into, source)) = pending.pop() {
         for child in from.node_children(from_repository.clone(), source).await? {
-            dirs.phase(SwapPhase::Fill).await?;
-            dirs.paths.reads += 1;
+            run_hook(hook, SwapPhase::Fill).await?;
+            *reads += 1;
             let child_name = from.node_name_clone(from_repository.clone(), child).await?;
             // The record read in a block, so no later await holds it.
             let (copy, directory) = {
@@ -1864,6 +2032,16 @@ async fn fill<H: HoldHost>(
         }
     }
     Ok(())
+}
+
+/// Runs the test hook `hook`, where given, at `phase`, failing the apply where it answers false.
+async fn run_hook(hook: Option<&SwapHook>, phase: SwapPhase) -> Result<(), StateError> {
+    match hook {
+        Some(hook) if !hook(phase).await => Err(StateError::internal(format!(
+            "the swap hook failed the apply at {phase:?}"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// The error of an attach that answered nothing, which only an attach that may not load can.

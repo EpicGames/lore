@@ -2,18 +2,17 @@
 //! revision, and below each link and layer mount path the repository mounted there. The mount's
 //! callbacks, an operation's reads and the thaw's descriptions all resolve paths through it, so
 //! they cannot disagree about what a path is.
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use lore_base::types::Hash;
 use lore_error_set::ForwardStrict;
 use lore_storage::hash;
-use parking_lot::Mutex;
 
 use crate::fs::filesystem_provider::FileInfo;
+use crate::fs::linked::EnteredNode;
+use crate::fs::linked::LinkedStates;
+use crate::fs::linked::open_link;
 use crate::fs::swfs::paths::rest_below;
 use crate::layer::Layer;
-use crate::lore::RepositoryId;
 use crate::lore_warn;
 use crate::node::Node;
 use crate::node::NodeID;
@@ -23,7 +22,6 @@ use crate::repository::MountKind;
 use crate::repository::RepositoryContext;
 use crate::repository::is_reserved_node_name;
 use crate::state::FoundNode;
-use crate::state::MAX_LINK_DEPTH;
 use crate::state::State;
 use crate::state::StateError;
 use crate::state::file_modified_time;
@@ -110,9 +108,6 @@ pub struct ServedChild {
     pub served: Served,
 }
 
-/// A linked repository's state at a pin, entered at a nested link.
-type Entered = (Arc<RepositoryContext>, Arc<State>);
-
 /// Maps each path of the working tree to what serves it.
 pub struct ServedTree {
     repository: Arc<RepositoryContext>,
@@ -121,7 +116,7 @@ pub struct ServedTree {
     /// current revision holds at and below their paths.
     mounts: Vec<ServedMount>,
     /// The states of nested links, by linked repository and pin, entered once.
-    entered: Mutex<HashMap<(RepositoryId, Hash), Entered>>,
+    entered: LinkedStates,
 }
 
 impl std::fmt::Debug for ServedTree {
@@ -155,7 +150,7 @@ impl ServedTree {
             repository,
             current,
             mounts,
-            entered: Mutex::default(),
+            entered: LinkedStates::default(),
         }
     }
 
@@ -325,7 +320,14 @@ impl ServedTree {
                 if child.is_link() && mount.is_none() {
                     continue;
                 }
-                let Some((repository, state, id, node)) = self
+                let Some(EnteredNode {
+                    repository,
+                    state,
+                    node_id: id,
+                    node,
+                    ..
+                }) = self
+                    .entered
                     .enter(repository.clone(), state.clone(), id, child)
                     .await?
                 else {
@@ -386,10 +388,16 @@ impl ServedTree {
             if node.is_link() && mount.is_none() {
                 return Ok(None);
             }
-            let Some(entered) = self.enter(repository, state, node_id, node).await? else {
+            let Some(entered) = self.entered.enter(repository, state, node_id, node).await? else {
                 return Ok(None);
             };
-            (repository, state, node_id, node) = entered;
+            EnteredNode {
+                repository,
+                state,
+                node_id,
+                node,
+                ..
+            } = entered;
             if !node.is_directory() {
                 return Ok(None);
             }
@@ -411,10 +419,16 @@ impl ServedTree {
         if node.is_link() && mount.is_none() {
             return Ok(None);
         }
-        let Some(entered) = self.enter(repository, state, node_id, node).await? else {
+        let Some(entered) = self.entered.enter(repository, state, node_id, node).await? else {
             return Ok(None);
         };
-        (repository, state, node_id, node) = entered;
+        EnteredNode {
+            repository,
+            state,
+            node_id,
+            node,
+            ..
+        } = entered;
         Ok(Some(Served::Node {
             repository,
             state,
@@ -423,51 +437,6 @@ impl ServedTree {
             mount,
         }))
     }
-
-    /// The directory the link `node` mounts: its source node in the linked repository's state at
-    /// the link's pin. A link whose source is itself a link is followed, up to the nesting
-    /// depth links allow.
-    async fn enter(
-        &self,
-        mut repository: Arc<RepositoryContext>,
-        mut state: Arc<State>,
-        mut node_id: NodeID,
-        mut node: Node,
-    ) -> Result<Option<(Arc<RepositoryContext>, Arc<State>, NodeID, Node)>, StateError> {
-        for _ in 0..MAX_LINK_DEPTH {
-            if !node.is_link() {
-                return Ok(Some((repository, state, node_id, node)));
-            }
-            let link = node.linked_node();
-            let key = (link.repository, link.revision);
-            let entered = self.entered.lock().get(&key).cloned();
-            (repository, state) = if let Some(entered) = entered {
-                entered
-            } else {
-                let entered =
-                    Box::pin(open_link(&repository, link.repository, link.revision)).await?;
-                self.entered.lock().insert(key, entered.clone());
-                entered
-            };
-            node_id = link.node;
-            node = state.node(repository.clone(), node_id).await?;
-        }
-        Ok(None)
-    }
-}
-
-/// The linked repository `linked` at `revision`, reached from `repository`.
-///
-/// Cold: a nested link's pin is opened once per tree, and boxed where it is awaited. Inline, loading
-/// its state would make every resolve as large as opening a link.
-async fn open_link(
-    repository: &Arc<RepositoryContext>,
-    linked: RepositoryId,
-    revision: Hash,
-) -> Result<Entered, StateError> {
-    let linked = repository.to_mounted_context_on_first_use(linked, MountKind::Link);
-    let state = State::deserialize(linked.clone(), revision).await?;
-    Ok((linked, state))
 }
 
 /// How a link or layer mount path changed between two served trees.

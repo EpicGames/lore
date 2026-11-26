@@ -228,6 +228,7 @@ fn bench_inode_table_dashmap_vs_mutex_hashmap_16_threads() {
                     size: i as u64,
                     executable: false,
                     local: false,
+                    source: 0,
                 },
                 mtime: 0,
                 node: i as u32 + 1,

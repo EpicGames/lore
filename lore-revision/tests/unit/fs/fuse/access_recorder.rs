@@ -410,6 +410,55 @@ async fn a_recorded_directory_names_the_blocks_holding_its_children() {
     assert_eq!(lines, vec![format!("/\t{blocks}")]);
 }
 
+/// Nothing a link serves is recorded: a listing there names blocks of the linked repository's
+/// State, which a prefetch would warm from the mount's own State, where they are other blocks.
+#[tokio::test]
+async fn nothing_a_link_serves_is_recorded() {
+    use crate::helper::in_memory;
+
+    let (fixture, fs) = mounted(&[("a.txt", b"hello")]).await;
+    lore_base::runtime::LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let writer = in_memory::repository_in(
+                fixture.repository.immutable_store(),
+                fixture
+                    .repository
+                    .try_mutable_store_arc()
+                    .expect("the fixture holds a write token"),
+                fixture.repository.id,
+            );
+            let linked = lore_revision::lore::RepositoryId::from(uuid::Uuid::now_v7());
+            let pin = in_memory::linked_revision(&writer, linked).await;
+            fs.state()
+                .node_attach(
+                    fixture.repository.clone(),
+                    ROOT_NODE,
+                    in_memory::link_node("vendor", linked, pin),
+                    "vendor",
+                )
+                .await
+                .expect("attach the link");
+            let (_dir, path) = recording(&fs);
+
+            let vendor = fs
+                .lookup(&req(), ROOT_INO, b"vendor")
+                .await
+                .expect("lookup vendor");
+            fs.lookup(&req(), vendor.ino, b"l.txt")
+                .await
+                .expect("lookup the link's file");
+            let a = fs
+                .lookup(&req(), ROOT_INO, b"a.txt")
+                .await
+                .expect("lookup a");
+            read(&fs, a.ino, 5).await;
+
+            let lines = wait_for_line(&path, "a.txt", WRITER_WAIT).await;
+            assert_eq!(paths(&lines), vec!["/", "a.txt"]);
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn nothing_recorded_when_recording_is_off() {
     let (_fixture, fs) = mounted(&[("a.txt", b"hello"), ("dir/c.txt", b"c")]).await;

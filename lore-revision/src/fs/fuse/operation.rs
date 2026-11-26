@@ -30,6 +30,7 @@ use lore_fuse::reply::Errno;
 use lore_storage::ContentSource;
 use smallvec::SmallVec;
 
+use crate::errors::LocalModifications;
 use crate::errors::NotSupported;
 use crate::fs::filesystem_provider::CaseLookup;
 use crate::fs::filesystem_provider::DirectoryEntry;
@@ -48,6 +49,7 @@ use crate::fs::fuse::filesystem::LookupCase;
 use crate::fs::fuse::filesystem::SettleOwed;
 use crate::fs::fuse::filesystem::SpelledEntry;
 use crate::fs::fuse::filesystem::WriteStep;
+use crate::fs::fuse::filesystem::node_at_path;
 use crate::fs::fuse::inode::Name;
 use crate::fs::fuse::inode::ROOT_INO;
 use crate::fs::fuse::listing::Listing;
@@ -57,8 +59,10 @@ use crate::fs::fuse::local_tree::LocalKind;
 use crate::fs::fuse::notifications::Invalidations;
 use crate::fs::fuse::notifications::Pending;
 use crate::fs::fuse::served::Served;
+use crate::fs::hold;
 use crate::lore::Hash;
 use crate::lore_debug;
+use crate::lore_error;
 use crate::lore_warn;
 use crate::node::INVALID_NODE;
 use crate::node::Node;
@@ -727,11 +731,16 @@ fn is_dir_mode(mode: u32) -> bool {
     mode & libc::S_IFMT == libc::S_IFDIR
 }
 
-/// `result` as an instance write reports it: a read-only provider's refusal as [`NotSupported`].
+/// `result` as an instance write reports it: a refusal (`EROFS`) as [`NotSupported`] of a write at
+/// or below a link, which is read-only, as every caller refuses a provider without `write/` first
+/// ([`FuseOperation::writable`]).
 fn written<T>(result: Result<T, Errno>, action: &str, path: &RelativePath) -> Result<T, FsError> {
     match result {
         Ok(done) => Ok(done),
-        Err(Errno::EROFS) => read_only(action),
+        Err(Errno::EROFS) => Err(NotSupported {
+            operation: format!("{action} at or below a link, which is read-only"),
+        }
+        .into()),
         Err(errno) => Err(FsError::internal(format!(
             "{action} '{path}': {}",
             std::io::Error::from_raw_os_error(errno.0)
@@ -1406,6 +1415,120 @@ impl FuseOperation {
         entry_changed(changed, from_parent, from.name().as_bytes());
         entry_changed(changed, to_parent, to.name().as_bytes());
         Ok(())
+    }
+
+    /// Serves `link`, a link node of the instance's own tree, at `path`, in place of what stands
+    /// there, or takes away the link standing at `path` where `None`: the mount serves a link from
+    /// its node (ADR-00036). A link placed over a local change, at or below `path` or a local file
+    /// above it, is refused with [`LocalModifications`] unless `force`, which removes the change
+    /// first: the local file above, or what stands at `path`. A path through a link takes nothing:
+    /// its pin serves it.
+    pub(crate) async fn place_link(
+        &self,
+        path: &RelativePath,
+        link: Option<&Node>,
+        force: bool,
+    ) -> Result<(), FsError> {
+        const ACTION: &str = "placing a link";
+        self.writable(ACTION)?;
+        let served = self.filesystem.served();
+        let replaced = if link.is_some() {
+            hold::Resolver::new((&served.repository, &served.state))
+                .replaced_by_link(path)
+                .await
+                .forward_any::<FsError>("checking the path of a link for local changes")?
+        } else {
+            let standing = node_at_path(&served.state, &served.repository, path.as_str())
+                .await
+                .forward_any::<FsError>("reading the link taken away")?;
+            // No link to take away, as below another link, whose pin serves the path: no inode
+            // is walked through it.
+            if !standing.is_some_and(|(_, node)| node.is_link()) {
+                return Ok(());
+            }
+            None
+        };
+        drop(served);
+        if let Some(replaced) = replaced {
+            if !force {
+                lore_error!("{path} has local changes the link placed there replaces");
+                return Err(LocalModifications.into());
+            }
+            InstanceOperation::remove_recursive(self, &replaced).await?;
+        }
+        self.place_at(path, hold::Placing::Link(link), ACTION).await
+    }
+
+    /// Serves at `path` a copy of the node `side` names, with every node below it, where nothing
+    /// stands there ([`hold::place_copy`]), as a reset puts back the committed directory a link
+    /// staged in its place took away. A path through a link takes nothing: its pin serves it.
+    pub(crate) async fn place_copy(
+        &self,
+        path: &RelativePath,
+        side: &NodeMapping,
+    ) -> Result<(), FsError> {
+        const ACTION: &str = "placing a committed node";
+        self.writable(ACTION)?;
+        self.place_at(path, hold::Placing::Copy(side), ACTION).await
+    }
+
+    /// [`Self::place_link`] of the link standing at `path` moved to the revision `pin`, mounting
+    /// its node `source`; nothing where no link stands there. A clean link stands there, so no
+    /// local change is looked for.
+    pub(crate) async fn repin_link(
+        &self,
+        path: &RelativePath,
+        pin: Hash,
+        source: NodeID,
+    ) -> Result<(), FsError> {
+        const ACTION: &str = "moving a link to a pin";
+        self.writable(ACTION)?;
+        let served = self.filesystem.served();
+        let held = node_at_path(&served.state, &served.repository, path.as_str())
+            .await
+            .forward_any::<FsError>("reading the link a pin moves")?;
+        drop(served);
+        let Some((_, mut moved)) = held.filter(|(_, held)| held.is_link()) else {
+            return Ok(());
+        };
+        moved.address.hash = pin;
+        moved.child = source;
+        self.place_at(path, hold::Placing::Link(Some(&moved)), ACTION)
+            .await
+    }
+
+    /// Places `placing` at `path` for `action`, once local changes are settled, and sends the
+    /// kernel what changed: [`Self::place_link`], [`Self::place_copy`] and [`Self::repin_link`].
+    /// A path through a link takes nothing: its pin serves it.
+    async fn place_at(
+        &self,
+        path: &RelativePath,
+        placing: hold::Placing<'_>,
+        action: &str,
+    ) -> Result<(), FsError> {
+        let takes_away = matches!(placing, hold::Placing::Link(None));
+        let mut changed = self.changes();
+        let batch = &mut changed.batch;
+        let placed = Box::pin(async {
+            let mut looked = Looked::new(&self.filesystem);
+            let parent = match self
+                .directory_at((&mut looked, &mut *batch), &path.parent_path(), !takes_away)
+                .await
+            {
+                Err(Errno::ENOENT | Errno::ENOTDIR) if takes_away => return Ok(()),
+                // Inside a link, whose pin serves the path.
+                Err(Errno::EROFS) => return Ok(()),
+                parent => parent?,
+            };
+            let name = path.name();
+            if self.filesystem.place(parent, name, placing).await? {
+                entry_changed(batch, parent, name.as_bytes());
+            }
+            Ok::<_, Errno>(())
+        })
+        .await;
+        changed.send().await;
+        written(placed, action, path)
     }
 
     /// What an instance write changes, sent from the mount's notification thread in one batch

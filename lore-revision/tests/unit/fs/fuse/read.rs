@@ -29,6 +29,7 @@ fn file_entry(size: u64) -> InodeEntry {
             size,
             executable: false,
             local: false,
+            source: 0,
         },
         nlookup: 1,
         mtime: 0,

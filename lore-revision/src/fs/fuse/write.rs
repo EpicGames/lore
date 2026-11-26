@@ -87,6 +87,7 @@ use crate::fs::fuse::served::Served;
 use crate::fs::fuse::spelling::DEFAULT_TIMEOUTS;
 use crate::fs::fuse::view::filter_states_to_u8;
 use crate::fs::fuse::view::view_line;
+use crate::fs::hold;
 use crate::fs::hold::SwapPhase;
 use crate::hash::hash_string;
 use crate::lore_warn;
@@ -2013,6 +2014,7 @@ impl FuseFilesystem {
                 size: 0,
                 executable,
                 local: true,
+                source: 0,
             },
             LocalKind::Symlink => InodeKind::Symlink,
             LocalKind::Dir => {
@@ -2029,6 +2031,8 @@ impl FuseFilesystem {
                     node: node_id,
                     local: true,
                     link: false,
+                    entered: false,
+                    source: 0,
                 }
             }
         };
@@ -2249,6 +2253,8 @@ impl FuseFilesystem {
         let local = self.writable()?;
         let kept = match self.inodes().get(ino).ok_or(Errno::ENOENT)?.kind {
             InodeKind::File { local: true, .. } => None,
+            // What a link serves, which no write changes.
+            InodeKind::File { source, .. } if source != 0 => return Err(Errno::EROFS.into()),
             InodeKind::File { size, .. } => Some(truncate_to.map_or(size, |len| len.min(size))),
             InodeKind::Dir { .. } => return Err(Errno::EISDIR.into()),
             InodeKind::Symlink => return Err(Errno::EINVAL.into()),
@@ -2305,8 +2311,11 @@ impl FuseFilesystem {
             let entry = self.inodes().get(ino).ok_or(Errno::ENOENT)?;
             match entry.kind {
                 InodeKind::File { local: true, .. } => return Ok(()),
-                // Its path is gone, and a copy-up has nowhere to go.
-                InodeKind::File { .. } if entry.orphaned => return Err(Errno::EROFS.into()),
+                // Its path is gone, and a copy-up has nowhere to go; what a link serves no write
+                // changes.
+                InodeKind::File { source, .. } if entry.orphaned || source != 0 => {
+                    return Err(Errno::EROFS.into());
+                }
                 InodeKind::File {
                     address,
                     size,
@@ -2501,8 +2510,8 @@ impl FuseFilesystem {
     }
 
     /// SETATTR of inode `ino`: size, mode and times; owner and group only as they are. A
-    /// tracked file is copied up first, a tracked directory takes a new time only, and a link
-    /// takes nothing (`EROFS`).
+    /// tracked file is copied up first, a tracked directory takes a new time only, and a link and
+    /// what it serves take nothing (`EROFS`).
     pub(crate) async fn setattr_node(
         &self,
         ino: u64,
@@ -2510,7 +2519,13 @@ impl FuseFilesystem {
         fetch: bool,
     ) -> Result<AttrReply, ReadFault> {
         let local = self.writable()?;
-        if self.inodes().get(ino).ok_or(Errno::ENOENT)?.kind.is_link() {
+        if self
+            .inodes()
+            .get(ino)
+            .ok_or(Errno::ENOENT)?
+            .kind
+            .is_read_only()
+        {
             return Err(Errno::EROFS.into());
         }
         let valid = attr.valid;
@@ -3665,6 +3680,48 @@ impl FuseFilesystem {
         let file = self.descriptor(ino)?;
         self.writable()?.pin_file(ino, file);
         Ok(())
+    }
+
+    /// Places `placing` as `name` in directory inode `parent` of the filesystem State: a link
+    /// node of the instance's own tree in place of what stands there, the taking away of the link
+    /// standing there, or a copy of a committed node where nothing stands
+    /// ([`hold::place_link`], [`hold::place_copy`]), serialized with swaps; answers whether the
+    /// State changed. The inode the kernel holds at the name is orphaned, so a lookup finds what
+    /// was placed. A directory inside a link takes nothing: the link's pin serves it.
+    pub(crate) async fn place(
+        &self,
+        parent: u64,
+        name: &str,
+        placing: hold::Placing<'_>,
+    ) -> Result<bool, Errno> {
+        if self
+            .inodes()
+            .get(parent)
+            .is_some_and(|entry| entry.kind.is_read_only())
+        {
+            return Ok(false);
+        }
+        let _swaps = self.swap_plan().lock().await;
+        let (dir, _) = self.dir_node(parent)?;
+        let served = self.served();
+        let held = (&served.repository, &*served.state);
+        let placed = match placing {
+            hold::Placing::Link(link) => hold::place_link(held, dir, name, link).await,
+            hold::Placing::Copy(side) => hold::place_copy(held, dir, name, side).await,
+        }
+        .map_err(|error| {
+            lore_warn!("FUSE placing '{name}' failed: {error}");
+            Errno::EIO
+        })?;
+        if placed {
+            let name_hash = hash_string(name);
+            if let Some(ino) = self.inodes().find_child(parent, name_hash, name) {
+                self.inodes().orphan(ino);
+            }
+            self.invalidate_spellings(parent, name_hash, name.as_bytes());
+            self.touch_dir(parent);
+        }
+        Ok(placed)
     }
 
     /// Drops the kernel's dentries for every other spelling of `name`'s key in `parent`, which
@@ -5407,6 +5464,7 @@ fn committed_kind(stored: &StoredContent) -> InodeKind {
         size: stored.size,
         executable: stored.mode & NodeFileMode::Executable == NodeFileMode::Executable,
         local: false,
+        source: 0,
     }
 }
 

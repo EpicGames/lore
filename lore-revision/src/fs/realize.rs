@@ -1656,8 +1656,8 @@ impl KeptEntries {
 /// ([`MountWalk`]), which stays with the directories leading to it, and the files `held` names,
 /// lowercase and sorted, and answers what stayed. A forced removal takes everything. Where `shown`
 /// is `None`, the link's revision cannot be opened, so only an empty mount goes. A provider holding
-/// its state has no mount to remove
-/// ([`holds_state`](crate::fs::filesystem_provider::FilesystemProvider::holds_state)).
+/// its state has no mount to remove: the link it serves at `mount` is taken away
+/// ([`InstanceOperationImpl::place_link`]).
 ///
 /// `root` is the working tree's, to tell a nested repository by.
 pub(crate) async fn remove_link_mount(
@@ -1670,6 +1670,7 @@ pub(crate) async fn remove_link_mount(
 ) -> Result<KeptEntries, SyncError> {
     let mut kept = KeptEntries::default();
     if operation.holds_state() {
+        operation.place_link(mount, None, false).await?;
         return Ok(kept);
     }
     if execution_context().globals().force() {
@@ -4708,8 +4709,17 @@ fn realize_change_modify_add<'a>(
         // file write. A link's content is written only here, so a link is kept wherever the view
         // could re-include something below it. The move rename below is not gated by the view,
         // because it repositions a path an earlier in-view realize may have written. Nothing of a
-        // link is written to a provider holding its state, which serves the link from its node.
+        // link is written to a provider holding its state, which serves the link from its node:
+        // the link is placed there, and taken away from where it moves from.
         let held_link = node.is_link() && operation.holds_state();
+        if held_link && !dry_run {
+            if let Some(from_path) = change.move_source() {
+                operation.place_link(from_path, None, false).await?;
+            }
+            operation
+                .place_link(path, Some(&node), execution_context().globals().force())
+                .await?;
+        }
         let write_to_disk = if node.is_link() {
             !held_link && !view_filter.excludes_tree(path, true, FilterMode::View)
         } else if node.is_directory() {
