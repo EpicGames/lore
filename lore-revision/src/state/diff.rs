@@ -1888,21 +1888,25 @@ async fn add_change_for_paired_nodes(
 
                     let can_read_link = to.mapping.repository.can_read_link(link_repository_id);
 
+                    let linked = if !can_read_link || flags.contains(DiffFlags::ReportsLinkNodes) {
+                        None
+                    } else {
+                        let linked_repository = to
+                            .mapping
+                            .repository
+                            .to_link_context(link_repository_id)
+                            .await;
+                        crate::link::skip_denied(
+                            (link_repository_id, subpath.as_str()),
+                            State::deserialize(linked_repository.clone(), to_node.address.hash),
+                        )
+                        .await?
+                        .map(|linked_state| (linked_repository, linked_state))
+                    };
                     // A staged link holding neither staged nor dirty children is a link update
-                    let recurse_link =
-                        if !can_read_link || flags.contains(DiffFlags::ReportsLinkNodes) {
-                            false
-                        } else {
-                            let linked_repository = to
-                                .mapping
-                                .repository
-                                .to_link_context(link_repository_id)
-                                .await;
-                            let linked_state =
-                                State::deserialize(linked_repository.clone(), to_node.address.hash)
-                                    .await
-                                    .forward::<StateError>("Link error")?;
-
+                    let recurse_link = match linked {
+                        None => false,
+                        Some((linked_repository, linked_state)) => {
                             let has_changed_children = linked_state
                                 .node_has_staged_or_dirty_children(
                                     linked_repository.clone(),
@@ -1912,16 +1916,21 @@ async fn add_change_for_paired_nodes(
 
                             // The two subtrees of a remount, or of a link replaced by one to another
                             // repository, don't correspond, so the link node is reported instead.
-                            (!is_staged || has_changed_children)
-                                && !(from_node.is_link()
-                                    && crate::link::link_remounted(
+                            let remounted = from_node.is_link()
+                                && crate::link::skip_denied(
+                                    (link_repository_id, subpath.as_str()),
+                                    crate::link::link_remounted(
                                         &linked_repository,
                                         from_node,
                                         &to_node,
                                         &linked_state,
-                                    )
-                                    .await?)
-                        };
+                                    ),
+                                )
+                                .await?
+                                .is_none_or(|remounted| remounted);
+                            (!is_staged || has_changed_children) && !remounted
+                        }
+                    };
 
                     if !recurse_link {
                         if flags.contains(DiffFlags::ReportsLinkNodes) {
@@ -2405,10 +2414,9 @@ pub(crate) async fn diff_states_into(
     let from_side = node_change_state(&from.repository, &from.state, from.node, path.clone()).await;
     let to_side = node_change_state(&to.repository, &to.state, to.node, path.clone()).await;
     let filesystem = to.clone();
-    let intent = if intent.marks_dirty() {
-        FilesystemDiffIntent::MarkDirty
-    } else {
-        FilesystemDiffIntent::Report
+    let intent = match intent {
+        _ if intent.marks_dirty() => FilesystemDiffIntent::MarkDirty,
+        _ => FilesystemDiffIntent::Report,
     };
     let extra = if intent.marks_dirty() {
         DiffFlags::FilesystemTo | DiffFlags::SettlesFrom

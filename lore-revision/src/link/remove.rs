@@ -6,6 +6,7 @@ use lore_error_set::prelude::*;
 
 use super::LinkError;
 use crate::errors::LocalModifications;
+use crate::errors::is_refusal;
 use crate::event;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
@@ -63,6 +64,17 @@ pub(crate) async fn remove(
 
     let link_id: RepositoryId = link_node.address.context.into();
     let is_staged_add = link_node.is_staged_add();
+    if let Err(err) = State::deserialize(
+        inner_repository.to_link_context(link_id).await,
+        link_node.address.hash,
+    )
+    .await
+        && is_refusal(&err)
+    {
+        return Err(err).forward_with::<LinkError, _>(|| {
+            format!("{} at {link_path}", crate::link::unreachable(link_id))
+        });
+    }
     // The tree's spelling, which the working tree holds the mount under however the caller
     // spelled it.
     let mount = match inner_state

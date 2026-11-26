@@ -1057,6 +1057,8 @@ pub struct ExecutionContext {
     /// Cancelled once nobody is waiting for this call's result. `None` for a call nothing can
     /// cancel, such as a client command.
     cancellation: Option<crate::runtime::Cancellation>,
+    /// The linked repositories that refused this call's caller, which the rest of the call skips.
+    denied_repositories: parking_lot::Mutex<std::collections::HashSet<crate::lore::RepositoryId>>,
 }
 
 impl ExecutionContext {
@@ -1223,6 +1225,14 @@ impl ExecutionContext {
         self.push_budget
             .get_or_init(crate::branch::push::PushBudget::default)
     }
+
+    pub(crate) fn deny_repository(&self, id: crate::lore::RepositoryId) {
+        self.denied_repositories.lock().insert(id);
+    }
+
+    pub(crate) fn repository_denied(&self, id: crate::lore::RepositoryId) -> bool {
+        self.denied_repositories.lock().contains(&id)
+    }
 }
 
 impl Default for ExecutionContext {
@@ -1239,6 +1249,7 @@ impl Default for ExecutionContext {
             fragment_stats: OnceLock::new(),
             push_stats: OnceLock::new(),
             push_budget: OnceLock::new(),
+            denied_repositories: Default::default(),
             environment: None,
             cancellation: None,
         }

@@ -873,14 +873,15 @@ async fn creating_a_branch_the_remote_refuses_writes_nothing() {
 }
 
 /// A create makes the new branch in each linked repository, once the instance's own lookups are
-/// answered. A linked repository the remote refuses the caller fails the create with the refusal.
+/// answered. A linked repository the remote refuses the caller is skipped, and its link keeps its
+/// pin and the branch it followed.
 #[tokio::test]
-async fn creating_a_branch_a_linked_repository_refuses_reports_the_refusal() {
+async fn creating_a_branch_skips_a_linked_repository_that_refuses_it() {
     Box::pin(with_execution(async {
         let (instance, _linked, _tempdir, protocol, _remote) = served_committed_instance().await;
         // The create reads the pinned revision for nested links before it asks the linked
         // repository for the branch, so the link pins a revision the instance holds.
-        let (revision, _branch) = lore_revision::instance::load_current_anchor_boxed(&instance)
+        let (revision, branch) = lore_revision::instance::load_current_anchor_boxed(&instance)
             .await
             .expect("loading the current anchor");
         let linked = state_linking(&instance, revision).await;
@@ -888,15 +889,34 @@ async fn creating_a_branch_a_linked_repository_refuses_reports_the_refusal() {
             .await
             .expect("staging the link");
 
-        let error = create_feature_branch(instance.clone())
+        create_feature_branch(instance.clone())
             .await
-            .expect_err("the remote refuses the linked repository");
-        assert!(error.is_not_authorized(), "{error:?}");
+            .expect("the create skips the refusing linked repository");
         assert_eq!(
             *protocol.revision_connects.lock(),
             [instance.id, linked_repository()],
             "the revision services connected"
         );
+        let staged = lore_revision::instance::load_staged_revision(&instance)
+            .await
+            .expect("loading the staged revision")
+            .expect("the link is still staged");
+        let pins: Vec<_> = State::deserialize(instance.clone(), staged)
+            .await
+            .expect("reading the staged state")
+            .link_list(instance.clone())
+            .await
+            .expect("listing the links")
+            .into_iter()
+            .map(|link| {
+                (
+                    link.repository,
+                    link.signature,
+                    link.resolve_branch(BranchId::default()),
+                )
+            })
+            .collect();
+        assert_eq!(pins, [(linked_repository(), revision, branch)]);
     }))
     .await;
 }

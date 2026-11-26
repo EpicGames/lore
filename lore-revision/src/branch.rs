@@ -3511,8 +3511,10 @@ impl LinkedBranches {
 /// Repinning `state` writes a revision on top of `current_latest`, which is returned as the
 /// branch's latest, and `state_staged` is rebased onto it. A dry run stops before the creates.
 ///
-/// A failing create starts no more, deletes the branches made, and returns its error naming its
-/// links. The other failures are logged.
+/// A repository that refuses the caller is skipped, with the repositories linked only below it,
+/// and a link following its parent there keeps its pin and the branch it followed. A failing create
+/// starts no more, deletes the branches made, and returns its error naming its links. The other
+/// failures are logged.
 async fn create_linked_branches(
     cascade: &LinkCascade<'_>,
     repository: &Arc<RepositoryContext>,
@@ -3539,32 +3541,52 @@ async fn create_linked_branches(
         .forward::<BranchError>("walking the nested links")?;
     let repositories =
         link::try_join_links(reached.into_iter().map(cascade_start).collect()).await?;
-    if repositories.is_empty() || cascade.dry_run {
+    let refusing = groups.iter().any(|(link_id, _)| link::denied(*link_id));
+    if (repositories.is_empty() && !refusing) || cascade.dry_run {
         return Ok(LinkedBranches::unchanged(current_latest));
     }
 
-    let creates = (0..repositories.len())
-        .map(|position| create_cascade_branch(cascade, &repositories[position]))
+    let creates = repositories
+        .iter()
+        .map(|linked| {
+            link::skip_denied(
+                (linked.reached.repository, &linked.start().mount_path),
+                create_cascade_branch(cascade, linked),
+            )
+        })
         .collect();
     let results = link::join_links_until_failure(creates).await;
+    let reachable = link::reachable_around(
+        repositories.iter().map(|linked| &linked.reached),
+        link::denied,
+    );
 
     let mut outcomes = Vec::with_capacity(results.len());
     let mut created = Vec::new();
+    let mut orphaned = Vec::new();
     let mut failures = Vec::new();
-    for (linked, result) in repositories.iter().zip(results) {
+    let mut branched = Vec::with_capacity(results.len());
+    for (linked, result) in repositories.into_iter().zip(results) {
         match result {
-            Ok((remote, outcome)) => {
-                if !outcome.reused {
-                    created.push(LinkedBranch {
-                        repository: linked.reached.repository,
-                        remote,
-                    });
+            Ok(Some((remote, outcome))) => {
+                let made = (!outcome.reused).then_some(LinkedBranch {
+                    repository: linked.reached.repository,
+                    remote,
+                });
+                if !reachable.contains(&linked.reached.repository) {
+                    orphaned.extend(made);
+                    continue;
                 }
+                created.extend(made);
                 outcomes.push(outcome);
+                branched.push(linked);
             }
+            Ok(None) => {}
             Err(err) => failures.push((err, linked)),
         }
     }
+    delete_linked_branches(orphaned, cascade.branch).await;
+    let repositories = branched;
     if let Some((first, mounts)) = log_cascade_failures(cascade, failures) {
         delete_linked_branches(created, cascade.branch).await;
         return Err(first).forward_with::<BranchError, _>(|| {
@@ -3593,7 +3615,7 @@ async fn create_linked_branches(
         &groups,
         (&repositories, &index),
         &outcomes,
-        current_latest,
+        (current_branch, current_latest),
     )
     .await
     {
@@ -3732,7 +3754,7 @@ async fn create_cascade_branch(
 /// line of its own. None where nothing failed.
 fn log_cascade_failures(
     cascade: &LinkCascade<'_>,
-    failures: Vec<(BranchError, &CascadeRepository)>,
+    failures: Vec<(BranchError, CascadeRepository)>,
 ) -> Option<(BranchError, String)> {
     let mut failures = failures.into_iter();
     let (first, first_linked) = failures.next()?;
@@ -3760,9 +3782,9 @@ async fn store_cascade_repins(
     groups: &[(RepositoryId, Vec<CascadeMount>)],
     (repositories, index): (&[CascadeRepository], &HashMap<RepositoryId, usize>),
     outcomes: &[link::LinkBranchOutcome],
-    current_latest: Hash,
+    (current_branch, current_latest): (BranchId, Hash),
 ) -> Result<(Hash, Option<Hash>), BranchError> {
-    let linked: Vec<Vec<usize>> = repositories
+    let (linked, holds_refused): (Vec<Vec<usize>>, Vec<bool>) = repositories
         .iter()
         .zip(outcomes)
         .map(|(linked, outcome)| {
@@ -3773,27 +3795,35 @@ async fn store_cascade_repins(
                 .iter()
                 .find(|walked| walked.pin == start)
             {
-                Some(walked) if !outcome.reused => walked
-                    .linked
-                    .iter()
-                    .filter_map(|repository| index.get(repository).copied())
-                    .collect(),
-                _ => Vec::new(),
+                Some(walked) if !outcome.reused => (
+                    walked
+                        .linked
+                        .iter()
+                        .filter_map(|repository| index.get(repository).copied())
+                        .collect(),
+                    walked.linked.iter().copied().any(link::denied),
+                ),
+                _ => (Vec::new(), false),
             }
         })
+        .unzip();
+    let repins: Vec<bool> = linked
+        .iter()
+        .zip(holds_refused)
+        .map(|(below, refused)| refused || !below.is_empty())
         .collect();
 
     let mut heads: Vec<Hash> = repositories
         .iter()
         .map(|linked| linked.start().pin)
         .collect();
-    if linked.iter().any(|below| !below.is_empty()) {
+    if repins.contains(&true) {
         // Few linked repositories hold links, so their repins are boxed rather than held by
         // every create over links.
         Box::pin(repin_holders(
             cascade,
             (repositories, index),
-            &linked,
+            (&linked, &repins),
             &mut heads,
         ))
         .await?;
@@ -3806,23 +3836,24 @@ async fn store_cascade_repins(
         groups,
         (repositories, index),
         &heads,
-        current_latest,
+        (current_branch, current_latest),
     )
     .await
 }
 
-/// Repins the links each of `repositories` holds at the pin its branch starts at, in the levels
-/// [`repin_levels`] orders them in, the repositories of a level at once, and records each head.
+/// Repins the links each of `repositories` that `repins` marks holds at the pin its branch starts
+/// at, in the levels [`repin_levels`] orders them in, the repositories of a level at once, and
+/// records each head.
 async fn repin_holders(
     cascade: &LinkCascade<'_>,
     (repositories, index): (&[CascadeRepository], &HashMap<RepositoryId, usize>),
-    linked: &[Vec<usize>],
+    (linked, repins): (&[Vec<usize>], &[bool]),
     heads: &mut [Hash],
 ) -> Result<(), BranchError> {
     for level in repin_levels(linked) {
         let work = level
             .iter()
-            .filter(|&&position| !linked[position].is_empty())
+            .filter(|&&position| repins[position])
             .map(|&position| {
                 let heads = &*heads;
                 async move {
@@ -3844,7 +3875,7 @@ async fn repin_holders(
                         &holder_groups,
                         (repositories, index),
                         heads,
-                        holder.start().pin,
+                        (holder.start().branch, holder.start().pin),
                     )
                     .await?;
                     Ok::<_, BranchError>((position, head))
@@ -3908,10 +3939,32 @@ async fn repin_links(
     groups: &[(RepositoryId, Vec<CascadeMount>)],
     (repositories, index): (&[CascadeRepository], &HashMap<RepositoryId, usize>),
     heads: &[Hash],
-    current_latest: Hash,
+    (current_branch, current_latest): (BranchId, Hash),
 ) -> Result<(Hash, Option<Hash>), BranchError> {
+    let mount_state = |mount: &CascadeMount| match state_staged {
+        Some(state_staged) if mount.staged => state_staged,
+        _ => state,
+    };
     for (link_id, mounts) in groups {
         let Some(&position) = index.get(link_id) else {
+            if link::denied(*link_id) {
+                // The branch is not made in a repository that refused the caller, so a link
+                // following its parent there stays on the branch it followed.
+                for mount in mounts.iter().filter(|mount| mount.link.is_tracking()) {
+                    let mount_state = mount_state(mount);
+                    mount_state.mark_dirty();
+                    mount_state
+                        .link_update(
+                            repository.clone(),
+                            mount.link.repository,
+                            mount.link.resolve_branch(current_branch),
+                            mount.link.signature,
+                            mount.link.local_node,
+                        )
+                        .await
+                        .forward::<BranchError>("keeping a link on the branch it followed")?;
+                }
+            }
             continue;
         };
         let (pin, head) = (repositories[position].start().pin, heads[position]);
@@ -3924,12 +3977,8 @@ async fn repin_links(
             if mount.link.is_tracking() && signature == mount.link.signature {
                 continue;
             }
-            let mount_state = match state_staged {
-                Some(state_staged) if mount.staged => state_staged,
-                _ => state,
-            };
             link::update_link_pin_by_node(
-                mount_state,
+                mount_state(mount),
                 repository.clone(),
                 mount.link.repository,
                 BranchId::default(),
@@ -4087,7 +4136,7 @@ pub mod test_util {
             &[],
             (&[], &HashMap::new()),
             &[],
-            Hash::default(),
+            (BranchId::default(), Hash::default()),
         ))
     }
 }

@@ -3247,6 +3247,9 @@ async fn repin_committed_links(
     let committed = std::mem::take(&mut *committed.lock());
     let mut pins = Vec::new();
     for link in repins(committed) {
+        if link::denied(link.repository) {
+            continue;
+        }
         let moved = link::repin_repository(
             state,
             repository.clone(),
@@ -3438,7 +3441,7 @@ fn reject_unmovable_link_mounts<'a>(
             *mounts.entry(row.repository()).or_default() += 1;
         }
         // Each repository committed through a staged link node, with the revisions staged at them.
-        let mut committed: Vec<(RepositoryId, Vec<Hash>)> = Vec::new();
+        let mut committed: Vec<(RepositoryId, NodeID, Vec<Hash>)> = Vec::new();
         for row in link_list
             .iter()
             .filter(|row| only.is_none_or(|only| row.repository() == only))
@@ -3452,19 +3455,21 @@ fn reject_unmovable_link_mounts<'a>(
             }
             match committed
                 .iter_mut()
-                .find(|(linked, _)| *linked == row.repository())
+                .find(|(linked, _, _)| *linked == row.repository())
             {
-                Some((_, staged)) if !staged.contains(&node.address.hash) => {
+                Some((_, _, staged)) if !staged.contains(&node.address.hash) => {
                     staged.push(node.address.hash);
                 }
                 Some(_) => {}
-                None => committed.push((row.repository(), vec![node.address.hash])),
+                None => {
+                    committed.push((row.repository(), row.local_node(), vec![node.address.hash]));
+                }
             }
         }
         // A repository mounted once has no other mount to move.
         let repositories: Vec<_> = committed
             .iter()
-            .map(|(linked, _)| *linked)
+            .map(|(linked, _, _)| *linked)
             .filter(|linked| mounts[linked] > 1)
             .collect();
         state
@@ -3476,15 +3481,28 @@ fn reject_unmovable_link_mounts<'a>(
             )
             .await
             .forward::<CommitError>("Checking the rows of the repositories the commit links")?;
-        for (linked, staged) in &committed {
+        for (linked, link_node, staged) in &committed {
+            let link_path = state
+                .node_path(repository.clone(), *link_node)
+                .await
+                .forward::<CommitError>("Failed resolving the path of a mount")?;
             // Mounts staged at different revisions are refused once the walk compares them.
-            if let [staged] = staged[..]
-                && mounts[linked] > 1
-                && let Some(missing) =
-                    link::mount_missing_at(state, repository, &link_list, *linked, staged)
-                        .await
-                        .forward::<CommitError>("Checking the mounts the commit moves")?
-            {
+            let missing = match staged[..] {
+                [staged] if mounts[linked] > 1 => {
+                    let Some(missing) = link::skip_denied(
+                        (*linked, &link_path),
+                        link::mount_missing_at(state, repository, &link_list, *linked, staged),
+                    )
+                    .await
+                    .forward::<CommitError>("Checking the mounts the commit moves")?
+                    else {
+                        continue;
+                    };
+                    missing
+                }
+                _ => None,
+            };
+            if let Some(missing) = missing {
                 let mount = state
                     .node_path(repository.clone(), missing)
                     .await
@@ -3500,9 +3518,15 @@ fn reject_unmovable_link_mounts<'a>(
             }
             for &staged in staged {
                 let link_repository = repository.to_link_context(*linked).await;
-                let link_state = State::deserialize(link_repository.clone(), staged)
-                    .await
-                    .forward::<CommitError>("Failed to deserialize link state")?;
+                let Some(link_state) = link::skip_denied(
+                    (*linked, &link_path),
+                    State::deserialize(link_repository.clone(), staged),
+                )
+                .await
+                .forward::<CommitError>("Failed to deserialize link state")?
+                else {
+                    continue;
+                };
                 reject_unmovable_link_mounts(&link_repository, &link_state, None).await?;
             }
         }
@@ -3536,11 +3560,14 @@ async fn reject_unresolved_link_merge_conflicts(
             continue;
         }
         let link = link_node.linked_node();
-        let (link_repository, link_state) = link
-            .open(repository)
-            .await
-            .forward::<CommitError>("Failed to deserialize link state")?;
         let path = path_for_message(repository, state, entry.local_node).await;
+        let Some((link_repository, link_state)) =
+            link::skip_denied((link.repository, &path), link.open(repository))
+                .await
+                .forward::<CommitError>("Failed to deserialize link state")?
+        else {
+            continue;
+        };
         let Ok(path) = RelativePath::from_str(&path);
         let link_mount = link::Mount::of_link(
             &link_repository,
@@ -3847,11 +3874,15 @@ async fn uncommitted_link_pins(
                     else {
                         return Ok(None);
                     };
-                    let (context, linked) = node
-                        .linked_node()
-                        .open(holder)
-                        .await
-                        .forward::<CommitError>("Failed to deserialize link state")?;
+                    let Some((context, linked)) = link::skip_denied(
+                        (link.repository, path.as_str()),
+                        node.linked_node().open(holder),
+                    )
+                    .await
+                    .forward::<CommitError>("Failed to deserialize link state")?
+                    else {
+                        return Ok(None);
+                    };
                     if linked.revision_number() != 0 {
                         return Ok(None);
                     }
@@ -6662,10 +6693,31 @@ async fn commit_link_node(
     let node = block.node(node_index);
 
     let link = node.linked_node();
-    let (link_repository, link_state) = link
-        .open(&repository)
-        .await
-        .forward::<CommitError>("Failed to deserialize link state")?;
+    let Some((link_repository, link_state)) = link::skip_denied(
+        (link.repository, relative_path.as_str()),
+        link.open(&repository),
+    )
+    .await
+    .forward::<CommitError>("Failed to deserialize link state")?
+    else {
+        // Nothing can be staged inside a link the caller cannot read, so the node commits its pin.
+        let link_reference = state
+            .link_find(repository.clone(), link.repository, node_id)
+            .await
+            .forward::<CommitError>("Commit of link node failed")?;
+        delta_add(delta, node_id, node.flags);
+        state.node_change_owned(&block, node_id, |held| {
+            held.clear_staged_and_action_bits();
+            true
+        });
+        committed_links.lock().push(CommittedLink {
+            repository: link.repository,
+            branch: link_reference.branch,
+            signature: link.revision,
+            made: false,
+        });
+        return Ok(());
+    };
 
     // An added link pinned at a committed revision has nothing inside it to commit; one pinned at
     // an uncommitted state, as dirtying or staging inside it leaves, goes through `commit_link`.

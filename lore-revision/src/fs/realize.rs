@@ -1060,24 +1060,31 @@ async fn incoming_writes<'a>(
     if change.action == change::FileAction::Delete {
         return Ok(IncomingWrites::Changes(incoming));
     }
-    let node = change
+    let link = change
         .to
         .get_node()
         .await
-        .forward::<SyncError>("Failed loading the incoming link node")?;
-    let Some((node, (repository, state))) =
-        open_mounted_tree(&change.to.mapping.repository, &node).await
-    else {
-        return Err(SyncError::internal(format!(
+        .forward::<SyncError>("Failed loading the incoming link node")?
+        .linked_node();
+    let Some((repository, state)) = crate::link::skip_denied(
+        (link.repository, change.path().as_str()),
+        link.open(&change.to.mapping.repository),
+    )
+    .await
+    .forward_with::<SyncError, _>(|| {
+        format!(
             "Failed to open the revision the link at {} moves to",
             change.path()
-        )));
+        )
+    })?
+    else {
+        return Ok(IncomingWrites::Nothing);
     };
     Ok(IncomingWrites::Tree(NodeMapping {
         repository,
         state,
         path: change.path().clone(),
-        node,
+        node: link.node,
     }))
 }
 
@@ -1252,6 +1259,8 @@ enum IncomingWrites<'a> {
     Changes(&'a IncomingChanges),
     /// The tree a link mounts there.
     Tree(NodeMapping),
+    /// Nothing, as a link to a repository that refuses the caller is left out.
+    Nothing,
 }
 
 impl IncomingWrites<'_> {
@@ -1261,6 +1270,7 @@ impl IncomingWrites<'_> {
         match self {
             IncomingWrites::Changes(incoming) => Ok(incoming.writes_meet(kept, filter)),
             IncomingWrites::Tree(incoming) => incoming_tree_meets(incoming, filter, kept).await,
+            IncomingWrites::Nothing => Ok(false),
         }
     }
 
@@ -1269,6 +1279,7 @@ impl IncomingWrites<'_> {
         match self {
             IncomingWrites::Changes(incoming) => incoming.writes_near(mount),
             IncomingWrites::Tree(_) => true,
+            IncomingWrites::Nothing => false,
         }
     }
 }
@@ -2899,9 +2910,16 @@ pub async fn verify_filesystem(
                 has_modified_file = true;
                 Box::pin(report_local_work(&operation, &subchange)).await;
             }
-            directory_changes.finish().await.forward::<SyncError>(
+            let walked = directory_changes.finish().await.forward::<SyncError>(
                 "Failed to calculate delta changes between file system and target state",
             )?;
+            if let Some(path) = walked.unreadable.into_inner() {
+                lore_error!(
+                    "Deleted directory {} holds what cannot be read: {path}",
+                    change.path()
+                );
+                return Err(LocalModifications.into());
+            }
             if has_modified_file {
                 return Err(LocalModifications.into());
             }
@@ -4465,7 +4483,11 @@ async fn realize_moved_mount(
         let shown = mount_shown(change, current.as_ref(), staged.flatten().as_ref())
             .await?
             .flatten();
-        let link = Box::pin(open_pinned_link(&repository, node, path)).await?;
+        let link = Box::pin(crate::link::skip_denied(
+            (node.address.context.into(), path.as_str()),
+            open_pinned_link(&repository, node, path),
+        ))
+        .await?;
         remove_link_mount(
             operation,
             &change.from.mapping.repository.filter,
@@ -4477,6 +4499,9 @@ async fn realize_moved_mount(
         .await
         .forward::<SyncError>("Failed removing the subtree the link exposed")?
         .report(path);
+        let Some(link) = link else {
+            return Ok(());
+        };
         operation
             .create_dir_all(path)
             .await
@@ -4495,23 +4520,26 @@ async fn realize_moved_mount(
         return Ok(());
     }
 
-    let link_context = repository
-        .to_link_context(node.address.context.into())
-        .await;
-    crate::link::realize_link_pin_change_boxed(
-        operation,
-        repository,
-        link_context,
-        crate::link::LinkPinRealizeTarget {
-            link_path: change.path().clone(),
-            old_signature: change.from.address.hash,
-            new_signature: node.address.hash,
-            current_node: from_node.child,
-            mount_source: crate::link::LinkMountSource::Node(node.child),
-        },
-        false,
+    let link_id = node.address.context.into();
+    let link_context = repository.to_link_context(link_id).await;
+    crate::link::skip_denied(
+        (link_id, change.path().as_str()),
+        crate::link::realize_link_pin_change_boxed(
+            operation,
+            repository,
+            link_context,
+            crate::link::LinkPinRealizeTarget {
+                link_path: change.path().clone(),
+                old_signature: change.from.address.hash,
+                new_signature: node.address.hash,
+                current_node: from_node.child,
+                mount_source: crate::link::LinkMountSource::Node(node.child),
+            },
+            false,
+        ),
     )
     .await
+    .map(drop)
     .forward::<SyncError>("Failed realizing the subtree a link exposes")
 }
 
@@ -4859,6 +4887,7 @@ async fn create_directory(
 
 /// Clones the link `node` adds at `path` into a mount created there, once the repository it pins
 /// is reached and its pinned revision read, so a link that can't be reached leaves no mount behind.
+/// A linked repository that refuses the caller is left out, as a clone leaves it.
 async fn realize_added_link(
     repository: &Arc<RepositoryContext>,
     operation: &Arc<InstanceOperationImpl>,
@@ -4866,7 +4895,14 @@ async fn realize_added_link(
     path: &RelativePath,
     dry_run: bool,
 ) -> Result<(), SyncError> {
-    let link = open_pinned_link(repository, node, path).await?;
+    let Some(link) = crate::link::skip_denied(
+        (node.address.context.into(), path.as_str()),
+        open_pinned_link(repository, node, path),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
     if !dry_run {
         create_directory(operation, path).await?;
     }

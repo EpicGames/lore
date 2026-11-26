@@ -2143,8 +2143,9 @@ async fn diff_filesystem_linked_directory(
         )
         .await?;
     }
+    let from_link = from_node.linked_node();
     let current_link = current_node.is_link().then(|| current_node.linked_node());
-    let (from, current) = crate::state::cross_links(
+    let crossed = crate::state::cross_links(
         DiffSide {
             repository: ctx.from.repository.clone(),
             state: ctx.from.state.clone(),
@@ -2157,10 +2158,18 @@ async fn diff_filesystem_linked_directory(
                 .as_ref()
                 .map_or(INVALID_NODE, |(node, _)| *node),
         },
-        Some(&from_node.linked_node()),
+        Some(&from_link),
         current_link.as_ref(),
-    )
-    .await?;
+    );
+    let Some((from, current)) =
+        crate::link::skip_denied((from_link.repository, item_path.as_str()), crossed).await?
+    else {
+        // What the mount holds is unknown, so a caller removing it has to hear of anything there.
+        if crate::state::holds_anything(&ctx.operation, &item_path).await {
+            stats.record_unreadable(item_path);
+        }
+        return Ok(());
+    };
     let from_item_states = from_directory_states(ctx, &from_path, &item_path, item_states);
     // The mounts are spelled from the from-side path the walk below compares against.
     let linked_mounts =

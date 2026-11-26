@@ -9984,8 +9984,8 @@ pub struct FilesystemDiffStats {
     /// `DiffWalkStats::finds_after_change` counts them. For tests.
     #[doc(hidden)]
     pub finds_after_change: AtomicU64,
-    /// One directory that cannot be listed, or file or name that cannot be read, which the walk
-    /// passed over, where it passed over any. A file that cannot be read compares as unmodified,
+    /// One directory that cannot be listed, file or name that cannot be read, or link mount whose
+    /// repository refuses the caller, which the walk passed over, where it passed over any. A file that cannot be read compares as unmodified,
     /// so this is all that tells a caller removing it that it may hold work.
     pub unreadable: parking_lot::Mutex<Option<RelativePath>>,
 }
@@ -10692,7 +10692,7 @@ pub(crate) async fn link_mount_work(
 
 /// Whether the working tree holds anything at `path` but an empty directory: an incoming
 /// revision writing there could overwrite it.
-async fn holds_anything(operation: &InstanceOperationImpl, path: &RelativePath) -> bool {
+pub(crate) async fn holds_anything(operation: &InstanceOperationImpl, path: &RelativePath) -> bool {
     match operation.read_directory(path).await {
         Ok(mut listing) => listing.next_with_untracked().await.is_some(),
         Err(_) => !matches!(operation.file_info(path).await, Ok(info) if !info.exists()),

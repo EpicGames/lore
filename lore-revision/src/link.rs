@@ -477,6 +477,39 @@ pub(crate) fn unreachable(id: RepositoryId) -> String {
     format!("Failed to reach linked repository {id}")
 }
 
+/// Whether the linked repository `id` refused the caller earlier in this call.
+pub(crate) fn denied(id: RepositoryId) -> bool {
+    crate::runtime::try_execution_context().is_some_and(|context| context.repository_denied(id))
+}
+
+/// `read` of the repository `id` linked at `path`, or `None` where the repository refuses the
+/// caller, which the rest of the call then skips without reading it again. Any other failure names
+/// the link.
+pub(crate) async fn skip_denied<T, E: ErrorSet + FfiError>(
+    (id, path): (RepositoryId, &str),
+    read: impl Future<Output = Result<T, E>>,
+) -> Result<Option<T>, E> {
+    if denied(id) {
+        return Ok(None);
+    }
+    match read.await {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if is_refusal(&err) => {
+            lore_debug!(
+                "Skipping the link at {}, as linked repository {id} refuses access: {err}",
+                display_path(path)
+            );
+            if let Some(context) = crate::runtime::try_execution_context() {
+                context.deny_repository(id);
+            }
+            Ok(None)
+        }
+        Err(err) => Err(err).forward_any_with(|| {
+            format!("reading linked repository {id} at {}", display_path(path))
+        }),
+    }
+}
+
 pub async fn create_branch(
     repository: Arc<RepositoryContext>,
     remote: Arc<Connection>,
@@ -929,7 +962,8 @@ pub fn group_by<T, K: PartialEq>(
 /// links nested inside them.
 ///
 /// A repository reached through several links is listed once, at the mount
-/// path of the outermost link reaching it.
+/// path of the outermost link reaching it. One that refuses the caller is left
+/// out.
 pub async fn list_with_context(
     repository: Arc<RepositoryContext>,
 ) -> Result<Vec<LinkTarget>, LinkError> {
@@ -1028,7 +1062,8 @@ pub(crate) async fn reach_links<'a>(
 /// and the pins of one level are read [`MAX_CONCURRENT_LINK_TASKS`] at a time.
 ///
 /// Bounded by `MAX_LINK_DEPTH` and the pins already read, so a link cycle terminates. The root of
-/// the walk is never listed.
+/// the walk is never listed. A repository that refuses the caller is left out, with the
+/// repositories reached only through it.
 #[lore_macro::test_pub]
 pub(crate) async fn collect_with_context(
     root: &Arc<RepositoryContext>,
@@ -1043,6 +1078,10 @@ pub(crate) async fn collect_with_context(
     let mut level = walk.add(root, first_level).await;
     loop {
         if level.is_empty() {
+            let reachable = reachable_around(&walk.reached, denied);
+
+            walk.reached
+                .retain(|linked| reachable.contains(&linked.repository));
             return Ok(walk.reached);
         }
         let reads = level
@@ -1052,9 +1091,15 @@ pub(crate) async fn collect_with_context(
                 let reach = &linked.reaches[reach];
                 let context = &linked.context;
                 async move {
-                    let state = State::deserialize(context.clone(), reach.pin)
-                        .await
-                        .forward_with::<LinkError, _>(|| unreachable(reach.repository))?;
+                    let Some(state) = skip_denied(
+                        (reach.repository, &reach.mount_path),
+                        State::deserialize(context.clone(), reach.pin),
+                    )
+                    .await
+                    .forward::<LinkError>("Failed deserializing state")?
+                    else {
+                        return Ok(None);
+                    };
                     let nested = if reach.depth < crate::state::MAX_LINK_DEPTH {
                         let links = state
                             .link_list(context.clone())
@@ -1069,7 +1114,7 @@ pub(crate) async fn collect_with_context(
                     } else {
                         Vec::new()
                     };
-                    Ok::<_, LinkError>((state.revision_number(), nested))
+                    Ok::<_, LinkError>(Some((state.revision_number(), nested)))
                 }
             })
             .collect();
@@ -1077,7 +1122,10 @@ pub(crate) async fn collect_with_context(
         let read = Box::pin(try_join_links(reads)).await?;
 
         let mut next = Vec::new();
-        for (&(position, reach), (number, nested)) in level.iter().zip(read) {
+        for (&(position, reach), read) in level.iter().zip(read) {
+            let Some((number, nested)) = read else {
+                continue;
+            };
             let mut linked: Vec<RepositoryId> = nested
                 .iter()
                 .map(|link| link.repository)
@@ -1096,6 +1144,34 @@ pub(crate) async fn collect_with_context(
         }
         level = next;
     }
+}
+
+/// The repositories of `reached` that links reach from the root of the walk without passing through
+/// a repository that is `skipped`.
+pub(crate) fn reachable_around<'a>(
+    reached: impl IntoIterator<Item = &'a ReachedRepository>,
+    skipped: impl Fn(RepositoryId) -> bool,
+) -> HashSet<RepositoryId> {
+    let by_id: HashMap<RepositoryId, &ReachedRepository> = reached
+        .into_iter()
+        .map(|linked| (linked.repository, linked))
+        .collect();
+    let mut pending: Vec<RepositoryId> = by_id
+        .values()
+        .filter(|linked| {
+            !skipped(linked.repository) && linked.reaches.iter().any(|reach| reach.depth == 1)
+        })
+        .map(|linked| linked.repository)
+        .collect();
+    let mut reachable: HashSet<RepositoryId> = pending.iter().copied().collect();
+    while let Some(holder) = pending.pop() {
+        for &below in by_id[&holder].pins.iter().flat_map(|pin| &pin.linked) {
+            if by_id.contains_key(&below) && !skipped(below) && reachable.insert(below) {
+                pending.push(below);
+            }
+        }
+    }
+    reachable
 }
 
 /// The repositories a walk over nested links reached, and the pins it read.
@@ -2551,9 +2627,16 @@ pub async fn is_staged_link_update(
 
     let link = staged_node.linked_node();
     let linked_repository = parent_repository.to_link_context(link.repository).await;
-    let linked_state = State::deserialize(linked_repository.clone(), link.revision)
-        .await
-        .forward::<LinkError>("Failed deserializing linked state")?;
+    // A pin the caller cannot read was staged from elsewhere, never by a stage in the link.
+    let Some(linked_state) = skip_denied(
+        (link.repository, ""),
+        State::deserialize(linked_repository.clone(), link.revision),
+    )
+    .await
+    .forward::<LinkError>("Failed deserializing linked state")?
+    else {
+        return Ok(true);
+    };
     let has_staged_children = linked_state
         .node_has_staged_children(linked_repository, link.node)
         .await
@@ -3136,7 +3219,14 @@ pub async fn check_incoming_mount_overlaps(
 
         let link_id: RepositoryId = node.address.context.into();
         let link_context = repository.to_link_context(link_id).await;
-        let source_path = pinned_source_path(link_context.clone(), &node).await?;
+        let Some(source_path) = skip_denied(
+            (link_id, change.path().as_str()),
+            pinned_source_path(link_context.clone(), &node),
+        )
+        .await?
+        else {
+            continue;
+        };
 
         check_source_path_overlap(
             state_target,

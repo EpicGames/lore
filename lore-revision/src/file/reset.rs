@@ -3215,20 +3215,39 @@ async fn reset_walk_link(
 
     let link = node.linked_node();
     let linked_repository = repository.to_link_context(link.repository).await;
-    let linked_state_current = state::State::deserialize(linked_repository.clone(), link.revision)
-        .await
-        .forward::<ResetError>("Failed to deserialize revision state")?;
-
-    let linked_state_staged = match state_staged
+    let staged_pin = match state_staged
         .locate_node(repository.clone(), relative_path.as_str())
         .await
     {
         Ok(staged) if staged.identity().repository == link.repository => {
-            state::State::deserialize(linked_repository.clone(), staged.identity().revision)
-                .await
-                .forward::<ResetError>("Failed to deserialize revision state")?
+            Some(staged.identity().revision)
         }
-        _ => linked_state_current.clone(),
+        _ => None,
+    };
+    let Some(linked_state_current) = crate::link::skip_denied(
+        (link.repository, relative_path.as_str()),
+        state::State::deserialize(linked_repository.clone(), link.revision),
+    )
+    .await
+    .forward::<ResetError>("Failed to deserialize revision state")?
+    else {
+        return Ok(());
+    };
+
+    let linked_state_staged = match staged_pin {
+        Some(pin) => {
+            let Some(staged) = crate::link::skip_denied(
+                (link.repository, relative_path.as_str()),
+                state::State::deserialize(linked_repository.clone(), pin),
+            )
+            .await
+            .forward::<ResetError>("Failed to deserialize revision state")?
+            else {
+                return Ok(());
+            };
+            staged
+        }
+        None => linked_state_current.clone(),
     };
 
     stats.directory_reset_count.fetch_add(1, Ordering::Relaxed);

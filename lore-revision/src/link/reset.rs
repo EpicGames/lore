@@ -127,18 +127,22 @@ async fn drop_staged_link(
 ) -> Result<(), LinkError> {
     let link_id = staged_link_node.linked_node().repository;
     if !execution_context().globals().dry_run() {
-        link::realize_link_pin_change_boxed(
-            operation,
-            at.repository.clone(),
-            at.repository.to_link_context(link_id).await,
-            link::LinkPinRealizeTarget {
-                link_path: at.path.clone(),
-                old_signature: staged_link_node.address.hash,
-                new_signature: Hash::default(),
-                current_node: staged_link_node.child,
-                mount_source: link::LinkMountSource::Node(ROOT_NODE),
-            },
-            overwrite_local,
+        // A staged pin the caller cannot read was never realized, so the mount holds none of it.
+        link::skip_denied(
+            (link_id, at.path.as_str()),
+            link::realize_link_pin_change_boxed(
+                operation,
+                at.repository.clone(),
+                at.repository.to_link_context(link_id).await,
+                link::LinkPinRealizeTarget {
+                    link_path: at.path.clone(),
+                    old_signature: staged_link_node.address.hash,
+                    new_signature: Hash::default(),
+                    current_node: staged_link_node.child,
+                    mount_source: link::LinkMountSource::Node(ROOT_NODE),
+                },
+                overwrite_local,
+            ),
         )
         .await?;
     }
@@ -335,18 +339,23 @@ pub(crate) async fn reset_staged_update_link(
         .forward::<LinkError>("Failed to find link registry entry")?;
 
     if staged_pin != current_pin || !staged_link_node.mounts_same_source(&current_link_node) {
-        link::realize_link_pin_change_boxed(
-            operation,
-            repository.clone(),
-            repository.to_link_context(link_id).await,
-            link::LinkPinRealizeTarget {
-                link_path,
-                old_signature: staged_pin,
-                new_signature: current_pin,
-                current_node: staged_link_node.child,
-                mount_source: link::LinkMountSource::Node(current_link_node.child),
-            },
-            overwrite_local,
+        // A staged pin the caller cannot read was never realized, so the mount still holds the
+        // current pin.
+        link::skip_denied(
+            (link_id, link_path.as_str()),
+            link::realize_link_pin_change_boxed(
+                operation,
+                repository.clone(),
+                repository.to_link_context(link_id).await,
+                link::LinkPinRealizeTarget {
+                    link_path: link_path.clone(),
+                    old_signature: staged_pin,
+                    new_signature: current_pin,
+                    current_node: staged_link_node.child,
+                    mount_source: link::LinkMountSource::Node(current_link_node.child),
+                },
+                overwrite_local,
+            ),
         )
         .await?;
     }

@@ -6,7 +6,6 @@ use lore_error_set::prelude::*;
 use serde::Serialize;
 
 use super::LinkError;
-use crate::errors::is_refusal;
 use crate::event;
 use crate::event::LoreLinkEntryEventData;
 use crate::interface::LoreString;
@@ -72,10 +71,14 @@ async fn list_recursive(
 
         let resolved_branch = link_reference.resolve_branch(parent_branch);
 
-        let described =
-            super::describe_link(link_context.clone(), link_reference.signature, &local_node)
-                .await
-                .forward_with::<LinkError, _>(|| super::unreachable(link_reference.repository))?;
+        let Some(described) = super::skip_denied(
+            (link_reference.repository, &full_path),
+            super::describe_link(link_context.clone(), link_reference.signature, &local_node),
+        )
+        .await?
+        else {
+            continue;
+        };
 
         event::LoreEvent::LinkEntry(LoreLinkEntryEventData {
             link: link_reference.repository,
@@ -191,16 +194,14 @@ async fn list_staged_recursive(
         };
 
         let link_repository = repository.to_link_context(link_ref.repository).await;
-        let link_state = match State::deserialize(link_repository.clone(), link_ref.signature)
-            .await
-            .forward_with::<LinkError, _>(|| super::unreachable(link_ref.repository))
-        {
-            Ok(link_state) => link_state,
-            Err(err) if !node.is_staged() && is_refusal(&err) => {
-                lore_debug!("Skipping the link at {full_path}, which has nothing staged: {err}");
-                continue;
-            }
-            Err(err) => return Err(err),
+        let Some(link_state) = super::skip_denied(
+            (link_ref.repository, &full_path),
+            State::deserialize(link_repository.clone(), link_ref.signature),
+        )
+        .await
+        .forward::<LinkError>("Failed deserializing state")?
+        else {
+            continue;
         };
 
         if node.is_staged() && !node.is_staged_add() {

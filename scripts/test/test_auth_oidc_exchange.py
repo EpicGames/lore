@@ -22,7 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from error_types import LoreException, ProtectedError
+from error_types import LocalModificationsError, LoreException
 from lore_parsers import parse_jsonl
 from lore_server import (
     _kill_server_by_pid,
@@ -373,12 +373,12 @@ def test_a_lookup_by_name_does_not_open_an_ungranted_partition(
 
 @pytest.mark.smoke
 @pytest.mark.parametrize("pin_form", [None, *PIN_FORMS])
-def test_a_link_to_an_ungranted_repository_points_at_requesting_access(
+def test_a_link_to_an_ungranted_repository_is_refused_naming_it(
     exchange_env, make_repo, new_lore_repo, scratch_dir, pin_form
 ):
     """Adding a link to a repository the stub grants nothing on, at its latest
-    or pinned without branching, fails as an authorization failure, names the
-    linked repository, and says how to get access. The parent runs from a
+    or pinned without branching, fails as an authorization failure naming the
+    linked repository, with no access hint. The parent runs from a
     token store of its own, which holds no partition token from the linked
     repository's push."""
     provider = exchange_env.provider
@@ -398,16 +398,16 @@ def test_a_link_to_an_ungranted_repository_points_at_requesting_access(
     with pytest.raises(LoreException) as denied:
         parent.link_add("lib", linked_id, "/", pin=pin, disable_branching=bool(pin))
 
-    assert_points_at_requesting_access(denied.value, linked_id)
+    assert_refused_naming(denied.value, linked_id)
 
 
 @pytest.mark.smoke
-def test_a_link_that_cannot_branch_the_linked_repository_points_at_requesting_access(
+def test_a_link_that_cannot_branch_the_linked_repository_is_refused_naming_it(
     exchange_env, make_repo, new_lore_repo, scratch_dir
 ):
     """Adding a link from a branch the linked repository lacks, with only read
     access to that repository, fails as an authorization failure when creating
-    the branch there, names the linked repository, and says how to get access."""
+    the branch there, naming the linked repository."""
     provider = exchange_env.provider
     linked, linked_id = granted_repository(exchange_env, make_repo)
     seed_commit_and_push(linked)
@@ -425,16 +425,17 @@ def test_a_link_that_cannot_branch_the_linked_repository_points_at_requesting_ac
     with pytest.raises(LoreException) as denied:
         parent.link_add("lib", linked_id, "/")
 
-    assert_points_at_requesting_access(denied.value, linked_id)
+    assert_refused_naming(denied.value, linked_id)
 
 
 def denied_clone_of_a_link(
-    exchange_env, make_repo, new_lore_repo, scratch_dir
+    exchange_env, make_repo, new_lore_repo, scratch_dir, prepare=None
 ) -> tuple[Lore, str, Lore, Lore]:
     """A fresh clone of a parent that linked a repository while the stub
     granted it, made after the grant is revoked, the linked repository's id,
     the linked repository, and the parent. The clone runs from a token store of its own, which
-    holds no partition token from the link's addition."""
+    holds no partition token from the link's addition. `prepare(linked, parent)` runs once the
+    link is pushed, while the grant still holds."""
     provider = exchange_env.provider
     linked, linked_id = granted_repository(exchange_env, make_repo)
     seed_commit_and_push(linked)
@@ -443,6 +444,8 @@ def denied_clone_of_a_link(
     parent.link_add("lib", linked_id, "/")
     parent.commit("link lib")
     parent.push()
+    if prepare:
+        prepare(linked, parent)
     del provider.grants[linked_id]
 
     denied = client_with_own_token_store(
@@ -453,54 +456,70 @@ def denied_clone_of_a_link(
     return denied, linked_id, linked, parent
 
 
-def assert_points_at_requesting_access(refused: LoreException, linked_id: str):
+def assert_refused_naming(refused: LoreException, linked_id: str):
     output = str(refused)
+    assert refused.returncode in (16, 17), output
     assert f"linked repository {linked_id}" in output, output
-    assert "Request access to it" in output, output
+    assert "Request access" not in output, output
 
 
 @pytest.mark.smoke
-def test_listing_a_link_to_a_repository_no_longer_granted_points_at_requesting_access(
+def test_listing_links_from_a_clone_without_access_to_one_lists_the_others(
     exchange_env, make_repo, new_lore_repo, scratch_dir
 ):
-    """Listing links from a clone without access to the linked repository
-    fails as an authorization failure, names the linked repository, and says
-    how to get access."""
-    denied, linked_id, _, _ = denied_clone_of_a_link(
+    """Listing links from a clone without access to one linked repository
+    lists the link it can read, and lists both once access is granted again."""
+    denied, linked_id, _, parent = denied_clone_of_a_link(
         exchange_env, make_repo, new_lore_repo, scratch_dir
     )
+    app, app_id = granted_repository(exchange_env, make_repo)
+    seed_commit_and_push(app)
+    parent.link_add("app", app_id, "/")
+    parent.commit("link app")
+    parent.push()
+    denied.sync()
 
-    with pytest.raises(LoreException) as refused:
-        denied.link_list()
+    def listed() -> list[tuple[str, str]]:
+        links = parse_jsonl(denied.link_list(json=True), "linkEntry")
+        return sorted((link["linkPath"], link["link"]) for link in links)
 
-    assert_points_at_requesting_access(refused.value, linked_id)
+    assert listed() == [("app", app_id)]
+    exchange_env.provider.grants[linked_id] = GRANTED
+    assert listed() == [("app", app_id), ("lib", linked_id)]
 
 
 @pytest.mark.smoke
-def test_updating_a_link_to_a_repository_no_longer_granted_points_at_requesting_access(
+def test_updating_or_removing_a_link_to_a_repository_no_longer_granted_is_refused_naming_it(
     exchange_env, make_repo, new_lore_repo, scratch_dir
 ):
-    """Updating a link from a clone without access to the linked repository
-    fails as an authorization failure, names the linked repository, and says
-    how to get access."""
-    denied, linked_id, _, _ = denied_clone_of_a_link(
+    """Updating or removing a link from a clone without access to the linked
+    repository fails as an authorization failure naming the linked repository
+    and the link's path, and leaves the link in place."""
+    denied, linked_id, _, parent = denied_clone_of_a_link(
         exchange_env, make_repo, new_lore_repo, scratch_dir
     )
 
-    with pytest.raises(LoreException) as refused:
-        denied.link_update("lib")
+    for change in (denied.link_update, denied.link_remove):
+        with pytest.raises(LoreException) as refused:
+            change("lib")
 
-    assert_points_at_requesting_access(refused.value, linked_id)
+        assert_refused_naming(refused.value, linked_id)
+    assert "lib" in str(refused.value)
+    commit_a_file(denied, "a.txt", "edit\n")
+    denied.push()
+    parent.sync()
+    links = parse_jsonl(parent.link_list(json=True), "linkEntry")
+    assert [link["linkPath"] for link in links] == ["lib"]
 
 
 @pytest.mark.smoke
 @pytest.mark.parametrize("pin_form", PIN_FORMS)
-def test_updating_a_link_to_a_pin_in_a_repository_no_longer_granted_points_at_requesting_access(
+def test_updating_a_link_to_a_pin_in_a_repository_no_longer_granted_is_refused_naming_it(
     exchange_env, make_repo, new_lore_repo, scratch_dir, pin_form
 ):
     """Updating a link to a pinned revision or branch latest from a clone
-    without access to the linked repository fails as an authorization failure,
-    names the linked repository, and says how to get access."""
+    without access to the linked repository fails as an authorization failure
+    naming the linked repository."""
     denied, linked_id, linked, _ = denied_clone_of_a_link(
         exchange_env, make_repo, new_lore_repo, scratch_dir
     )
@@ -509,7 +528,7 @@ def test_updating_a_link_to_a_pin_in_a_repository_no_longer_granted_points_at_re
     with pytest.raises(LoreException) as refused:
         denied.link_update("lib", pin=pin)
 
-    assert_points_at_requesting_access(refused.value, linked_id)
+    assert_refused_naming(refused.value, linked_id)
 
 
 @pytest.mark.smoke
@@ -581,6 +600,257 @@ def test_a_commit_in_a_clone_without_access_to_a_linked_repository_reports_only_
 
 
 @pytest.mark.smoke
+def test_a_clone_without_access_to_a_linked_repository_works_around_the_link(
+    exchange_env, make_repo, new_lore_repo, scratch_dir
+):
+    """A clone without access to a linked repository syncs, switches branches,
+    reverts, scans and resets the files around the link, leaving what the
+    link's directory holds."""
+    denied, _, _, parent = denied_clone_of_a_link(
+        exchange_env, make_repo, new_lore_repo, scratch_dir
+    )
+    commit_a_file(parent, "a.txt", "main\n")
+    parent.push()
+    parent.branch_create("other")
+    commit_a_file(parent, "b.txt", "other\n")
+    parent.push()
+
+    def edit_a() -> None:
+        with denied.open_file("a.txt", "w+") as f:
+            f.write("edited\n")
+
+    denied.sync()
+    assert denied.read_files()["a.txt"] == "main\n"
+    denied.branch_switch("other")
+    assert denied.read_files()["b.txt"] == "other\n"
+
+    Path(denied.path, "lib").mkdir(exist_ok=True)
+    with denied.open_file("lib/x.txt", "w+") as f:
+        f.write("x\n")
+    edit_a()
+    assert "M a.txt" in denied.status(scan=True)
+    denied.reset()
+    assert denied.read_files()["a.txt"] == "main\n"
+    edit_a()
+    denied.sync(reset=True)
+    files = denied.read_files()
+    assert (files["a.txt"], files["lib/x.txt"]) == ("main\n", "x\n")
+
+    denied.revision_revert(denied.branch_info().local_latest, message="revert b")
+    assert "b.txt" not in denied.read_files()
+
+
+def repin(linked: Lore, parent: Lore, name: str) -> None:
+    commit_a_file(linked, f"{name}.txt", f"{name}\n")
+    linked.push()
+    parent.link_update("lib", pin=linked.branch_info().local_latest)
+    parent.commit(f"repin lib to {name}")
+    parent.push()
+
+
+@pytest.mark.smoke
+def test_a_clone_without_access_to_a_linked_repository_takes_pins_others_moved(
+    exchange_env, make_repo, new_lore_repo, scratch_dir
+):
+    """A branch switch, a sync, with and without a reset, and a revert that
+    move the pin of a link the clone cannot read succeed, leaving what the
+    link's directory holds."""
+
+    def branch_then_repin(linked: Lore, parent: Lore) -> None:
+        parent.branch_create("before-repin")
+        parent.push()
+        parent.branch_switch("main")
+        repin(linked, parent, "first")
+
+    denied, linked_id, linked, parent = denied_clone_of_a_link(
+        exchange_env, make_repo, new_lore_repo, scratch_dir, branch_then_repin
+    )
+    exchange_env.provider.grants[linked_id] = GRANTED
+    repin(linked, parent, "second")
+    del exchange_env.provider.grants[linked_id]
+    Path(denied.path, "lib").mkdir(exist_ok=True)
+    with denied.open_file("lib/x.txt", "w+") as f:
+        f.write("x\n")
+
+    denied.branch_switch("before-repin")
+    assert denied.branch_info().name == "before-repin"
+    denied.branch_switch("main")
+    denied.sync()
+    assert denied.branch_info().local_latest == parent.branch_info().local_latest
+    denied.sync(reset=True)
+    assert denied.read_files()["lib/x.txt"] == "x\n"
+    assert "Committed reverted repository state" in denied.revision_revert(
+        denied.branch_info().local_latest, message="unpin"
+    )
+
+
+@pytest.mark.smoke
+def test_a_sync_removing_a_link_around_one_the_clone_cannot_read_keeps_what_its_mount_holds(
+    exchange_env, make_repo, new_lore_repo, scratch_dir
+):
+    """A sync removing a link that holds a link the clone cannot read keeps
+    the outer mount while the inner one holds files, and removes it once the
+    inner mount is empty."""
+    provider = exchange_env.provider
+    inner, inner_id = granted_repository(exchange_env, make_repo)
+    seed_commit_and_push(inner)
+    outer, outer_id = granted_repository(exchange_env, make_repo)
+    seed_commit_and_push(outer)
+    outer.link_add("inner", inner_id, "/")
+    outer.commit("link inner")
+    outer.push()
+    parent, _ = granted_repository(exchange_env, make_repo)
+    seed_commit_and_push(parent)
+    parent.link_add("lib", outer_id, "/")
+    parent.commit("link lib")
+    parent.push()
+    del provider.grants[inner_id]
+    denied = client_with_own_token_store(
+        exchange_env, new_lore_repo, scratch_dir, "denied-auth-store"
+    )
+    Path(denied.path).mkdir()
+    denied.run(["repository", "clone", parent.remote_path, denied.path])
+    Path(denied.path, "lib", "inner").mkdir(exist_ok=True)
+    with denied.open_file("lib/inner/x.txt", "w+") as f:
+        f.write("x\n")
+    provider.grants[inner_id] = GRANTED
+    parent.link_remove("lib")
+    parent.commit("unlink lib")
+    parent.push()
+    del provider.grants[inner_id]
+
+    with pytest.raises(LocalModificationsError):
+        denied.sync()
+    assert denied.read_files()["lib/inner/x.txt"] == "x\n"
+    denied.remove_file("lib/inner/x.txt")
+    denied.sync()
+
+    assert denied.branch_info().local_latest == parent.branch_info().local_latest
+    assert "lib/seed.txt" not in denied.read_files()
+
+
+@pytest.mark.smoke
+def test_a_reset_in_a_clone_that_lost_access_skips_a_link_staged_at_a_pin_it_cannot_read(
+    exchange_env, make_repo, new_lore_repo, scratch_dir
+):
+    """A reset in a clone that held a link's pin before losing access to the
+    linked repository, with a merge staging a pin it never read, leaves the
+    link's mount alone."""
+    provider = exchange_env.provider
+    linked, linked_id = granted_repository(exchange_env, make_repo)
+    seed_commit_and_push(linked)
+    parent, _ = granted_repository(exchange_env, make_repo)
+    seed_commit_and_push(parent)
+    parent.link_add("lib", linked_id, "/")
+    parent.commit("link lib")
+    parent.push()
+    parent.branch_create("feature")
+    parent.push()
+    repin(linked, parent, "first")
+    parent.branch_switch("main")
+    commit_a_file(parent, "m.txt", "m\n")
+    parent.push()
+    clone = client_with_own_token_store(
+        exchange_env, new_lore_repo, scratch_dir, "granted-auth-store"
+    )
+    Path(clone.path).mkdir()
+    clone.run(["repository", "clone", parent.remote_path, clone.path])
+    assert clone.read_files()["lib/seed.txt"] == "seed\n"
+    del provider.grants[linked_id]
+    clone.environment_vars["LORE_AUTH_PATH"] = str(
+        scratch_dir("denied-auth-store", create=True)
+    )
+    clone.run(urc_args=["auth", "login", exchange_env.remote_url, "--no-browser"])
+    clone.branch_merge_start("feature", no_commit=True)
+
+    clone.reset(".")
+
+    assert clone.read_files()["lib/seed.txt"] == "seed\n"
+
+
+@pytest.mark.smoke
+def test_a_switch_in_a_clone_that_lost_access_leaves_a_folder_link_pinned_where_it_cannot_read(
+    exchange_env, make_repo, new_lore_repo, scratch_dir
+):
+    """A switch in a clone that lost access to a linked repository, from a pin
+    of a folder link it never read to one it holds, succeeds."""
+    provider = exchange_env.provider
+    linked, linked_id = granted_repository(exchange_env, make_repo)
+    Path(linked.path, "a").mkdir()
+    commit_a_file(linked, "a/a.txt", "a\n")
+    linked.push()
+    parent, _ = granted_repository(exchange_env, make_repo)
+    seed_commit_and_push(parent)
+    parent.link_add("lib", linked_id, "/a")
+    parent.commit("link lib")
+    parent.push()
+    parent.branch_create("other")
+    parent.push()
+    repin(linked, parent, "other")
+    parent.branch_switch("main")
+    clone = client_with_own_token_store(
+        exchange_env, new_lore_repo, scratch_dir, "granted-auth-store"
+    )
+    Path(clone.path).mkdir()
+    clone.run(["repository", "clone", parent.remote_path, clone.path])
+    clone.branch_switch("other")
+    clone.branch_switch("main")
+    del provider.grants[linked_id]
+    clone.environment_vars["LORE_AUTH_PATH"] = str(
+        scratch_dir("denied-auth-store", create=True)
+    )
+    clone.run(urc_args=["auth", "login", exchange_env.remote_url, "--no-browser"])
+    provider.grants[linked_id] = GRANTED
+    repin(linked, parent, "main")
+    del provider.grants[linked_id]
+    clone.sync()
+
+    clone.branch_switch("other")
+
+    assert clone.branch_info().name == "other"
+
+
+@pytest.mark.smoke
+def test_a_sync_replacing_a_link_with_one_the_clone_cannot_read_removes_the_old_mount(
+    exchange_env, make_repo, new_lore_repo, scratch_dir
+):
+    """A sync that replaces a link with one to a repository the clone cannot
+    read removes the replaced link's mount, and a switch back to a branch
+    holding the replaced link materializes it again."""
+    provider = exchange_env.provider
+    readable, readable_id = granted_repository(exchange_env, make_repo)
+    refusing, refusing_id = granted_repository(exchange_env, make_repo)
+    parent, _ = granted_repository(exchange_env, make_repo)
+    for repo in (readable, refusing, parent):
+        seed_commit_and_push(repo)
+    parent.link_add("lib", readable_id, "/")
+    parent.commit("link lib")
+    parent.push()
+    parent.branch_create("readable")
+    parent.push()
+    parent.branch_switch("main")
+    parent.link_remove("lib")
+    parent.link_add("lib", refusing_id, "/")
+    parent.commit("relink lib")
+    del provider.grants[refusing_id]
+    clone = client_with_own_token_store(
+        exchange_env, new_lore_repo, scratch_dir, "denied-auth-store"
+    )
+    Path(clone.path).mkdir()
+    clone.run(["repository", "clone", parent.remote_path, clone.path])
+    clone.branch_switch("readable")
+    assert clone.read_files()["lib/seed.txt"] == "seed\n"
+    parent.push()
+
+    clone.branch_switch("main")
+
+    assert clone.branch_info().local_latest == parent.branch_info().local_latest
+    assert sorted(clone.read_files()) == ["seed.txt"]
+    clone.branch_switch("readable")
+    assert clone.read_files()["lib/seed.txt"] == "seed\n"
+
+
+@pytest.mark.smoke
 def test_a_push_repinning_a_link_the_token_cannot_read_is_refused_naming_it(
     exchange_env, make_repo
 ):
@@ -615,41 +885,51 @@ def test_a_push_repinning_a_link_the_token_cannot_read_is_refused_naming_it(
 
 
 @pytest.mark.smoke
-def test_a_branch_create_linked_repositories_refuse_names_them_and_takes_back_the_rest(
+def test_a_branch_create_skips_the_linked_repositories_that_refuse_it_and_keeps_their_pins(
     exchange_env, make_repo
 ):
     """A branch create whose token grants nothing on two linked repositories
-    fails with the first refusal, names both links, deletes the branch it made
-    in the other linked repository, and leaves the parent on its branch."""
+    switches the parent to the new branch, makes it in the other linked
+    repository, takes it back from a repository linked only below a refusing
+    one, and leaves the links to the two at their pins and branch."""
     provider = exchange_env.provider
     parent, parent_id = granted_repository(exchange_env, make_repo)
     healthy, healthy_id = granted_repository(exchange_env, make_repo)
     refusing = [granted_repository(exchange_env, make_repo)[0] for _ in range(2)]
-    for repo in (parent, healthy, *refusing):
+    nested, nested_id = granted_repository(exchange_env, make_repo)
+    for repo in (parent, healthy, nested, *refusing):
         seed_commit_and_push(repo)
+    refusing[0].link_add("nested", nested_id, "/")
+    refusing[0].commit("Link nested")
+    refusing[0].push()
     parent.link_add("vendor/healthy", healthy.get_id(), "/")
     for position, repo in enumerate(refusing):
         parent.link_add(f"vendor/refusing{position}", repo.get_id(), "/")
     parent.commit("Link three repositories")
     parent.push()
+    pins = {repo.get_id(): repo.branch_info().local_latest for repo in refusing}
     scoped = provider.mint_token(
         USER,
         resources=[
             {"resource_id": f"urc-{repo_id}", "permission": GRANTED}
-            for repo_id in (parent_id, healthy_id)
+            for repo_id in (parent_id, healthy_id, nested_id)
         ],
     )
     branch_id = uuid.uuid4().hex
 
-    with pytest.raises(ProtectedError) as refused:
-        parent.branch_create(
-            "feature", id=branch_id, identity_token=scoped, access_token=scoped
-        )
+    parent.branch_create(
+        "feature", id=branch_id, identity_token=scoped, access_token=scoped
+    )
 
-    assert refused.value.returncode == 17, "the refusal must keep its exit code"
-    for position in range(2):
-        assert f"linked repository at vendor/refusing{position}" in str(refused.value)
-    assert parent.branch_info().name == "main", "the parent must stay on its branch"
-    assert "Restoring deleted branch 'feature'" in healthy.branch_create(
+    assert parent.branch_info().name == "feature"
+    assert healthy.branch_info("feature").id == branch_id
+    assert "Restoring deleted branch 'feature'" in nested.branch_create(
         "feature", id=branch_id
-    ), "the branch made in the healthy linked repository must have been deleted"
+    ), "the branch made below a refusing repository must have been taken back"
+    main = parent.branch_info("main").id
+    links = parse_jsonl(parent.link_list(json=True), "linkEntry")
+    assert {
+        link["link"]: (link["revision"], link["branch"])
+        for link in links
+        if link["link"] in pins
+    } == {repo_id: (pin, main) for repo_id, pin in pins.items()}
