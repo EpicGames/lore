@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
@@ -166,6 +167,7 @@ pub struct RepositoryCreateArgs {
     shared_store_path: Option<String>,
 }
 
+#[lore_macro::test_pub]
 #[derive(Args)]
 pub struct RepositoryCloneArgs {
     /// URL of repository
@@ -240,6 +242,14 @@ pub struct RepositoryCloneArgs {
     /// Maximum dependency traversal depth (0 means unlimited)
     #[clap(long, value_name = "depth", default_value = "0")]
     dependency_depth_limit: u32,
+
+    /// Fragments the new instance's store holds before eviction removes some, defaults to 2000000. The periodic eviction pass treats a value below 1048576 as 1048576. Ignored over a shared store and with --no-tracking
+    #[clap(long, value_name = "fragments")]
+    max_capacity: Option<NonZeroU64>,
+
+    /// Bytes the new instance's store holds before compaction reclaims space, defaults to 10 GiB. Ignored over a shared store and with --no-tracking
+    #[clap(long, value_name = "bytes")]
+    max_size: Option<NonZeroU64>,
 }
 
 #[derive(Args)]
@@ -377,7 +387,7 @@ pub enum RepositoryCommands {
     /// staging and committing write to, so both work without the remote, and fails if it cannot. A
     /// bare or virtual instance writes no files and reads them from the remote when a command needs
     /// them.
-    Clone(RepositoryCloneArgs),
+    Clone(Box<RepositoryCloneArgs>),
 
     /// Delete a repository
     Delete(RepositoryDeleteArgs),
@@ -1138,6 +1148,8 @@ pub fn handle_repository_clone(globals: LoreGlobalArgs, args: &RepositoryCloneAr
         ),
         dependency_recursive: args.dependency_recursive.into(),
         dependency_depth_limit: args.dependency_depth_limit,
+        max_capacity: args.max_capacity.map_or(0, NonZeroU64::get),
+        max_size: args.max_size.map_or(0, NonZeroU64::get),
     };
 
     let start = std::time::Instant::now();

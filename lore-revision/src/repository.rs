@@ -264,6 +264,17 @@ impl StoreConfig {
         }
     }
 
+    /// [`Self::client_default`], with `max_capacity` fragments and `max_size` bytes in place of the
+    /// default limits where they are not 0.
+    pub fn client_default_with_limits(max_capacity: u64, max_size: u64) -> Self {
+        StoreConfig {
+            max_capacity: (max_capacity != 0).then_some(max_capacity as usize),
+            max_size: (max_size != 0).then_some(max_size as usize),
+            ..StoreConfig::default()
+        }
+        .with_default_limits()
+    }
+
     /// This config, with the limits and delays it leaves out taken from [`Self::client_default`].
     pub fn with_default_limits(&self) -> Self {
         let default = Self::client_default();

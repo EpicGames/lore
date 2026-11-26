@@ -65,7 +65,13 @@ An instance over a shared store collects to the shared store's limits, not these
 
 Eviction removes only content the remote also holds, which Lore fetches again when it's next read. Content held only locally, such as commits not yet pushed, counts toward both limits but is never evicted. Once it fills about 70% of a limit, eviction removes the remote content cached beside it. The store keeps its packfiles in 256 groups, and compaction rewrites a group's packfiles only once at least 10% of their bytes are no longer referenced.
 
-The **Default** column shows the value `lore repository create` and `lore clone` write into a freshly generated `config.toml`. A new repository's `[store]` table already contains every field but `verify_write` and `cache_payloads` at these values, so editing the file means changing values that are already present rather than adding missing ones.
+The **Default** column shows the value `lore repository create` and `lore clone` write into a freshly generated `config.toml`. `lore clone --max-capacity` and `--max-size` write the given limits in place of the defaults, except over a shared store or with `--no-tracking`, where the clone writes the defaults and warns that the options had no effect. A new repository's `[store]` table already contains every field but `verify_write` and `cache_payloads` at these values, so editing the file means changing values that are already present rather than adding missing ones.
+
+A clone puts about 2.8 fragments per file into the store. A clone that fetches more fragments than `max_capacity` evicts part way through, and each eviction pass writes the index buckets it changes while the clone writes its files. A `--max-capacity` above what the clone fetches keeps the store from evicting during the clone, and the instance keeps the larger store afterwards. In one measured clone of 1,162,160 files, the store kept 3,254,903 fragments, against 1.4 to 1.5 million under the default limit:
+
+- the instance's `.lore` directory took 771 MB, against 585 to 599 MB;
+- `lore repository gc` took 15 s and at most 0.7 GiB of memory and evicted nothing. Over the default instance, a first pass took 51 s to evict 154,575 fragments, and a second pass took 9 s and 0.3 GiB;
+- `lore status` took about 2 s on both.
 
 #### `verify_write`
 

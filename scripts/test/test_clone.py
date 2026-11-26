@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import time
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -61,6 +62,27 @@ def test_clone_status_behind_remote_not_divergent(new_lore_repo):
         f"Status must NOT report local ahead — clone_a has no local commits "
         f"beyond what the remote has: {entry}"
     )
+
+
+@pytest.mark.smoke
+@pytest.mark.own_vfs(
+    "reads the [store] config of an instance with a store of its own, which a virtual clone, "
+    "over a shared store, does not have"
+)
+def test_clone_writes_the_store_limits_it_is_given(new_lore_repo):
+    """`--max-capacity` and `--max-size` are the new instance's store limits."""
+    repo: Lore = new_lore_repo()
+    with repo.open_file("seed.txt", "w+") as f:
+        f.write("seed\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit("Seed", offline=True)
+    repo.push()
+
+    clone = repo.clone(max_capacity=50_000_000, max_size=1 << 40)
+
+    config = tomllib.loads((Path(clone.dot_path()) / "config.toml").read_text(encoding="utf-8"))
+    assert config["store"]["max_capacity"] == 50_000_000
+    assert config["store"]["max_size"] == 1 << 40
 
 
 @pytest.mark.smoke

@@ -5412,6 +5412,17 @@ typedef struct lore_repository_clone_args_t {
   uint8_t dependency_recursive;
   // Maximum dependency traversal depth. 0 means unlimited.
   uint32_t dependency_depth_limit;
+  // Fragments the new instance's store holds before eviction removes some; 0 uses the default
+  // of 2000000. The periodic eviction pass treats a value below 1048576 as 1048576. Ignored, with
+  // a warning, where the instance uses a shared store, whose limits are set in its
+  // `shared_store.toml`, and where `no_tracking`, or the `in_memory` of `lore_global_args_t`, is
+  // set
+  uint64_t max_capacity;
+  // Bytes the new instance's store holds before compaction reclaims space; 0 uses the default of
+  // 10 GiB. Ignored, with a warning, where the instance uses a shared store, whose limits are set
+  // in its `shared_store.toml`, and where `no_tracking`, or the `in_memory` of
+  // `lore_global_args_t`, is set
+  uint64_t max_size;
 } lore_repository_clone_args_t;
 
 // Arguments for retrieving metadata about a remote repository.

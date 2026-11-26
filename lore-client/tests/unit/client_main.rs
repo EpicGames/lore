@@ -5,7 +5,8 @@ use lore_client::cli::LoreCli;
 use lore_client::cli::LoreCommands;
 use lore_client::client_main::runs_the_service;
 
-fn command_of(args: &[&str]) -> LoreCommands {
+/// The command `args` parse to.
+pub(crate) fn command_of(args: &[&str]) -> LoreCommands {
     LoreCli::try_parse_from(args)
         .expect("the arguments must parse")
         .command

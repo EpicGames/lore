@@ -434,6 +434,9 @@ cannot. A bare or virtual instance writes no files and reads them from the remot
 
   Default value: `0`
 
+* `--max-capacity <fragments>` — Fragments the new instance's store holds before eviction removes some, defaults to 2000000. The periodic eviction pass treats a value below 1048576 as 1048576. Ignored over a shared store and with --no-tracking
+* `--max-size <bytes>` — Bytes the new instance's store holds before compaction reclaims space, defaults to 10 GiB. Ignored over a shared store and with --no-tracking
+
 ## `lore repository delete`
 
 Delete a repository
@@ -2312,6 +2315,9 @@ cannot. A bare or virtual instance writes no files and reads them from the remot
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
 
   Default value: `0`
+
+* `--max-capacity <fragments>` — Fragments the new instance's store holds before eviction removes some, defaults to 2000000. The periodic eviction pass treats a value below 1048576 as 1048576. Ignored over a shared store and with --no-tracking
+* `--max-size <bytes>` — Bytes the new instance's store holds before compaction reclaims space, defaults to 10 GiB. Ignored over a shared store and with --no-tracking
 
 ## `lore stage`
 

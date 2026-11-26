@@ -2279,6 +2279,8 @@ class Lore:
         dependency_recursive: bool = False,
         dependency_depth_limit: int = 0,
         no_tracking: bool = False,
+        max_capacity: int | None = None,
+        max_size: int | None = None,
         **kwargs: Unpack[GlobalOptions],
     ):
         asked_vfs = vfs
@@ -2329,7 +2331,9 @@ class Lore:
                 if dependency_depth_limit > 0
                 else []
             )
-            + (["--no-tracking"] if no_tracking else []),
+            + (["--no-tracking"] if no_tracking else [])
+            + (["--max-capacity", str(max_capacity)] if max_capacity else [])
+            + (["--max-size", str(max_size)] if max_size else []),
             **kwargs,
         )
         new_repo = Lore(

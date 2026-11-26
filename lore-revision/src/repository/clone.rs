@@ -382,6 +382,42 @@ pub struct CloneOptions {
     /// which staging and committing write to, so both work without the remote, and fail the clone
     /// if that fails.
     pub cache_file_metadata: bool,
+    /// Fragments the new instance's store holds before eviction removes some; 0 takes the default
+    pub max_capacity: u64,
+    /// Bytes the new instance's store holds before compaction reclaims space; 0 takes the default
+    pub max_size: u64,
+}
+
+impl CloneOptions {
+    /// The new instance's `[store]` config: the default limits, with the limits these options give
+    /// in their place. Over a shared store, whose limits are set in its `shared_store.toml`, and
+    /// where the clone keeps its stores in memory without limits, because it is without tracking or
+    /// `global_in_memory` is set, the config holds the defaults, and given limits are reported as
+    /// having no effect.
+    #[lore_macro::test_pub]
+    fn store_config(&self, global_in_memory: bool) -> StoreConfig {
+        let in_memory = self.no_tracking || global_in_memory;
+        if self.shared_store_options.is_none() && !in_memory {
+            return StoreConfig::client_default_with_limits(self.max_capacity, self.max_size);
+        }
+        if self.max_capacity == 0 && self.max_size == 0 {
+            return StoreConfig::client_default();
+        }
+        if in_memory {
+            lore_warn!(
+                "The store limits given to the clone have no effect, since the clone keeps its \
+                 stores in memory, without limits"
+            );
+        } else {
+            lore_warn!(
+                "The store limits given to the clone have no effect, since the instance uses a \
+                 shared store: set the shared store's limits as `max_capacity` and `max_size` in \
+                 the `[store_config]` table of its `shared_store.toml`, or with `lore \
+                 shared-store create --max-capacity --max-size`"
+            );
+        }
+        StoreConfig::client_default()
+    }
 }
 
 pub struct CloneWorkItem {
@@ -1321,7 +1357,7 @@ pub async fn clone(
         remote_url: Some(remote_url),
         identity: resolved_identity,
         shared_store_to_use: options.shared_store_options.clone(),
-        store: Some(StoreConfig::client_default()),
+        store: Some(options.store_config(execution_context().globals().in_memory())),
         file: Some(FileConfig::default()),
         vfs: options.vfs_options.clone(),
         sync: None,

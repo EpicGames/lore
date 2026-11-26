@@ -115,19 +115,11 @@ fn create_local(
             .unwrap_or(raw_remote_url)
             .to_owned();
 
-        let mut store_config = StoreConfig::client_default();
-        if args.max_size != 0 {
-            store_config.max_size = Some(args.max_size as usize);
-        }
-        if args.max_capacity != 0 {
-            store_config.max_capacity = Some(args.max_capacity as usize);
-        }
-
         lore_revision::shared_store::create_shared_store(
             path,
             remote_url,
             args.make_default != 0,
-            store_config,
+            StoreConfig::client_default_with_limits(args.max_capacity, args.max_size),
         )
         .await
     })
