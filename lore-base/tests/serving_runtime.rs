@@ -18,11 +18,12 @@ mod timer;
 mod report;
 
 /// A process that serves, with no configuration, asks for one core and one net thread per
-/// processor, and a thread limit scales both runtimes from that one request: the core runtime is
-/// not sized as if the net runtime had its default of two. Its core runtime keeps a timer per
-/// worker: its sleeps and timeouts fire, and its shutdown completes with a sleep still pending,
-/// which that timer wakes. A `LORE_CORE_TIMER` that names neither timer keeps it, and is reported
-/// with a warning when the process reports its runtime, after the runtime is built.
+/// processor, and a thread limit sizes both runtimes from that one request: the blocking pool
+/// keeps its request, and the core and net runtimes split the rest evenly with the syscall pool,
+/// each up to its request. Its core runtime keeps a timer per worker: its sleeps and timeouts
+/// fire, and its shutdown completes with a sleep still pending, which that timer wakes. A
+/// `LORE_CORE_TIMER` that names neither timer keeps it, and is reported with a warning when the
+/// process reports its runtime, after the runtime is built.
 #[test]
 fn a_serving_process_sizes_its_runtimes_and_keeps_a_timer_per_core_worker() {
     const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -30,7 +31,7 @@ fn a_serving_process_sizes_its_runtimes_and_keeps_a_timer_per_core_worker() {
         net: processor_count(),
         ..default_thread_counts(processor_count(), lore_io::requested_max_threads())
     };
-    let limit = (requested.total() / 2).max(POOL_COUNT * MIN_THREADS_PER_POOL);
+    let limit = requested.blocking + 3 * requested.io;
     // Safety: single-threaded, before any runtime exists, and nothing else in this target reads
     // the environment concurrently.
     unsafe {
@@ -58,7 +59,14 @@ fn a_serving_process_sizes_its_runtimes_and_keeps_a_timer_per_core_worker() {
     );
 
     let counts = thread_counts();
-    assert_eq!(counts, apportion_thread_counts(requested, limit));
+    assert_eq!(
+        counts,
+        ThreadCounts {
+            worker: requested.worker.min(requested.io),
+            net: requested.net.min(requested.io),
+            ..requested
+        }
+    );
     assert_eq!(core.metrics().num_workers(), counts.worker);
     assert_eq!(net_runtime().metrics().num_workers(), counts.net);
 

@@ -13720,12 +13720,18 @@ int32_t lore_shutdown(void);
 // pool's final size, so no knob can lift the process above a limit set here.
 // Retired per-pool variables are ignored outright.
 //
-// With no limit, every pool gets its ideal. With one, the pools are scaled to
-// fit by the largest-remainder method: each is granted its proportional share
-// of the limit, and the threads left over by rounding go to the pools with the
-// largest remainders. A pool never drops below 2 threads, since a starved pool
-// can deadlock work another pool waits on. That floor outranks the limit, so a
-// limit below 8 yields 8.
+// With no limit, every pool gets its ideal. With one, the blocking pool and the
+// net pool keep their ideals, and the worker pool and the io pool split the rest
+// evenly; on a server, whose net pool asks for one thread per processor, the net
+// pool shares the split too. No pool in the split gets more than its ideal: what
+// it leaves goes evenly to the others, and odd threads go to the worker pool
+// first, then the net pool, then the io pool. Where the split would leave a pool
+// fewer than 2, those pools keep 2 each and the pools outside the split are
+// scaled into the rest by the largest-remainder method: each is granted its
+// proportional share, and the threads left over by rounding go to the pools with
+// the largest remainders. A pool never drops below
+// 2 threads, since a starved pool can deadlock work another pool waits on. That
+// floor outranks the limit, so a limit below 8 yields 8.
 //
 // # What is not counted
 //

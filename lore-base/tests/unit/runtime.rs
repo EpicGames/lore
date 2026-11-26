@@ -285,15 +285,21 @@ fn default_thread_counts_match_design_formulas() {
 fn apportion_returns_defaults_when_within_limit() {
     let defaults = default_thread_counts(8, IO_REQUEST);
     let total = defaults.total();
-    assert_eq!(apportion_thread_counts(defaults, total), defaults);
-    assert_eq!(apportion_thread_counts(defaults, total + 100), defaults);
+    assert_eq!(
+        apportion_thread_counts(defaults, NetRequest::Fixed, total),
+        defaults
+    );
+    assert_eq!(
+        apportion_thread_counts(defaults, NetRequest::Fixed, total + 100),
+        defaults
+    );
 }
 
 #[test]
 fn apportion_fills_budget_exactly_above_the_floor() {
     let defaults = default_thread_counts(64, IO_REQUEST);
     for limit in (POOL_COUNT * MIN_THREADS_PER_POOL)..=defaults.total() {
-        let counts = apportion_thread_counts(defaults, limit);
+        let counts = apportion_thread_counts(defaults, NetRequest::Fixed, limit);
         assert_eq!(counts.total(), limit, "limit {limit} not used exactly");
         for pool in counts.as_array() {
             assert!(pool >= MIN_THREADS_PER_POOL);
@@ -303,7 +309,8 @@ fn apportion_fills_budget_exactly_above_the_floor() {
 
 #[test]
 fn apportion_floors_below_min_total() {
-    let counts = apportion_thread_counts(default_thread_counts(64, IO_REQUEST), 1);
+    let counts =
+        apportion_thread_counts(default_thread_counts(64, IO_REQUEST), NetRequest::Fixed, 1);
     assert_eq!(counts.as_array(), [MIN_THREADS_PER_POOL; POOL_COUNT]);
 }
 
@@ -311,32 +318,160 @@ fn apportion_floors_below_min_total() {
 fn apportion_at_limit_64_on_64_core_host() {
     let defaults = default_thread_counts(64, IO_REQUEST);
     assert_eq!(defaults.total(), 85);
-    let counts = apportion_thread_counts(defaults, 64);
-    assert_eq!(counts.worker, 48);
-    assert_eq!(counts.blocking, MIN_THREADS_PER_POOL);
-    assert_eq!(counts.net, MIN_THREADS_PER_POOL);
-    assert_eq!(counts.io, 12);
+    let counts = apportion_thread_counts(defaults, NetRequest::Fixed, 64);
+    assert_eq!(counts.worker, 43);
+    assert_eq!(counts.blocking, defaults.blocking);
+    assert_eq!(counts.net, defaults.net);
+    assert_eq!(counts.io, IO_REQUEST);
     assert_eq!(counts.total(), 64);
 }
 
-/// A net request raises the pool's ideal, and the limit still binds the total —
-/// asking for 64 net threads under a 64-thread ceiling cannot buy 64 of them
-/// on top of the worker and blocking pools.
+/// The processor counts [`the_counts_each_process_runs_under_a_limit`] covers.
+const PROCESSORS: [usize; 7] = [4, 8, 16, 32, 64, 128, 192];
+
+/// The limits [`the_counts_each_process_runs_under_a_limit`] covers.
+const LIMITS: [usize; 8] = [8, 10, 16, 24, 32, 44, 64, 128];
+
+/// What each kind of process asks for on `processors` before any limit, with the syscall pool's
+/// default request of `min(2 x processors, 16)`: a command opening 1 and 6 storage connections;
+/// the server, with one net thread per processor; the service, which serves commands that each
+/// open up to 10; and a program embedding Lore, which sizes for no connections.
+fn requests_by_process(processors: usize) -> [(ThreadCounts, NetRequest); 5] {
+    let defaults = default_thread_counts(processors, (2 * processors).min(16));
+    [
+        (
+            threads_for_connections(defaults, NetConnections::Opened(1)),
+            NetRequest::Fixed,
+        ),
+        (
+            threads_for_connections(defaults, NetConnections::Opened(6)),
+            NetRequest::Fixed,
+        ),
+        (
+            ThreadCounts {
+                net: processors,
+                ..defaults
+            },
+            NetRequest::PerProcessor,
+        ),
+        (
+            threads_for_connections(defaults, NetConnections::Served(10)),
+            NetRequest::Fixed,
+        ),
+        (defaults, NetRequest::Fixed),
+    ]
+}
+
+/// worker, blocking, net and io threads under each of [`LIMITS`], for each request of
+/// [`requests_by_process`] on each of [`PROCESSORS`]. A limit that holds the fixed pools' requests
+/// and the minimum threads for each shared pool splits the rest evenly among the shared pools,
+/// each up to its request. A smaller one leaves those at the minimum and scales the fixed pools
+/// into the rest.
 #[test]
-fn a_net_request_is_scaled_by_the_limit() {
-    let requested = ThreadCounts {
-        worker: 20,
-        blocking: CORE_BLOCKING_THREADS + NET_BLOCKING_THREADS,
-        net: 64,
-        io: IO_REQUEST,
-    };
-    let counts = apportion_thread_counts(requested, 64);
-    assert_eq!(counts.total(), 64);
-    assert!(counts.net < requested.net);
-    assert!(
-        counts.net > counts.worker,
-        "the largest request keeps the largest share"
-    );
+fn the_counts_each_process_runs_under_a_limit() {
+    #[rustfmt::skip]
+    let expected: [[[[usize; 4]; 8]; 7]; 5] = [
+        // client-1
+        [
+            [[2, 2, 2, 2], [3, 3, 2, 2], [3, 3, 2, 8], [3, 3, 2, 8], [3, 3, 2, 8], [3, 3, 2, 8], [3, 3, 2, 8], [3, 3, 2, 8]],
+            [[2, 2, 2, 2], [3, 3, 2, 2], [6, 3, 2, 5], [7, 3, 2, 12], [7, 3, 2, 16], [7, 3, 2, 16], [7, 3, 2, 16], [7, 3, 2, 16]],
+            [[2, 2, 2, 2], [3, 3, 2, 2], [6, 3, 2, 5], [10, 3, 2, 9], [14, 3, 2, 13], [15, 3, 2, 16], [15, 3, 2, 16], [15, 3, 2, 16]],
+            [[2, 2, 2, 2], [3, 3, 2, 2], [6, 3, 2, 5], [10, 3, 2, 9], [14, 3, 2, 13], [23, 3, 2, 16], [31, 3, 2, 16], [31, 3, 2, 16]],
+            [[2, 2, 2, 2], [3, 3, 2, 2], [6, 3, 2, 5], [10, 3, 2, 9], [14, 3, 2, 13], [23, 3, 2, 16], [43, 3, 2, 16], [63, 3, 2, 16]],
+            [[2, 2, 2, 2], [3, 3, 2, 2], [6, 3, 2, 5], [10, 3, 2, 9], [14, 3, 2, 13], [23, 3, 2, 16], [43, 3, 2, 16], [107, 3, 2, 16]],
+            [[2, 2, 2, 2], [3, 3, 2, 2], [6, 3, 2, 5], [10, 3, 2, 9], [14, 3, 2, 13], [23, 3, 2, 16], [43, 3, 2, 16], [107, 3, 2, 16]],
+        ],
+        // client-6
+        [
+            [[2, 2, 2, 2], [3, 3, 2, 2], [3, 3, 2, 8], [3, 3, 2, 8], [3, 3, 2, 8], [3, 3, 2, 8], [3, 3, 2, 8], [3, 3, 2, 8]],
+            [[2, 2, 2, 2], [2, 3, 3, 2], [5, 3, 4, 4], [5, 3, 4, 12], [5, 3, 4, 16], [5, 3, 4, 16], [5, 3, 4, 16], [5, 3, 4, 16]],
+            [[2, 2, 2, 2], [2, 2, 4, 2], [4, 3, 6, 3], [8, 3, 6, 7], [11, 3, 6, 12], [11, 3, 6, 16], [11, 3, 6, 16], [11, 3, 6, 16]],
+            [[2, 2, 2, 2], [2, 2, 4, 2], [4, 3, 6, 3], [8, 3, 6, 7], [12, 3, 6, 11], [19, 3, 6, 16], [27, 3, 6, 16], [27, 3, 6, 16]],
+            [[2, 2, 2, 2], [2, 2, 4, 2], [4, 3, 6, 3], [8, 3, 6, 7], [12, 3, 6, 11], [19, 3, 6, 16], [39, 3, 6, 16], [59, 3, 6, 16]],
+            [[2, 2, 2, 2], [2, 2, 4, 2], [4, 3, 6, 3], [8, 3, 6, 7], [12, 3, 6, 11], [19, 3, 6, 16], [39, 3, 6, 16], [103, 3, 6, 16]],
+            [[2, 2, 2, 2], [2, 2, 4, 2], [4, 3, 6, 3], [8, 3, 6, 7], [12, 3, 6, 11], [19, 3, 6, 16], [39, 3, 6, 16], [103, 3, 6, 16]],
+        ],
+        // server
+        [
+            [[2, 2, 2, 2], [3, 3, 2, 2], [4, 3, 4, 5], [4, 3, 4, 8], [4, 3, 4, 8], [4, 3, 4, 8], [4, 3, 4, 8], [4, 3, 4, 8]],
+            [[2, 2, 2, 2], [3, 3, 2, 2], [5, 3, 4, 4], [7, 3, 7, 7], [8, 3, 8, 13], [8, 3, 8, 16], [8, 3, 8, 16], [8, 3, 8, 16]],
+            [[2, 2, 2, 2], [3, 3, 2, 2], [5, 3, 4, 4], [7, 3, 7, 7], [10, 3, 10, 9], [14, 3, 14, 13], [16, 3, 16, 16], [16, 3, 16, 16]],
+            [[2, 2, 2, 2], [3, 3, 2, 2], [5, 3, 4, 4], [7, 3, 7, 7], [10, 3, 10, 9], [14, 3, 14, 13], [23, 3, 22, 16], [32, 3, 32, 16]],
+            [[2, 2, 2, 2], [3, 3, 2, 2], [5, 3, 4, 4], [7, 3, 7, 7], [10, 3, 10, 9], [14, 3, 14, 13], [23, 3, 22, 16], [55, 3, 54, 16]],
+            [[2, 2, 2, 2], [3, 3, 2, 2], [5, 3, 4, 4], [7, 3, 7, 7], [10, 3, 10, 9], [14, 3, 14, 13], [23, 3, 22, 16], [55, 3, 54, 16]],
+            [[2, 2, 2, 2], [3, 3, 2, 2], [5, 3, 4, 4], [7, 3, 7, 7], [10, 3, 10, 9], [14, 3, 14, 13], [23, 3, 22, 16], [55, 3, 54, 16]],
+        ],
+        // service
+        [
+            [[2, 2, 2, 2], [3, 3, 2, 2], [3, 3, 2, 8], [3, 3, 2, 8], [3, 3, 2, 8], [3, 3, 2, 8], [3, 3, 2, 8], [3, 3, 2, 8]],
+            [[2, 2, 2, 2], [2, 3, 3, 2], [5, 3, 4, 4], [7, 3, 4, 10], [7, 3, 4, 16], [7, 3, 4, 16], [7, 3, 4, 16], [7, 3, 4, 16]],
+            [[2, 2, 2, 2], [2, 2, 4, 2], [3, 3, 8, 2], [7, 3, 8, 6], [11, 3, 8, 10], [15, 3, 8, 16], [15, 3, 8, 16], [15, 3, 8, 16]],
+            [[2, 2, 2, 2], [2, 2, 4, 2], [2, 3, 9, 2], [6, 3, 10, 5], [10, 3, 10, 9], [16, 3, 10, 15], [31, 3, 10, 16], [31, 3, 10, 16]],
+            [[2, 2, 2, 2], [2, 2, 4, 2], [2, 3, 9, 2], [6, 3, 10, 5], [10, 3, 10, 9], [16, 3, 10, 15], [35, 3, 10, 16], [63, 3, 10, 16]],
+            [[2, 2, 2, 2], [2, 2, 4, 2], [2, 3, 9, 2], [6, 3, 10, 5], [10, 3, 10, 9], [16, 3, 10, 15], [35, 3, 10, 16], [99, 3, 10, 16]],
+            [[2, 2, 2, 2], [2, 2, 4, 2], [2, 3, 9, 2], [6, 3, 10, 5], [10, 3, 10, 9], [16, 3, 10, 15], [35, 3, 10, 16], [99, 3, 10, 16]],
+        ],
+        // embedder
+        [
+            [[2, 2, 2, 2], [3, 3, 2, 2], [4, 3, 2, 7], [4, 3, 2, 8], [4, 3, 2, 8], [4, 3, 2, 8], [4, 3, 2, 8], [4, 3, 2, 8]],
+            [[2, 2, 2, 2], [3, 3, 2, 2], [6, 3, 2, 5], [8, 3, 2, 11], [8, 3, 2, 16], [8, 3, 2, 16], [8, 3, 2, 16], [8, 3, 2, 16]],
+            [[2, 2, 2, 2], [3, 3, 2, 2], [6, 3, 2, 5], [10, 3, 2, 9], [14, 3, 2, 13], [16, 3, 2, 16], [16, 3, 2, 16], [16, 3, 2, 16]],
+            [[2, 2, 2, 2], [3, 3, 2, 2], [6, 3, 2, 5], [10, 3, 2, 9], [14, 3, 2, 13], [23, 3, 2, 16], [32, 3, 2, 16], [32, 3, 2, 16]],
+            [[2, 2, 2, 2], [3, 3, 2, 2], [6, 3, 2, 5], [10, 3, 2, 9], [14, 3, 2, 13], [23, 3, 2, 16], [43, 3, 2, 16], [64, 3, 2, 16]],
+            [[2, 2, 2, 2], [3, 3, 2, 2], [6, 3, 2, 5], [10, 3, 2, 9], [14, 3, 2, 13], [23, 3, 2, 16], [43, 3, 2, 16], [107, 3, 2, 16]],
+            [[2, 2, 2, 2], [3, 3, 2, 2], [6, 3, 2, 5], [10, 3, 2, 9], [14, 3, 2, 13], [23, 3, 2, 16], [43, 3, 2, 16], [107, 3, 2, 16]],
+        ],
+    ];
+    for (process, by_processors) in expected.into_iter().enumerate() {
+        for (processors, by_limit) in PROCESSORS.into_iter().zip(by_processors) {
+            let (requested, net) = requests_by_process(processors)[process];
+            assert_eq!(
+                LIMITS.map(|limit| apportion_thread_counts(requested, net, limit).as_array()),
+                by_limit,
+                "{requested:?} ({net:?}) on {processors} processors"
+            );
+        }
+    }
+}
+
+/// `LORE_IO_POOL_THREADS` raises the syscall pool's request. Under a limit the pool gets an even
+/// share with the core workers, up to that request.
+#[test]
+fn a_raised_syscall_pool_request_caps_its_even_share() {
+    let defaults = default_thread_counts(192, IO_REQUEST);
+    for (io, limit, expected) in [
+        (32, 44, [20, 3, 2, 19]),
+        (32, 128, [91, 3, 2, 32]),
+        (128, 128, [62, 3, 2, 61]),
+    ] {
+        let requested = ThreadCounts { io, ..defaults };
+        assert_eq!(
+            apportion_thread_counts(requested, NetRequest::Fixed, limit).as_array(),
+            expected,
+            "{requested:?} at limit {limit}"
+        );
+    }
+}
+
+/// An explicit net request, as `LORE_NET_THREADS` makes, is fixed: it is granted while the limit
+/// holds it, the blocking pool and the minimum for each shared pool, and is scaled with the
+/// blocking pool under a smaller one, so asking for 64 net threads under a 64-thread ceiling
+/// cannot buy 64 of them on top of the other pools.
+#[test]
+fn an_explicit_net_request_is_granted_while_the_shared_pools_fit() {
+    let defaults = default_thread_counts(192, IO_REQUEST);
+    for (net, limit, expected) in [
+        (16, 44, [13, 3, 16, 12]),
+        (16, 24, [3, 3, 16, 2]),
+        (64, 64, [2, 3, 57, 2]),
+    ] {
+        let requested = requested_counts(defaults, Some(net), None);
+        assert_eq!(
+            apportion_thread_counts(requested, NetRequest::Fixed, limit).as_array(),
+            expected,
+            "{requested:?} at limit {limit}"
+        );
+    }
 }
 
 /// Sizing for storage connections gives the core runtime one thread fewer than the
@@ -455,34 +590,59 @@ fn connections_are_refused_once_a_runtime_exists() {
 /// no knob can raise the process above what an embedder asked for. The
 /// per-pool floor is a property of scaling down rather than of every result:
 /// a request that already fits is honoured as written, including one below it.
+/// A limit that holds the fixed pools' requests, each raised to the floor, and
+/// the minimum for each shared pool grants those, and the shared pools use the
+/// rest, split evenly: each gets its request or within one thread of the largest
+/// share.
 #[test]
 fn the_limit_bounds_the_total_for_any_request() {
-    for worker in [2, 8, 64, 256] {
-        for blocking in [1, 2, 128] {
-            for net in [1, 2, 64, 512] {
-                for io in [1, 16, 128] {
-                    let requested = ThreadCounts {
-                        worker,
-                        blocking,
-                        net,
-                        io,
-                    };
-                    for limit in [POOL_COUNT * MIN_THREADS_PER_POOL, 16, 64, 1024] {
-                        let counts = apportion_thread_counts(requested, limit);
+    let requests = [2, 8, 64, 256].into_iter().flat_map(|worker| {
+        [1, 2, 128].into_iter().flat_map(move |blocking| {
+            [1, 2, 64, 512].into_iter().flat_map(move |net| {
+                [1, 16, 128].into_iter().map(move |io| ThreadCounts {
+                    worker,
+                    blocking,
+                    net,
+                    io,
+                })
+            })
+        })
+    });
+    for requested in requests {
+        for net_request in [NetRequest::Fixed, NetRequest::PerProcessor] {
+            for limit in [POOL_COUNT * MIN_THREADS_PER_POOL, 16, 64, 1024] {
+                let counts = apportion_thread_counts(requested, net_request, limit);
+                let case =
+                    format!("{requested:?} ({net_request:?}) at limit {limit} gave {counts:?}");
+                assert!(counts.total() <= limit, "{case}");
+                if requested.total() <= limit {
+                    assert_eq!(counts, requested, "a request that fits is untouched");
+                    continue;
+                }
+                for pool in counts.as_array() {
+                    assert!(pool >= MIN_THREADS_PER_POOL, "{case} starved a pool");
+                }
+                let floored = requested
+                    .as_array()
+                    .map(|pool| pool.max(MIN_THREADS_PER_POOL));
+                let granted = counts.as_array();
+                let (fixed, shared): (&[usize], &[usize]) = match net_request {
+                    NetRequest::Fixed => (&[1, 2], &[0, 3]),
+                    NetRequest::PerProcessor => (&[1], &[0, 2, 3]),
+                };
+                let fixed_total: usize = fixed.iter().map(|&i| floored[i]).sum();
+                if fixed_total + shared.len() * MIN_THREADS_PER_POOL <= limit {
+                    assert_eq!(counts.total(), limit, "{case}");
+                    for &i in fixed {
+                        assert_eq!(granted[i], floored[i], "{case}");
+                    }
+                    let largest = shared.iter().map(|&i| granted[i]).max().unwrap_or(0);
+                    for &i in shared {
                         assert!(
-                            counts.total() <= limit,
-                            "{requested:?} at limit {limit} gave {counts:?}"
+                            granted[i] == floored[i] || granted[i] + 1 >= largest,
+                            "{case} split unevenly"
                         );
-                        if requested.total() <= limit {
-                            assert_eq!(counts, requested, "a request that fits is untouched");
-                            continue;
-                        }
-                        for pool in counts.as_array() {
-                            assert!(
-                                pool >= MIN_THREADS_PER_POOL,
-                                "{requested:?} at limit {limit} starved a pool: {counts:?}"
-                            );
-                        }
+                        assert!(granted[i] <= floored[i], "{case} exceeds a request");
                     }
                 }
             }
