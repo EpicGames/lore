@@ -343,6 +343,33 @@ pub(crate) async fn branch_step(step: BranchStep) {
     stop_where_held(&STEPPED, step).await;
 }
 
+/// A point of a clone's discovery where a task run under [`step_discovery`] stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiscoveryStep {
+    /// The walk has ended and discovery is not yet marked complete.
+    Walked,
+}
+
+tokio::task_local! {
+    static DISCOVERY_STEPPED: Hold<DiscoveryStep>;
+}
+
+/// Runs `future`, stopping at each [`DiscoveryStep`] it reaches: the step is sent on `reached`,
+/// and the task waits for a notification of `resume` before it goes on. Tasks `future` spawns don't
+/// stop.
+pub fn step_discovery<F: Future>(
+    reached: tokio::sync::mpsc::UnboundedSender<DiscoveryStep>,
+    resume: Arc<Notify>,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    DISCOVERY_STEPPED.scope(Hold { reached, resume }, future)
+}
+
+/// Stops this task at `step`, where it runs under [`step_discovery`].
+pub(crate) async fn discovery_step(step: DiscoveryStep) {
+    stop_where_held(&DISCOVERY_STEPPED, step).await;
+}
+
 /// A point of a move of the external root where a task run under [`step_moves`] stops.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoveStep {

@@ -300,6 +300,43 @@ async fn adversarial_concurrent_calls_same_parent() {
     assert_eq!(stats.created_parents.len(), 1);
 }
 
+/// Files of one new directory whose writers start together create it with one call, and a create
+/// that fails fails each of them.
+#[tokio::test]
+async fn concurrent_files_of_a_new_directory_share_its_create() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            for blocked in [false, true] {
+                let temp = TempDir::new("lore-clone-shared-create-");
+                let provider =
+                    crate::fs::filesystem_provider::TestFilesystemProvider::reading(temp.path());
+                let creates = provider.directory_creates.clone();
+                let operation = provider
+                    .begin_operation()
+                    .await
+                    .expect("Starting test operation");
+                if blocked {
+                    std::fs::write(temp.path().join("shared"), b"").expect("block the directory");
+                }
+                let stats = CloneStats::default();
+                let directory = relative_path("shared/nested");
+
+                let results = futures::future::join_all(
+                    (0..8).map(|_| ensure_directory(&directory, &operation, &stats, false)),
+                )
+                .await;
+
+                assert_eq!(creates.load(Ordering::Relaxed), 1, "blocked {blocked}");
+                assert!(
+                    results.iter().all(|result| result.is_err() == blocked),
+                    "blocked {blocked}: {results:?}"
+                );
+                assert!(stats.creating_parents.is_empty());
+            }
+        })
+        .await;
+}
+
 /// A node with neither the file nor the link flag, which makes it a directory, and no children. A
 /// `stop` that never answers true.
 fn never() -> StopWhen {
