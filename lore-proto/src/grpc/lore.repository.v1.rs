@@ -95,6 +95,42 @@ impl ::prost::Name for RepositoryDeleteResponse {
         "/lore.repository.v1.RepositoryDeleteResponse".into()
     }
 }
+/// Request to rename a repository by id. Names are not used here because
+/// they may have been recycled after a prior rename or delete.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RepositoryRenameRequest {
+    /// Repository id.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub id: ::prost::bytes::Bytes,
+    /// The new name. Must satisfy the validation rules of
+    /// `RepositoryCreateRequest.name`, and must not be held by another repository.
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+}
+impl ::prost::Name for RepositoryRenameRequest {
+    const NAME: &'static str = "RepositoryRenameRequest";
+    const PACKAGE: &'static str = "lore.repository.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.repository.v1.RepositoryRenameRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.repository.v1.RepositoryRenameRequest".into()
+    }
+}
+/// Response to a repository rename. Empty: the caller already holds the id
+/// and the new name.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RepositoryRenameResponse {}
+impl ::prost::Name for RepositoryRenameResponse {
+    const NAME: &'static str = "RepositoryRenameResponse";
+    const PACKAGE: &'static str = "lore.repository.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.repository.v1.RepositoryRenameResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.repository.v1.RepositoryRenameResponse".into()
+    }
+}
 /// Request to look up a repository by id or by name.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RepositoryGetRequest {
@@ -275,8 +311,8 @@ pub mod repository_service_client {
     use tonic::codegen::*;
     use tonic::codegen::http::Uri;
     /// Baseline repository-management service. Carries the lifecycle and
-    /// metadata-pointer primitives — repository create / delete, lookup, list,
-    /// and CAS update of the repository metadata pointer. The repository
+    /// metadata-pointer primitives — repository create / delete, rename, lookup,
+    /// list, and CAS update of the repository metadata pointer. The repository
     /// metadata blob itself is read/written through CAS storage like any other
     /// content; this service only mediates the pointer to its current head.
     #[derive(Debug, Clone)]
@@ -420,6 +456,38 @@ pub mod repository_service_client {
                     GrpcMethod::new(
                         "lore.repository.v1.RepositoryService",
                         "RepositoryDelete",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Rename a repository. The id does not change, and the previous name
+        /// is freed. Renaming a repository to the name it already has succeeds,
+        /// so a caller can complete an interrupted rename by sending it again.
+        pub async fn repository_rename(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RepositoryRenameRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryRenameResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.repository.v1.RepositoryService/RepositoryRename",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.repository.v1.RepositoryService",
+                        "RepositoryRename",
                     ),
                 );
             self.inner.unary(req, path, codec).await
@@ -581,6 +649,16 @@ pub mod repository_service_server {
             tonic::Response<super::RepositoryDeleteResponse>,
             tonic::Status,
         >;
+        /// Rename a repository. The id does not change, and the previous name
+        /// is freed. Renaming a repository to the name it already has succeeds,
+        /// so a caller can complete an interrupted rename by sending it again.
+        async fn repository_rename(
+            &self,
+            request: tonic::Request<super::RepositoryRenameRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryRenameResponse>,
+            tonic::Status,
+        >;
         /// Look up a repository by id or by name.
         async fn repository_get(
             &self,
@@ -622,8 +700,8 @@ pub mod repository_service_server {
         >;
     }
     /// Baseline repository-management service. Carries the lifecycle and
-    /// metadata-pointer primitives — repository create / delete, lookup, list,
-    /// and CAS update of the repository metadata pointer. The repository
+    /// metadata-pointer primitives — repository create / delete, rename, lookup,
+    /// list, and CAS update of the repository metadata pointer. The repository
     /// metadata blob itself is read/written through CAS storage like any other
     /// content; this service only mediates the pointer to its current head.
     #[derive(Debug)]
@@ -779,6 +857,52 @@ pub mod repository_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = RepositoryDeleteSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.repository.v1.RepositoryService/RepositoryRename" => {
+                    #[allow(non_camel_case_types)]
+                    struct RepositoryRenameSvc<T: RepositoryService>(pub Arc<T>);
+                    impl<
+                        T: RepositoryService,
+                    > tonic::server::UnaryService<super::RepositoryRenameRequest>
+                    for RepositoryRenameSvc<T> {
+                        type Response = super::RepositoryRenameResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RepositoryRenameRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RepositoryService>::repository_rename(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RepositoryRenameSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

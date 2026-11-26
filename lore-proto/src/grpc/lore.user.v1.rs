@@ -225,6 +225,44 @@ impl ::prost::Name for RepositoryUnregisterResponse {
         "/lore.user.v1.RepositoryUnregisterResponse".into()
     }
 }
+/// Request to rename a repository. The credential is the token the caller
+/// sent with the rename, forwarded by the Lore server: a token scoped to the
+/// repository when the client signed in over OIDC, and the login token
+/// otherwise, so the registry must accept either.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RepositoryRenameRequest {
+    /// The repository id.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub id: ::prost::bytes::Bytes,
+    /// The new name.
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+}
+impl ::prost::Name for RepositoryRenameRequest {
+    const NAME: &'static str = "RepositoryRenameRequest";
+    const PACKAGE: &'static str = "lore.user.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.user.v1.RepositoryRenameRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.user.v1.RepositoryRenameRequest".into()
+    }
+}
+/// Response to a repository rename. Renaming a repository to the name the
+/// registry already holds for it succeeds for any caller allowed to rename
+/// it, so a repeated rename completes one the Lore server did not finish.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RepositoryRenameResponse {}
+impl ::prost::Name for RepositoryRenameResponse {
+    const NAME: &'static str = "RepositoryRenameResponse";
+    const PACKAGE: &'static str = "lore.user.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.user.v1.RepositoryRenameResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.user.v1.RepositoryRenameResponse".into()
+    }
+}
 /// Generated client implementations.
 pub mod user_service_client {
     #![allow(
@@ -622,9 +660,10 @@ pub mod repository_registry_service_client {
     use tonic::codegen::http::Uri;
     /// A 3rd party registry of the repositories and the users' permissions
     /// on them. The Lore server calls it with the caller's token: it registers a
-    /// repository on create, unregisters it on delete, and asks it which
-    /// repositories a caller may list. Every RPC is called with the token in the
-    /// gRPC metadata as `authorization: Bearer <token>`.
+    /// repository on create, unregisters it on delete, records its new name on
+    /// rename, and asks it which repositories a caller may list. Every RPC is
+    /// called with the token in the gRPC metadata as
+    /// `authorization: Bearer <token>`.
     ///
     /// The registry answers each rejection with the status code the RPC
     /// documents. A rejection the RPC documents with a reason carries a
@@ -821,6 +860,46 @@ pub mod repository_registry_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Record the new name of a repository the Lore server is renaming. The Lore
+        /// server calls this before it changes the name and refuses the rename when
+        /// this fails, so the registry can authorize the rename. See
+        /// `RepositoryRenameResponse`. The registry refuses with:
+        ///
+        /// * `PERMISSION_DENIED` when the caller may not rename the repository.
+        /// * `ALREADY_EXISTS` when the registry holds the name for another repository.
+        /// * `ALREADY_EXISTS` or `PERMISSION_DENIED` when the name is valid but the registry does not allow it for this repository, for example because it keeps the name reserved.
+        /// * `UNAUTHENTICATED` when the token is missing, invalid or expired.
+        /// * `NOT_FOUND` when the registry does not know the repository.
+        /// * `INVALID_ARGUMENT` with an `ErrorInfo` field of `name` and a reason of `ERROR_REASON_INVALID_FORMAT`, `ERROR_REASON_MISSING_REQUIRED_FIELD` or `ERROR_REASON_UNSPECIFIED` when the registry rejects the name.
+        pub async fn repository_rename(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RepositoryRenameRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryRenameResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.user.v1.RepositoryRegistryService/RepositoryRename",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.user.v1.RepositoryRegistryService",
+                        "RepositoryRename",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -883,12 +962,31 @@ pub mod repository_registry_service_server {
             tonic::Response<super::RepositoryUnregisterResponse>,
             tonic::Status,
         >;
+        /// Record the new name of a repository the Lore server is renaming. The Lore
+        /// server calls this before it changes the name and refuses the rename when
+        /// this fails, so the registry can authorize the rename. See
+        /// `RepositoryRenameResponse`. The registry refuses with:
+        ///
+        /// * `PERMISSION_DENIED` when the caller may not rename the repository.
+        /// * `ALREADY_EXISTS` when the registry holds the name for another repository.
+        /// * `ALREADY_EXISTS` or `PERMISSION_DENIED` when the name is valid but the registry does not allow it for this repository, for example because it keeps the name reserved.
+        /// * `UNAUTHENTICATED` when the token is missing, invalid or expired.
+        /// * `NOT_FOUND` when the registry does not know the repository.
+        /// * `INVALID_ARGUMENT` with an `ErrorInfo` field of `name` and a reason of `ERROR_REASON_INVALID_FORMAT`, `ERROR_REASON_MISSING_REQUIRED_FIELD` or `ERROR_REASON_UNSPECIFIED` when the registry rejects the name.
+        async fn repository_rename(
+            &self,
+            request: tonic::Request<super::RepositoryRenameRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryRenameResponse>,
+            tonic::Status,
+        >;
     }
     /// A 3rd party registry of the repositories and the users' permissions
     /// on them. The Lore server calls it with the caller's token: it registers a
-    /// repository on create, unregisters it on delete, and asks it which
-    /// repositories a caller may list. Every RPC is called with the token in the
-    /// gRPC metadata as `authorization: Bearer <token>`.
+    /// repository on create, unregisters it on delete, records its new name on
+    /// rename, and asks it which repositories a caller may list. Every RPC is
+    /// called with the token in the gRPC metadata as
+    /// `authorization: Bearer <token>`.
     ///
     /// The registry answers each rejection with the status code the RPC
     /// documents. A rejection the RPC documents with a reason carries a
@@ -1110,6 +1208,55 @@ pub mod repository_registry_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = RepositoryUnregisterSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.user.v1.RepositoryRegistryService/RepositoryRename" => {
+                    #[allow(non_camel_case_types)]
+                    struct RepositoryRenameSvc<T: RepositoryRegistryService>(pub Arc<T>);
+                    impl<
+                        T: RepositoryRegistryService,
+                    > tonic::server::UnaryService<super::RepositoryRenameRequest>
+                    for RepositoryRenameSvc<T> {
+                        type Response = super::RepositoryRenameResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RepositoryRenameRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RepositoryRegistryService>::repository_rename(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RepositoryRenameSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

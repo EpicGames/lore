@@ -5,8 +5,8 @@ package lore.repository.v1;
 import "lore/model/v1/model.proto";
 
 // Baseline repository-management service. Carries the lifecycle and
-// metadata-pointer primitives — repository create / delete, lookup, list,
-// and CAS update of the repository metadata pointer. The repository
+// metadata-pointer primitives — repository create / delete, rename, lookup,
+// list, and CAS update of the repository metadata pointer. The repository
 // metadata blob itself is read/written through CAS storage like any other
 // content; this service only mediates the pointer to its current head.
 service RepositoryService {
@@ -19,6 +19,10 @@ service RepositoryService {
   // Hard-delete a repository: clears the name → id mapping, zeroes the
   // metadata pointer, and tears down all branches.
   rpc RepositoryDelete     (RepositoryDeleteRequest)     returns (RepositoryDeleteResponse);
+  // Rename a repository. The id does not change, and the previous name
+  // is freed. Renaming a repository to the name it already has succeeds,
+  // so a caller can complete an interrupted rename by sending it again.
+  rpc RepositoryRename     (RepositoryRenameRequest)     returns (RepositoryRenameResponse);
   // Look up a repository by id or by name.
   rpc RepositoryGet        (RepositoryGetRequest)        returns (RepositoryGetResponse);
   // Stream all repositories the caller is authorised to see.
@@ -84,6 +88,20 @@ message RepositoryDeleteResponse {
   // Repository record as it was immediately before deletion.
   lore.model.v1.Repository repository = 1;
 }
+
+// Request to rename a repository by id. Names are not used here because
+// they may have been recycled after a prior rename or delete.
+message RepositoryRenameRequest {
+  // Repository id.
+  bytes id = 1;
+  // The new name. Must satisfy the validation rules of
+  // `RepositoryCreateRequest.name`, and must not be held by another repository.
+  string name = 2;
+}
+
+// Response to a repository rename. Empty: the caller already holds the id
+// and the new name.
+message RepositoryRenameResponse {}
 
 // Request to look up a repository by id or by name.
 message RepositoryGetRequest {

@@ -8,6 +8,8 @@ use lore_proto::lore::user::v1::RepositoryListRequest;
 use lore_proto::lore::user::v1::RepositoryListResponse;
 use lore_proto::lore::user::v1::RepositoryRegisterRequest;
 use lore_proto::lore::user::v1::RepositoryRegisterResponse;
+use lore_proto::lore::user::v1::RepositoryRenameRequest;
+use lore_proto::lore::user::v1::RepositoryRenameResponse;
 use lore_proto::lore::user::v1::RepositoryUnregisterRequest;
 use lore_proto::lore::user::v1::RepositoryUnregisterResponse;
 use lore_proto::lore::user::v1::User;
@@ -37,6 +39,8 @@ fn v1_user_request_response_types_default() {
     let _ = RepositoryRegisterResponse::default();
     let _ = RepositoryUnregisterRequest::default();
     let _ = RepositoryUnregisterResponse::default();
+    let _ = RepositoryRenameRequest::default();
+    let _ = RepositoryRenameResponse::default();
 }
 
 /// Field-shape regression net: destructuring each message asserts that every
@@ -70,6 +74,8 @@ fn v1_user_field_shapes() {
     let RepositoryRegisterResponse {} = RepositoryRegisterResponse::default();
     let RepositoryUnregisterRequest { id: _ } = RepositoryUnregisterRequest::default();
     let RepositoryUnregisterResponse {} = RepositoryUnregisterResponse::default();
+    let RepositoryRenameRequest { id: _, name: _ } = RepositoryRenameRequest::default();
+    let RepositoryRenameResponse {} = RepositoryRenameResponse::default();
 }
 
 /// A partition is carried as the repository id bytes, as `Repository.id`
@@ -161,6 +167,13 @@ impl RepositoryRegistryService for Unserved {
         &self,
         _: tonic::Request<RepositoryUnregisterRequest>,
     ) -> Result<tonic::Response<RepositoryUnregisterResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not served"))
+    }
+
+    async fn repository_rename(
+        &self,
+        _: tonic::Request<RepositoryRenameRequest>,
+    ) -> Result<tonic::Response<RepositoryRenameResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("not served"))
     }
 }

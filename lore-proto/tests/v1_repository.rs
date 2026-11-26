@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Smoke test verifying `lore.repository.v1` carries the 6 RPCs' request /
+//! Smoke test verifying `lore.repository.v1` carries the 7 RPCs' request /
 //! response messages.
 
 use lore_proto::lore::repository::v1::RepositoryCreateRequest;
@@ -15,6 +15,8 @@ use lore_proto::lore::repository::v1::RepositoryMetadataGetRequest;
 use lore_proto::lore::repository::v1::RepositoryMetadataGetResponse;
 use lore_proto::lore::repository::v1::RepositoryMetadataSetRequest;
 use lore_proto::lore::repository::v1::RepositoryMetadataSetResponse;
+use lore_proto::lore::repository::v1::RepositoryRenameRequest;
+use lore_proto::lore::repository::v1::RepositoryRenameResponse;
 use lore_proto::lore::repository::v1::repository_get_request::Query as RepositoryGetQuery;
 
 #[test]
@@ -23,6 +25,8 @@ fn v1_repository_request_response_types_default() {
     let _ = RepositoryCreateResponse::default();
     let _ = RepositoryDeleteRequest::default();
     let _ = RepositoryDeleteResponse::default();
+    let _ = RepositoryRenameRequest::default();
+    let _ = RepositoryRenameResponse::default();
     let _ = RepositoryGetRequest::default();
     let _ = RepositoryGetResponse::default();
     let _ = RepositoryListRequest::default();
@@ -51,6 +55,9 @@ fn v1_repository_field_shapes() {
 
     let RepositoryDeleteRequest { id: _ } = RepositoryDeleteRequest::default();
     let RepositoryDeleteResponse { repository: _ } = RepositoryDeleteResponse::default();
+
+    let RepositoryRenameRequest { id: _, name: _ } = RepositoryRenameRequest::default();
+    let RepositoryRenameResponse {} = RepositoryRenameResponse::default();
 
     let RepositoryGetRequest { query: _ } = RepositoryGetRequest::default();
     let _ = RepositoryGetQuery::Id(Default::default());

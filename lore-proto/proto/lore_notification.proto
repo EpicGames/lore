@@ -41,6 +41,17 @@ message Obliterate {
   bytes repository = 2;
 }
 
+// An event published when a repository is renamed on the server
+message RepositoryRenamed {
+  // The name after the rename.
+  string name = 1;
+  // The name before the rename. Empty when the call found the new name
+  // already in place.
+  string previous_name = 2;
+  // The user who renamed the repository.
+  string user_id = 3;
+}
+
 message ExtensionEvent {
   // Globally unique event identifier, e.g. `org.lore.security.compliance`
   string type = 1;
@@ -69,6 +80,7 @@ message Event {
     // TODO(jcohen): We may eventually want to investigate supporting propagation of obliterate events between instances
     //  directly using the storage layer, rather than relying on an external notification system for coordination.
     Obliterate obliterate = 10;
+    RepositoryRenamed repository_renamed = 11;
   }
 }
 

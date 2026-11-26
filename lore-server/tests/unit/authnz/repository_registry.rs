@@ -9,6 +9,8 @@ use lore_proto::lore::user::v1::RepositoryListRequest;
 use lore_proto::lore::user::v1::RepositoryListResponse;
 use lore_proto::lore::user::v1::RepositoryRegisterRequest;
 use lore_proto::lore::user::v1::RepositoryRegisterResponse;
+use lore_proto::lore::user::v1::RepositoryRenameRequest;
+use lore_proto::lore::user::v1::RepositoryRenameResponse;
 use lore_proto::lore::user::v1::RepositoryUnregisterRequest;
 use lore_proto::lore::user::v1::RepositoryUnregisterResponse;
 use lore_proto::lore::user::v1::repository_registry_service_server::RepositoryRegistryService;
@@ -275,6 +277,13 @@ impl RepositoryRegistryService for Registry {
             .unwrap()
             .push((request.into_inner(), authorization));
         self.answer()
+    }
+
+    async fn repository_rename(
+        &self,
+        _request: tonic::Request<RepositoryRenameRequest>,
+    ) -> Result<tonic::Response<RepositoryRenameResponse>, Status> {
+        Err(Status::unimplemented("not under test"))
     }
 }
 

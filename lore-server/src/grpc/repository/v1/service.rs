@@ -16,6 +16,8 @@ use lore_proto::lore::repository::v1::RepositoryMetadataGetRequest;
 use lore_proto::lore::repository::v1::RepositoryMetadataGetResponse;
 use lore_proto::lore::repository::v1::RepositoryMetadataSetRequest;
 use lore_proto::lore::repository::v1::RepositoryMetadataSetResponse;
+use lore_proto::lore::repository::v1::RepositoryRenameRequest;
+use lore_proto::lore::repository::v1::RepositoryRenameResponse;
 use lore_proto::lore::repository::v1::repository_service_server::RepositoryService;
 use lore_revision::environment::EnvironmentConfig;
 use lore_telemetry::InstrumentProvider;
@@ -131,6 +133,15 @@ impl RepositoryService for LoreRepositoryV1Service {
             ),
         )
         .await
+    }
+
+    async fn repository_rename(
+        &self,
+        _request: Request<RepositoryRenameRequest>,
+    ) -> Result<Response<RepositoryRenameResponse>, Status> {
+        Err(Status::unimplemented(
+            "lore.repository.v1.RepositoryService.RepositoryRename not yet implemented",
+        ))
     }
 
     async fn repository_get(

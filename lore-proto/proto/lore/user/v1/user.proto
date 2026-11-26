@@ -15,9 +15,10 @@ service UserService {
 
 // A 3rd party registry of the repositories and the users' permissions
 // on them. The Lore server calls it with the caller's token: it registers a
-// repository on create, unregisters it on delete, and asks it which
-// repositories a caller may list. Every RPC is called with the token in the
-// gRPC metadata as `authorization: Bearer <token>`.
+// repository on create, unregisters it on delete, records its new name on
+// rename, and asks it which repositories a caller may list. Every RPC is
+// called with the token in the gRPC metadata as
+// `authorization: Bearer <token>`.
 //
 // The registry answers each rejection with the status code the RPC
 // documents. A rejection the RPC documents with a reason carries a
@@ -48,6 +49,17 @@ service RepositoryRegistryService {
   // not delete the repository, and with `UNAUTHENTICATED` when the token is
   // missing, invalid or expired.
   rpc RepositoryUnregister(RepositoryUnregisterRequest) returns (RepositoryUnregisterResponse);
+  // Record the new name of a repository the Lore server is renaming. The Lore
+  // server calls this before it changes the name and refuses the rename when
+  // this fails, so the registry can authorize the rename. See
+  // `RepositoryRenameResponse`. The registry refuses with:
+  // - `PERMISSION_DENIED` when the caller may not rename the repository.
+  // - `ALREADY_EXISTS` when the registry holds the name for another repository.
+  // - `ALREADY_EXISTS` or `PERMISSION_DENIED` when the name is valid but the registry does not allow it for this repository, for example because it keeps the name reserved.
+  // - `UNAUTHENTICATED` when the token is missing, invalid or expired.
+  // - `NOT_FOUND` when the registry does not know the repository.
+  // - `INVALID_ARGUMENT` with an `ErrorInfo` field of `name` and a reason of `ERROR_REASON_INVALID_FORMAT`, `ERROR_REASON_MISSING_REQUIRED_FIELD` or `ERROR_REASON_UNSPECIFIED` when the registry rejects the name.
+  rpc RepositoryRename(RepositoryRenameRequest) returns (RepositoryRenameResponse);
 }
 
 // A user as the directory knows them.
@@ -143,3 +155,19 @@ message RepositoryUnregisterRequest {
 // Response to a repository unregister. Unregistering a repository that is
 // not registered succeeds.
 message RepositoryUnregisterResponse {}
+
+// Request to rename a repository. The credential is the token the caller
+// sent with the rename, forwarded by the Lore server: a token scoped to the
+// repository when the client signed in over OIDC, and the login token
+// otherwise, so the registry must accept either.
+message RepositoryRenameRequest {
+  // The repository id.
+  bytes id = 1;
+  // The new name.
+  string name = 2;
+}
+
+// Response to a repository rename. Renaming a repository to the name the
+// registry already holds for it succeeds for any caller allowed to rename
+// it, so a repeated rename completes one the Lore server did not finish.
+message RepositoryRenameResponse {}

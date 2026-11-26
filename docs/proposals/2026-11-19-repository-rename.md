@@ -5,7 +5,7 @@ authors:
   - Hannes Muurinen
 status: Accepted
 created: 2026-11-19
-updated: 2026-11-25
+updated: 2026-11-26
 ---
 
 # Repository rename
@@ -70,10 +70,13 @@ A new RPC is added to `RepositoryService`:
 // so a caller can complete an interrupted rename by sending it again.
 rpc RepositoryRename(RepositoryRenameRequest) returns (RepositoryRenameResponse);
 
+// Request to rename a repository by id. Names are not used here because
+// they may have been recycled after a prior rename or delete.
 message RepositoryRenameRequest {
   // Repository id.
   bytes id = 1;
-  // The new name. Subject to the same rules as `RepositoryCreateRequest.name`.
+  // The new name. Must satisfy the validation rules of
+  // `RepositoryCreateRequest.name`, and must not be held by another repository.
   string name = 2;
 }
 
@@ -86,11 +89,11 @@ The request addresses the repository by ID, as `RepositoryDelete` does, because 
 
 | Status | Condition |
 |---|---|
-| `INVALID_ARGUMENT` | The new name fails the rules that `RepositoryCreate` applies. |
+| `INVALID_ARGUMENT` | The new name fails the rules that `RepositoryCreate` applies, or the registry's own name rules. |
 | `NOT_FOUND` | The repository does not exist. |
 | `UNAUTHENTICATED` | The registry rejects the caller's token, as for create and delete. The caller signs in again. |
-| `PERMISSION_DENIED` | The caller may not administer the repository, or the registry refuses the caller. |
-| `ALREADY_EXISTS` | A different repository has the new name, on the server or in the registry. |
+| `PERMISSION_DENIED` | The caller may not administer the repository, or the registry refuses the caller or does not allow the name for this repository. |
+| `ALREADY_EXISTS` | A different repository has the new name, on the server or in the registry, or the registry does not allow the name for this repository. |
 | `ABORTED` | A concurrent operation changed the repository's name or took the new name after the checks passed. |
 | `FAILED_PRECONDITION` | The registry does not know the repository. |
 | `UNIMPLEMENTED` | The registry has no rename operation. |
@@ -101,9 +104,14 @@ A new RPC is added to `RepositoryRegistryService`, next to `RepositoryRegister` 
 ```proto
 // Record the new name of a repository the Lore server is renaming. The Lore
 // server calls this before it changes the name and refuses the rename when
-// this fails, so the registry can authorize the rename.
+// this fails, so the registry can authorize the rename. See
+// `RepositoryRenameResponse`.
 rpc RepositoryRename(RepositoryRenameRequest) returns (RepositoryRenameResponse);
 
+// Request to rename a repository. The credential is the token the caller
+// sent with the rename, forwarded by the Lore server: a token scoped to the
+// repository when the client signed in over OIDC, and the login token
+// otherwise, so the registry must accept either.
 message RepositoryRenameRequest {
   // The repository id.
   bytes id = 1;
@@ -111,6 +119,9 @@ message RepositoryRenameRequest {
   string name = 2;
 }
 
+// Response to a repository rename. Renaming a repository to the name the
+// registry already holds for it succeeds for any caller allowed to rename
+// it, so a repeated rename completes one the Lore server did not finish.
 message RepositoryRenameResponse {}
 ```
 
@@ -138,7 +149,7 @@ The registry and the server's stores share no transaction, so a rename can stop 
 
 - The caller sends the same rename again. The registry already holds the new name and accepts the call (see [Registry](#registry)). The server finishes whichever local writes are missing.
 - A rename to the name the server already holds is not a no-op. The server still calls the registry and still repairs the name index, so the call also completes a rename whose metadata write succeeded but whose index writes did not.
-- To abandon the rename instead, the caller renames the repository to its old name. The server still holds that name, so the call only moves the registry back.
+- To abandon the rename instead, the caller renames the repository to its old name. The server still holds that name, so the call only moves the registry back. The registry decides whether it accepts the old name: a registry that reserves old names can still allow the repository that held the name to take it back.
 
 The CLI reports a rename that failed after the checks passed as incomplete, and tells the user to run the command again.
 
@@ -146,9 +157,11 @@ The CLI reports a rename that failed after the checks passed as incomplete, and 
 
 The server calls the registry's rename RPC from [The RPCs](#the-rpcs). It forwards the caller's token, as it does for `RepositoryUnregister`: a token scoped to the repository when the client signed in over OIDC, and the login token otherwise. The contract for the registry:
 
-- Renaming a repository to the same name that the registry already has for this id succeeds. The retry in [Failure after the registry accepted](#failure-after-the-registry-accepted) depends on this.
-- The registry refuses a caller without permission to rename the repository with `PERMISSION_DENIED`.
-- The registry refuses a name it holds for a different repository, or does not allow for some other reason, with `ALREADY_EXISTS` or `PERMISSION_DENIED`. A registry that enforces unique names atomically resolves the race in Risks, because its answer comes before any local write.
+- Renaming a repository to the same name that the registry already has for this id succeeds for any caller allowed to rename it. The retry in [Failure after the registry accepted](#failure-after-the-registry-accepted) depends on this.
+- The registry refuses a caller without permission to rename the repository with `PERMISSION_DENIED`, and a missing, invalid or expired token with `UNAUTHENTICATED`.
+- The registry refuses a name it holds for a different repository with `ALREADY_EXISTS`. A registry that enforces unique names atomically resolves the race in Risks, because its answer comes before any local write.
+- The registry refuses a name that fails its own name rules with `INVALID_ARGUMENT` and the `ErrorInfo` that `RepositoryRegister` documents in `lore-proto/proto/lore/user/v1/user.proto`: field `name`, and a reason of `ERROR_REASON_INVALID_FORMAT`, `ERROR_REASON_MISSING_REQUIRED_FIELD` or `ERROR_REASON_UNSPECIFIED`.
+- The registry refuses a valid name that it does not allow for this repository, for example because it keeps the name reserved, with `ALREADY_EXISTS` or `PERMISSION_DENIED`.
 - The registry answers `NOT_FOUND` for a repository ID it does not know. The server refuses the rename with `FAILED_PRECONDITION`, as it does for a create.
 
 The server selects its registry from configuration (`RepositoryRegistry` in `lore-server/src/authnz/repository_registry.rs`):
@@ -207,7 +220,7 @@ After a rename, the old name is free. A lookup by the old name returns `NOT_FOUN
 - **Wire format** — Additive and backward compatible. The proposal adds new protobuf messages for the new RPCs and one new member, `RepositoryRenamed`, to the `Event.event` oneof. It changes no existing message, field or framing. An older peer never receives the new RPC messages, and it decodes an `Event` that carries the new member as an event with no payload. A newer peer decodes every message an older peer produces.
 - **Client/server protocols** — Three additions:
   - `lore.repository.v1.RepositoryService.RepositoryRename`. An old client and a new server: no change. A new client and an old server: the server answers `UNIMPLEMENTED`, and the CLI reports that the remote cannot rename.
-  - `lore.user.v1.RepositoryRegistryService.RepositoryRename`. The server calls it only during a rename, if the server is configured to use an external registry. A registry that does not implement the new RPC it keeps working for create, delete and list, and renames fail with `UNIMPLEMENTED`.
+  - `lore.user.v1.RepositoryRegistryService.RepositoryRename`. The server calls it only during a rename, if the server is configured to use an external registry. A registry that does not implement the new RPC keeps working for create, delete and list, and renames fail with `UNIMPLEMENTED`.
   - `lore.notification.RepositoryRenamed` as member 11 of `Event.event`. An old client decodes the event with unknown payload and ignores it.
 - **On-disk format** — N/A. A rename reuses existing metadata key and name index entries. An older server reads a renamed repository.
 - **CLI and public API** — New `lore repository rename` subcommand. New `lore_repository_rename` and `lore_repository_rename_async` functions, and a new `LORE_EVENT_NOTIFICATION_REPOSITORY_RENAMED` event with its data struct, in `lore-capi`. No existing command or function changes.
@@ -251,7 +264,7 @@ The rename also does not delete the previous metadata blob, which holds the old 
 
 **Risks**
 
-- **Risk:** A rename stops after the registry accepted and nobody runs it again, so the registry and the server hold different names. — *mitigation:* the CLI reports the rename as incomplete and suggests a retry. A repeated rename, to the new name or back to the old one, makes them agree.
+- **Risk:** A rename stops after the registry accepted and nobody runs it again, so the registry and the server hold different names. — *mitigation:* the CLI reports the rename as incomplete and suggests a retry. A repeated rename to the new name makes them agree, and so does a rename back to the old one that the registry accepts.
 - **Risk:** Two renames of one repository to different names run at the same time. One completes and the other answers `ABORTED`, but the registry can hold the name of the call that answered `ABORTED`. — *mitigation:* accepted. A repeated rename of either makes the registry and the server agree.
 - **Risk:** A repository create takes a name between a rename's check and its bind of that name. Create binds names with unconditional writes, so one of the two repositories can end up holding a name that the index maps to the other, and a lookup of that repository by ID then answers `NOT_FOUND`. — *mitigation:* accepted. Two concurrent creates have the same exposure today. A registry that enforces unique names atomically prevents it. `RepositoryRename` still reaches the affected repository by ID, so a caller who may rename it repairs it with `lore repository rename --name <new-name> <id>`.
 - **Risk:** A dependent system misses the notification, because it was not subscribed when the server published it. — *mitigation:* the event is a hint, as the existing notifications are. The repository record queried by ID is the source of truth, and the dependent system must be built to reconcile the differences it detects, if missing a notification.

@@ -104,6 +104,30 @@ impl ::prost::Name for Obliterate {
         "/lore.notification.Obliterate".into()
     }
 }
+/// An event published when a repository is renamed on the server
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RepositoryRenamed {
+    /// The name after the rename.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// The name before the rename. Empty when the call found the new name
+    /// already in place.
+    #[prost(string, tag = "2")]
+    pub previous_name: ::prost::alloc::string::String,
+    /// The user who renamed the repository.
+    #[prost(string, tag = "3")]
+    pub user_id: ::prost::alloc::string::String,
+}
+impl ::prost::Name for RepositoryRenamed {
+    const NAME: &'static str = "RepositoryRenamed";
+    const PACKAGE: &'static str = "lore.notification";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.notification.RepositoryRenamed".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.notification.RepositoryRenamed".into()
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExtensionEvent {
     /// Globally unique event identifier, e.g. `org.lore.security.compliance`
@@ -134,7 +158,7 @@ pub struct Event {
     #[prost(bytes = "bytes", tag = "3")]
     pub repository: ::prost::bytes::Bytes,
     /// Event payload
-    #[prost(oneof = "event::Event", tags = "4, 5, 6, 7, 8, 9, 10")]
+    #[prost(oneof = "event::Event", tags = "4, 5, 6, 7, 8, 9, 10, 11")]
     pub event: ::core::option::Option<event::Event>,
 }
 /// Nested message and enum types in `Event`.
@@ -158,6 +182,8 @@ pub mod event {
         /// directly using the storage layer, rather than relying on an external notification system for coordination.
         #[prost(message, tag = "10")]
         Obliterate(super::Obliterate),
+        #[prost(message, tag = "11")]
+        RepositoryRenamed(super::RepositoryRenamed),
     }
 }
 impl ::prost::Name for Event {
