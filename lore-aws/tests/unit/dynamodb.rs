@@ -35,6 +35,7 @@ fn dynamodb_resending_with(
         pool_idle_timeout_seconds: 5,
         nodelay: true,
         max_connections: None,
+        connection_acquire_timeout_millis: None,
     })
     .expect("a client builds");
 

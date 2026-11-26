@@ -58,9 +58,15 @@ pub struct HttpClientSettings {
     /// when unset. Zero is refused when the settings are read.
     ///
     /// Each service client has a pool of its own and takes this many. A request past the limit
-    /// waits for a connection to be released until its operation's deadline.
+    /// waits for a connection to be released, for at most `connection_acquire_timeout_millis` and
+    /// never past its operation's deadline, and is shed as a back-off when none is.
     #[serde(default)]
     pub max_connections: Option<NonZeroUsize>,
+    /// The longest a request waits for a connection under `max_connections`, in milliseconds, or
+    /// until its operation's deadline when unset. Zero sheds a request at once when no connection
+    /// is free. Has no effect without `max_connections`.
+    #[serde(default)]
+    pub connection_acquire_timeout_millis: Option<u64>,
 }
 
 fn default_quota_per_second() -> u32 {
@@ -101,8 +107,8 @@ impl Default for TaskQueueSettings {
 /// retry stays possible, and the attempt's deadline also bounds reading its response body. A
 /// `GetObject` body is streamed by the caller after the call returns, so it is read under the
 /// operation's deadline, and the client does not retry a read that overruns it. With a connection
-/// limit, an attempt's wait for a connection may take what remains of the budget, past its share.
-/// There is no separate connect timeout.
+/// limit, an attempt's wait for a connection may take what remains of the budget, past its share,
+/// unless the connection acquire timeout ends it sooner. There is no separate connect timeout.
 #[derive(Clone, Copy, Debug)]
 pub struct TimeoutConfig {
     operation_timeout: Duration,
@@ -158,6 +164,7 @@ impl Default for HttpClientSettings {
             pool_idle_timeout_seconds: DEFAULT_POOL_IDLE_TIMEOUT_SECONDS,
             nodelay: false,
             max_connections: None,
+            connection_acquire_timeout_millis: None,
         }
     }
 }

@@ -197,8 +197,9 @@ impl ClientCore {
     /// applied twice, and a conditional `PutItem` applied before the failure reports its own write
     /// as a failed condition when resent.
     ///
-    /// A request the client's connection limit held back ends the operation, since its wait spent
-    /// the budget. It is reported as [`operation_failure`] describes. So does one the limit kept
+    /// A request the client's connection limit held back ends the operation, which goes back to
+    /// the caller as shed for its own back-off to pace. It is reported as [`operation_failure`]
+    /// describes. So does one the limit kept
     /// queued until too little of the budget was left and that then ran out of it, reported as
     /// [`TransportError::ConnectionLimitTimeout`].
     async fn dispatch<P, D, B>(&self, mut build: B) -> Result<D::Output, AwsCallError<P::Code>>
@@ -400,7 +401,7 @@ impl ClientCore {
 ///
 /// A request the connection limit held back was never sent. When an earlier attempt of the same
 /// operation was, that one may have been applied, so the operation is reported as a timeout rather
-/// than as never sent: its deadline has passed, as the wait for a connection ran to it.
+/// than as never sent.
 #[lore_macro::test_pub]
 fn operation_failure<C>(failure: AwsCallError<C>, attempts: u32) -> AwsCallError<C> {
     match failure {
@@ -419,7 +420,8 @@ pub trait Dispatch {
     type Output: HasStatus;
 
     /// Send one attempt of an operation whose budget runs out at `deadline`. `timeout` bounds its
-    /// exchange, and with a connection limit its wait for a connection lasts until `deadline`.
+    /// exchange, and with a connection limit its wait for a connection lasts until `deadline`, or
+    /// until the limit's acquire timeout when that ends sooner.
     fn send(
         client: &HttpClient,
         request: HttpRequest,

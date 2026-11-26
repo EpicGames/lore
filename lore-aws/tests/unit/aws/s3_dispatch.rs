@@ -37,6 +37,7 @@ fn client_for(server: &StubServer, timeout: Duration) -> S3Client {
         pool_idle_timeout_seconds: 5,
         nodelay: true,
         max_connections: None,
+        connection_acquire_timeout_millis: None,
     })
     .expect("a client builds");
 

@@ -281,3 +281,95 @@ async fn test_lock_store_config_error_includes_field_name() {
         config_err.message
     );
 }
+
+/// An immutable store config whose shared `http` table sets `shared` as its limit, and whose S3 and
+/// `DynamoDB` clients set `s3` and `dynamodb`.
+fn immutable_config(
+    shared: Option<usize>,
+    s3: Option<usize>,
+    dynamodb: Option<usize>,
+) -> AwsImmutableStorePluginConfig {
+    let limit = |key: &str, value: Option<usize>| {
+        value.map_or(String::new(), |value| format!("{key} = {value}\n"))
+    };
+    let text = format!(
+        "s3_bucket = \"b\"\n\
+         dynamodb_fragments_table = \"f\"\n\
+         dynamodb_fragment_state_table = \"s\"\n\
+         {}{}\
+         [http]\n\
+         pool_idle_timeout_seconds = 7\n\
+         nodelay = true\n\
+         connection_acquire_timeout_millis = 250\n\
+         {}",
+        limit("s3_max_connections", s3),
+        limit("dynamodb_max_connections", dynamodb),
+        limit("max_connections", shared),
+    );
+
+    toml::from_str(&text).expect("the config parses")
+}
+
+mod s3_http {
+    use std::num::NonZeroUsize;
+
+    use super::*;
+
+    /// The S3 client's own limit replaces the shared one, and the shared settings are otherwise
+    /// kept.
+    #[test]
+    fn its_own_limit_replaces_the_shared_limit() {
+        let s3 = immutable_config(Some(100), Some(40), Some(60)).s3_http();
+
+        assert_eq!(s3.max_connections, NonZeroUsize::new(40));
+        assert_eq!(s3.pool_idle_timeout_seconds, 7);
+        assert!(s3.nodelay);
+        assert_eq!(s3.connection_acquire_timeout_millis, Some(250));
+    }
+
+    #[test]
+    fn without_its_own_limit_the_shared_limit_applies() {
+        let s3 = immutable_config(Some(100), None, Some(60)).s3_http();
+
+        assert_eq!(s3.max_connections, NonZeroUsize::new(100));
+    }
+
+    #[test]
+    fn its_own_limit_applies_where_none_is_shared() {
+        let s3 = immutable_config(None, Some(40), None).s3_http();
+
+        assert_eq!(s3.max_connections, NonZeroUsize::new(40));
+    }
+}
+
+mod dynamodb_http {
+    use std::num::NonZeroUsize;
+
+    use super::*;
+
+    /// The `DynamoDB` client's own limit replaces the shared one, and the shared settings are
+    /// otherwise kept.
+    #[test]
+    fn its_own_limit_replaces_the_shared_limit() {
+        let dynamodb = immutable_config(Some(100), Some(40), Some(60)).dynamodb_http();
+
+        assert_eq!(dynamodb.max_connections, NonZeroUsize::new(60));
+        assert_eq!(dynamodb.pool_idle_timeout_seconds, 7);
+        assert!(dynamodb.nodelay);
+        assert_eq!(dynamodb.connection_acquire_timeout_millis, Some(250));
+    }
+
+    #[test]
+    fn without_its_own_limit_the_shared_limit_applies() {
+        let dynamodb = immutable_config(Some(100), Some(40), None).dynamodb_http();
+
+        assert_eq!(dynamodb.max_connections, NonZeroUsize::new(100));
+    }
+
+    #[test]
+    fn without_any_limit_there_is_none() {
+        let dynamodb = immutable_config(None, Some(40), None).dynamodb_http();
+
+        assert_eq!(dynamodb.max_connections, None);
+    }
+}

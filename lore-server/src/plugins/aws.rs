@@ -7,6 +7,7 @@
 //! - [`AwsMutableStorePluginFactory`] - Creates `DynamoDB`-backed mutable stores
 //! - [`AwsLockStorePluginFactory`] - Creates `DynamoDB`-backed lock stores
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -58,6 +59,15 @@ pub struct AwsImmutableStorePluginConfig {
     /// HTTP client settings for AWS operations.
     #[serde(default)]
     pub http: HttpClientSettings,
+
+    /// The S3 client's `max_connections`, in place of the one `http` sets. The S3 and `DynamoDB`
+    /// clients each have a pool of their own, so each takes its own limit.
+    #[serde(default)]
+    pub s3_max_connections: Option<NonZeroUsize>,
+
+    /// The `DynamoDB` client's `max_connections`, in place of the one `http` sets.
+    #[serde(default)]
+    pub dynamodb_max_connections: Option<NonZeroUsize>,
 
     /// S3 bucket name for storing fragment payloads.
     pub s3_bucket: String,
@@ -131,6 +141,31 @@ pub struct AwsImmutableStorePluginConfig {
     /// non-AWS hostnames like `MinIO` in Docker).
     #[serde(default)]
     pub s3_force_path_style: bool,
+}
+
+impl AwsImmutableStorePluginConfig {
+    /// The settings the S3 client is built from: `http`, with `s3_max_connections` as its limit
+    /// when that is set.
+    pub fn s3_http(&self) -> HttpClientSettings {
+        with_max_connections(&self.http, self.s3_max_connections)
+    }
+
+    /// The settings the `DynamoDB` client is built from: `http`, with `dynamodb_max_connections` as
+    /// its limit when that is set.
+    pub fn dynamodb_http(&self) -> HttpClientSettings {
+        with_max_connections(&self.http, self.dynamodb_max_connections)
+    }
+}
+
+/// `http` with its `max_connections` replaced by `max_connections`, when that is set.
+fn with_max_connections(
+    http: &HttpClientSettings,
+    max_connections: Option<NonZeroUsize>,
+) -> HttpClientSettings {
+    HttpClientSettings {
+        max_connections: max_connections.or(http.max_connections),
+        ..http.clone()
+    }
 }
 
 /// Configuration for the AWS mutable store plugin.
@@ -261,6 +296,9 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
             "Creating AWS immutable store: {plugin_config:?}"
         );
 
+        let s3_http = plugin_config.s3_http();
+        let dynamodb_http = plugin_config.dynamodb_http();
+
         // Plugin construction is a synchronous trait method. It runs once at startup, one plugin
         // at a time, so at most one core is handed off at a time.
         #[allow(clippy::disallowed_methods)]
@@ -268,7 +306,7 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
             runtime().block_on(Box::pin(async {
                 // Build S3 client
                 let s3_client = AwsClientBuilder::builder()
-                    .with_http_settings(&plugin_config.http)
+                    .with_http_settings(&s3_http)
                     .for_store(StoreKind::Immutable)
                     .maybe_endpoint(plugin_config.s3_endpoint_url.clone())
                     .maybe_region(plugin_config.s3_region.clone())
@@ -292,7 +330,7 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
 
                 // Build DynamoDB client
                 let dynamodb_client_builder = AwsClientBuilder::builder()
-                    .with_http_settings(&plugin_config.http)
+                    .with_http_settings(&dynamodb_http)
                     .for_store(StoreKind::Immutable)
                     .maybe_endpoint(plugin_config.dynamodb_endpoint_url.clone())
                     .maybe_region(plugin_config.dynamodb_region.clone())

@@ -22,9 +22,9 @@ use crate::aws_error::AwsError;
 /// Whether a failed call went unanswered because the service shed it, rather than failing.
 ///
 /// An [`AwsError::Aws`] that [`is_overloaded`] accepts is shed: a spent budget, a transport failure
-/// it counts as transient, a request the client's connection limit held back until its deadline or
-/// kept waiting until it ran out of time, an HTTP 429 or 5xx, a code the service marks as
-/// retryable, or a credential provider that could not be reached. So is
+/// it counts as transient, a request the client's connection limit held back for as long as it
+/// could wait or kept waiting until it ran out of time, an HTTP 429 or 5xx, a code the service
+/// marks as retryable, or a credential provider that could not be reached. So is
 /// [`AwsError::UnprocessedKeys`], a batch read whose table kept shedding part of it. Everything
 /// else is a failure, including a service error naming a misconfiguration such as `AccessDenied`
 /// and every other [`AwsError`] variant.

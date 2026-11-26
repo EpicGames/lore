@@ -21,6 +21,7 @@ use lore_base::lore_spawn_net;
 use lore_telemetry::InstrumentProvider;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Histogram;
+use opentelemetry::metrics::UpDownCounter;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 use tokio_util::task::AbortOnDropHandle;
@@ -118,7 +119,7 @@ pub struct HttpStream {
     cap: u64,
     /// When the operation's budget runs out, which every read of the body must finish by.
     deadline: Instant,
-    /// The permit for this response's connection, when the client limits connections.
+    /// The permit for this response's connection, for a service client.
     ///
     /// The connection is in use until the body has been read or the stream is dropped, so the
     /// stream holds the permit until it is dropped.
@@ -270,8 +271,9 @@ pub struct HttpClient {
     inner: reqwest::Client,
     /// The largest body a response may carry: [`MAX_BUFFERED_BODY`] unless a test lowered it.
     body_cap: u64,
-    /// The connections the client may have in use, when its settings limit them.
-    connections: Option<Arc<ConnectionLimit>>,
+    /// The connections a service client has in use, and its limit on them. The credential clients
+    /// count none.
+    connections: Option<Arc<Connections>>,
 }
 
 impl HttpClient {
@@ -290,16 +292,20 @@ impl HttpClient {
     ///
     /// When the settings set `max_connections`, a request takes a permit for its connection before
     /// it is sent and holds it until its body has been read, or until its stream is dropped, so no
-    /// more than that many requests are in flight at once. A request waits for a permit until its
-    /// operation's deadline.
+    /// more than that many requests are in flight at once. A request waits for a permit for at most
+    /// the settings' `connection_acquire_timeout_millis`, and never past its operation's deadline.
+    ///
+    /// The requests in flight are counted whether or not the settings limit them, and the limit is
+    /// reported beside them, so how close a client runs to its limit can be watched.
     pub fn new(settings: &HttpClientSettings) -> Result<Self, TransportError> {
         Self::labelled(settings, &[])
     }
 
     /// [`Self::new`], for the client that sends a store's requests to `service`.
     ///
-    /// The time its requests wait for a connection is labelled with `service`, and with `store`
-    /// when one is named, so a wait can be traced to the store whose limit it waited on.
+    /// Its requests in flight, its limit and the time its requests wait for a connection are
+    /// labelled with `service`, and with `store` when one is named, so each can be traced to the
+    /// store whose connections they count.
     pub(crate) fn for_service(
         settings: &HttpClientSettings,
         service: &'static str,
@@ -317,15 +323,18 @@ impl HttpClient {
         }
     }
 
-    /// [`Self::new`], with the time its requests wait for a connection labelled `wait_labels`.
+    /// [`Self::new`], with what it records labelled `labels`.
     fn labelled(
         settings: &HttpClientSettings,
-        wait_labels: &[KeyValue],
+        labels: &[KeyValue],
     ) -> Result<Self, TransportError> {
-        let connections = settings
-            .max_connections
-            .map(|max| ConnectionLimit::new(max, wait_labels.to_vec()))
-            .transpose()?;
+        let connections = Connections::new(
+            labels.to_vec(),
+            settings.max_connections,
+            settings
+                .connection_acquire_timeout_millis
+                .map(Duration::from_millis),
+        )?;
 
         let inner = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(settings.pool_idle_timeout_seconds))
@@ -337,10 +346,14 @@ impl HttpClient {
             .build()
             .map_err(|error| TransportError::Build(error.to_string()))?;
 
+        if let Some(max) = settings.max_connections {
+            report_max_connections(max, labels.to_vec());
+        }
+
         Ok(Self {
             inner,
             body_cap: MAX_BUFFERED_BODY,
-            connections,
+            connections: Some(connections),
         })
     }
 
@@ -411,13 +424,13 @@ impl HttpClient {
     /// Send `request`, reading the whole body, as one attempt of an operation whose budget runs out
     /// at `deadline`.
     ///
-    /// When the client limits connections, the request waits for a permit until `deadline` and
-    /// holds it until the body has been read, and the exchange then has `timeout` or what is left
-    /// until `deadline`, whichever is less. Without a limit, `timeout` bounds the exchange. A
-    /// request that finds no connection released by `deadline` fails as
-    /// [`TransportError::ConnectionLimit`]. One whose wait cut `timeout` short — the whole of it
-    /// fit before `deadline` when the wait began — and that is then not answered by `deadline`
-    /// fails as [`TransportError::ConnectionLimitTimeout`].
+    /// When the client limits connections, the request waits for a permit until `deadline`, or for
+    /// the client's acquire timeout when that ends sooner, and holds it until the body has been
+    /// read. The exchange then has `timeout` or what is left until `deadline`, whichever is less.
+    /// Without a limit, `timeout` bounds the exchange. A request that finds no connection released
+    /// in time fails as [`TransportError::ConnectionLimit`]. One whose wait cut `timeout` short —
+    /// the whole of it fit before `deadline` when the wait began — and that is then not answered by
+    /// `deadline` fails as [`TransportError::ConnectionLimitTimeout`].
     ///
     /// The exchange is spawned on the net runtime when this is called, and the future returned only
     /// waits for it, so it holds the task's handle rather than the request. The task with a limit
@@ -441,13 +454,14 @@ impl HttpClient {
         // Awaited from a net task so hyper's connection driver is spawned there. Reading the body
         // there rather than in the caller keeps the whole exchange on one runtime.
         let dispatched = AbortOnDropHandle::new(match &self.connections {
-            None => lore_spawn_net!(exchange(client, built, cap)),
-            Some(limit) => lore_spawn_net!(exchange_within_limit(
-                limit.clone(),
-                deadline,
+            Some(connections) if connections.is_limited() => lore_spawn_net!(
+                exchange_within_limit(connections.clone(), deadline, client, built, cap,)
+            ),
+            connections => lore_spawn_net!(exchange(
                 client,
                 built,
                 cap,
+                connections.clone().map(ConnectionPermit::new),
             )),
         });
 
@@ -474,10 +488,11 @@ impl HttpClient {
     /// every read of the body after that, so a body arriving slowly but steadily has what is left of
     /// the whole budget rather than the attempt's share of it.
     ///
-    /// Spawned when called, limited, and aborted when the future returned is dropped, as
-    /// [`Self::send_by`] is: the request waits for a permit until `deadline`, and the stream holds it
-    /// until it is dropped. A request whose wait cut `timeout` short, and whose headers then do not
-    /// arrive by `deadline`, fails as [`TransportError::ConnectionLimitTimeout`].
+    /// Spawned when called, limited, counted and aborted when the future returned is dropped, as
+    /// [`Self::send_by`] is, except that the stream holds its permit, and its place in the count of
+    /// requests in flight, until it is dropped. A request whose wait cut `timeout` short, and whose
+    /// headers then do not arrive by `deadline`, fails as
+    /// [`TransportError::ConnectionLimitTimeout`].
     pub fn send_streaming(
         &self,
         request: HttpRequest,
@@ -488,16 +503,18 @@ impl HttpClient {
         let built = Self::build(request, None);
         let client = self.inner.clone();
 
-        let dispatched = AbortOnDropHandle::new(match &self.connections {
-            None => lore_spawn_net!(open(client, built, timeout)),
-            Some(limit) => lore_spawn_net!(open_within_limit(
-                limit.clone(),
-                deadline,
-                timeout,
-                client,
-                built,
-            )),
-        });
+        let dispatched =
+            AbortOnDropHandle::new(match &self.connections {
+                Some(connections) if connections.is_limited() => lore_spawn_net!(
+                    open_within_limit(connections.clone(), deadline, timeout, client, built,)
+                ),
+                connections => lore_spawn_net!(open(
+                    client,
+                    built,
+                    timeout,
+                    connections.clone().map(ConnectionPermit::new),
+                )),
+            });
 
         async move {
             match dispatched.await {
@@ -538,13 +555,20 @@ impl HttpClient {
 /// connection.
 const CONNECTION_WAIT_METRIC_NAME: &str = "connection_wait";
 
-/// The label on a connection wait that names the service the client sends to.
+/// The name, under [`LoreHttpInstruments`], of the count of requests a client has in flight.
+const REQUESTS_IN_FLIGHT_METRIC_NAME: &str = "requests_in_flight";
+
+/// The name, under [`LoreHttpInstruments`], of the gauge of a client's `max_connections`.
+const MAX_CONNECTIONS_METRIC_NAME: &str = "max_connections";
+
+/// The label on a client's measurements that names the service it sends to.
 const SERVICE_LABEL_KEY: &str = "service";
 
-/// The label on a connection wait that names the store the client serves.
+/// The label on a client's measurements that names the store it serves.
 const STORE_LABEL_KEY: &str = "store";
 
-/// The instruments the HTTP transport records into.
+/// The HTTP transport's instruments whose names dashboards and alerts already read, under
+/// `urc.aws.http`.
 struct HttpInstruments;
 
 impl InstrumentProvider for HttpInstruments {
@@ -553,55 +577,106 @@ impl InstrumentProvider for HttpInstruments {
     }
 }
 
-/// The connections a client may have in use at once, and how long its requests wait for one.
-struct ConnectionLimit {
-    permits: Semaphore,
-    /// How long each request waited for a connection, in milliseconds, whether or not it got one.
-    wait: Histogram<f64>,
-    /// The labels each wait is recorded with.
-    wait_labels: Vec<KeyValue>,
-}
+/// The HTTP transport's other instruments, under `lore.aws.http`.
+struct LoreHttpInstruments;
 
-impl fmt::Debug for ConnectionLimit {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ConnectionLimit")
-            .field("available", &self.permits.available_permits())
-            .finish_non_exhaustive()
+impl InstrumentProvider for LoreHttpInstruments {
+    fn namespace(&self) -> &'static str {
+        "lore.aws.http"
     }
 }
 
-impl ConnectionLimit {
-    /// A limit of `max` connections, whose waits are recorded with `wait_labels`.
+/// The connections one service client has in use, and the limit on them when its settings set one.
+///
+/// The client speaks HTTP/1.1, so each request in flight holds a connection of its own: a request
+/// counts as in flight from when it is sent until its body has been read or its stream is dropped.
+struct Connections {
+    in_flight: UpDownCounter<i64>,
+    /// The labels the count, and every wait for a connection, are recorded with.
+    labels: Vec<KeyValue>,
+    limit: Option<ConnectionLimit>,
+}
+
+/// The most connections a client may have in use at once, and how long its requests wait for one.
+struct ConnectionLimit {
+    permits: Semaphore,
+    /// The longest a request waits for a permit, when it is not its operation's deadline.
+    acquire_timeout: Option<Duration>,
+    /// How long each request waited for a connection, in milliseconds, whether or not it got one.
+    wait: Histogram<f64>,
+}
+
+impl fmt::Debug for Connections {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = f.debug_struct("Connections");
+        debug.field("labels", &self.labels);
+        if let Some(limit) = &self.limit {
+            debug
+                .field("available", &limit.permits.available_permits())
+                .field("acquire_timeout", &limit.acquire_timeout);
+        }
+        debug.finish_non_exhaustive()
+    }
+}
+
+impl Connections {
+    /// The connections of a client whose measurements carry `labels`, limited to `max` when one is
+    /// given, each waited for no longer than `acquire_timeout` when one is given.
     ///
     /// A semaphore holds at most [`Semaphore::MAX_PERMITS`] permits, so the client is not built
     /// with a limit past it.
-    fn new(max: NonZeroUsize, wait_labels: Vec<KeyValue>) -> Result<Arc<Self>, TransportError> {
-        if max.get() > Semaphore::MAX_PERMITS {
-            return Err(TransportError::Build(format!(
-                "max_connections must be at most {}, not {max}",
-                Semaphore::MAX_PERMITS
-            )));
-        }
+    fn new(
+        labels: Vec<KeyValue>,
+        max: Option<NonZeroUsize>,
+        acquire_timeout: Option<Duration>,
+    ) -> Result<Arc<Self>, TransportError> {
+        let limit = match max {
+            Some(max) if max.get() > Semaphore::MAX_PERMITS => {
+                return Err(TransportError::Build(format!(
+                    "max_connections must be at most {}, not {max}",
+                    Semaphore::MAX_PERMITS
+                )));
+            }
+            Some(max) => Some(ConnectionLimit {
+                permits: Semaphore::new(max.get()),
+                acquire_timeout,
+                wait: HttpInstruments.latency_histogram_ms(CONNECTION_WAIT_METRIC_NAME),
+            }),
+            None => None,
+        };
 
         Ok(Arc::new(Self {
-            permits: Semaphore::new(max.get()),
-            wait: HttpInstruments.latency_histogram_ms(CONNECTION_WAIT_METRIC_NAME),
-            wait_labels,
+            in_flight: LoreHttpInstruments
+                .meter()
+                .i64_up_down_counter(LoreHttpInstruments.scope_name(REQUESTS_IN_FLIGHT_METRIC_NAME))
+                .build(),
+            labels,
+            limit,
         }))
     }
 
-    /// A connection, with how long the request waited for it, or `None` when none was released by
-    /// `deadline`.
+    /// Whether requests wait for a permit before they are sent.
+    fn is_limited(&self) -> bool {
+        self.limit.is_some()
+    }
+
+    /// A connection, with how long the request waited for it, or `None` when none was released
+    /// within the acquire timeout or by `deadline`, whichever comes first. Without a limit, a
+    /// connection at once.
     ///
     /// The time waited is recorded either way, as none when a connection was free. The semaphore
-    /// is never closed, so the wait ends with a permit or at the deadline.
+    /// is never closed, so the wait ends with a permit or when its time runs out.
     async fn connection_by(
         self: Arc<Self>,
         deadline: Instant,
     ) -> Option<(ConnectionPermit, Duration)> {
+        let Some(limit) = &self.limit else {
+            return Some((ConnectionPermit::new(self), Duration::ZERO));
+        };
+
         // A released permit goes to the longest-queued request before it is free to take, so a
         // free one passes no request that queued.
-        let free = match self.permits.try_acquire() {
+        let free = match limit.permits.try_acquire() {
             Ok(permit) => {
                 permit.forget();
                 true
@@ -609,14 +684,21 @@ impl ConnectionLimit {
             Err(_) => false,
         };
         if free {
-            self.wait.record(0.0, &self.wait_labels);
+            limit.wait.record(0.0, &self.labels);
 
-            return Some((ConnectionPermit(self), Duration::ZERO));
+            return Some((ConnectionPermit::new(self), Duration::ZERO));
         }
 
         let waiting = Instant::now();
-
-        let held = match tokio::time::timeout_at(deadline, self.permits.acquire()).await {
+        let held = match tokio::time::timeout_at(
+            limit
+                .acquire_timeout
+                .and_then(|timeout| waiting.checked_add(timeout))
+                .map_or(deadline, |end| deadline.min(end)),
+            limit.permits.acquire(),
+        )
+        .await
+        {
             Ok(Ok(permit)) => {
                 permit.forget();
                 true
@@ -624,27 +706,55 @@ impl ConnectionLimit {
             Ok(Err(_)) | Err(_) => false,
         };
         let waited = waiting.elapsed();
-        self.wait
-            .record(waited.as_secs_f64() * 1000.0, &self.wait_labels);
+        limit
+            .wait
+            .record(waited.as_secs_f64() * 1000.0, &self.labels);
 
         // Built only once a permit is held: dropping one releases a permit.
         if held {
-            Some((ConnectionPermit(self), waited))
+            Some((ConnectionPermit::new(self), waited))
         } else {
             None
         }
     }
 }
 
-/// A connection taken from a [`ConnectionLimit`], released to it when dropped.
+/// Report a client's limit of `max` connections as a gauge under `labels`, the labels its requests in
+/// flight are counted with, so those can be read as a share of it.
 ///
-/// One pointer, where a semaphore's own owned permit is two: the limit it returns to also holds the
-/// semaphore, and a permit is always one connection.
-struct ConnectionPermit(Arc<ConnectionLimit>);
+/// The gauge lasts as long as the process, so it is reported only for a client that was built.
+fn report_max_connections(max: NonZeroUsize, labels: Vec<KeyValue>) {
+    let reported = max.get() as u64;
+    LoreHttpInstruments
+        .meter()
+        .u64_observable_gauge(LoreHttpInstruments.scope_name(MAX_CONNECTIONS_METRIC_NAME))
+        .with_callback(move |observer| observer.observe(reported, &labels))
+        .build();
+}
+
+/// A connection in use, counted as in flight while held, and released to the client's limit when
+/// dropped, when the client has one.
+///
+/// One pointer, where a semaphore's own owned permit is two: the connections it returns to also
+/// hold the semaphore, and a permit is always one connection.
+struct ConnectionPermit(Arc<Connections>);
+
+impl ConnectionPermit {
+    /// The permit for a request about to be sent, whose connection is already taken from the
+    /// limit's semaphore when there is one.
+    fn new(connections: Arc<Connections>) -> Self {
+        connections.in_flight.add(1, &connections.labels);
+
+        Self(connections)
+    }
+}
 
 impl Drop for ConnectionPermit {
     fn drop(&mut self) {
-        self.0.permits.add_permits(1);
+        self.0.in_flight.add(-1, &self.0.labels);
+        if let Some(limit) = &self.0.limit {
+            limit.permits.add_permits(1);
+        }
     }
 }
 
@@ -653,10 +763,12 @@ impl Drop for ConnectionPermit {
 type Exchanged = Result<(StatusCode, HeaderMap, Option<Bytes>), TransportError>;
 
 /// What opening a stream hands back: the response with its body unread, and the permit for its
-/// connection when the client limits connections.
+/// connection for a service client.
 type Opened = Result<(reqwest::Response, Option<ConnectionPermit>), TransportError>;
 
 /// Send `request` and read its body, giving up past `cap`. The request's own timeout bounds both.
+/// `connection`, the request's permit, is held until the body has been read or the exchange is
+/// dropped.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
@@ -664,6 +776,7 @@ fn exchange(
     client: reqwest::Client,
     request: reqwest::Request,
     cap: u64,
+    connection: Option<ConnectionPermit>,
 ) -> impl Future<Output = Exchanged> {
     async move {
         let mut response = client
@@ -678,24 +791,26 @@ fn exchange(
             .await
             .map_err(|error| classify(&error))?;
 
+        drop(connection);
+
         Ok((status, headers, body))
     }
 }
 
-/// [`exchange`], once a connection from `limit` is held, which it keeps until the body has been
-/// read.
+/// [`exchange`], once a connection from `connections` is held, which it keeps until the body has
+/// been read.
 ///
-/// The wait for the connection lasts until `deadline`, the operation's, and the request's own
-/// timeout is then cut to what is left until it. A request whose wait cut its timeout short, as
-/// [`shortened_by_wait`] decides, fails as [`TransportError::ConnectionLimitTimeout`] when it runs
-/// out of what remained.
+/// The wait for the connection lasts until `deadline`, the operation's, unless the limit's acquire
+/// timeout ends it sooner, and the request's own timeout is then cut to what is left until it. A
+/// request whose wait cut its timeout short, as [`shortened_by_wait`] decides, fails as
+/// [`TransportError::ConnectionLimitTimeout`] when it runs out of what remained.
 ///
 /// It repeats the steps of [`exchange`] rather than awaiting it, which would hold the request
 /// twice, in this future and in that one. Not an `async fn`, which would hold a second copy of its
 /// arguments.
 #[allow(clippy::manual_async_fn)]
 fn exchange_within_limit(
-    limit: Arc<ConnectionLimit>,
+    connections: Arc<Connections>,
     deadline: Instant,
     client: reqwest::Client,
     mut request: reqwest::Request,
@@ -703,7 +818,7 @@ fn exchange_within_limit(
 ) -> impl Future<Output = Exchanged> {
     async move {
         // Decided inside the arm, so the wait's figures are not kept across the exchange.
-        let (_connection, shortened) = match limit.connection_by(deadline).await {
+        let (_connection, shortened) = match connections.connection_by(deadline).await {
             Some((connection, waited)) => {
                 let left = deadline.saturating_duration_since(Instant::now());
                 let shortened = match request.timeout_mut() {
@@ -733,7 +848,8 @@ fn exchange_within_limit(
     }
 }
 
-/// Send `request` and wait no longer than `timeout` for the response's headers.
+/// Send `request` and wait no longer than `timeout` for the response's headers, handing
+/// `connection`, its permit, back with the response for the stream to hold.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
@@ -741,27 +857,29 @@ fn open(
     client: reqwest::Client,
     request: reqwest::Request,
     timeout: Duration,
+    connection: Option<ConnectionPermit>,
 ) -> impl Future<Output = Opened> {
     async move {
         match tokio::time::timeout(timeout, client.execute(request)).await {
-            Ok(Ok(response)) => Ok((response, None)),
+            Ok(Ok(response)) => Ok((response, connection)),
             Ok(Err(error)) => Err(classify(&error)),
             Err(_elapsed) => Err(no_response_in_time()),
         }
     }
 }
 
-/// [`open`], once a connection from `limit` is held, which it hands back with the response.
+/// [`open`], once a connection from `connections` is held, which it hands back with the response.
 ///
-/// The wait for the connection lasts until `deadline`, the operation's, and the wait for the
-/// headers then has `timeout` or what is left until `deadline`, whichever is less. A request whose
-/// wait cut `timeout` short, as [`shortened_by_wait`] decides, fails as
-/// [`TransportError::ConnectionLimitTimeout`] when its headers do not arrive in what remained.
+/// The wait for the connection lasts until `deadline`, the operation's, unless the limit's acquire
+/// timeout ends it sooner, and the wait for the headers then has `timeout` or what is left until
+/// `deadline`, whichever is less. A request whose wait cut `timeout` short, as
+/// [`shortened_by_wait`] decides, fails as [`TransportError::ConnectionLimitTimeout`] when its
+/// headers do not arrive in what remained.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
 fn open_within_limit(
-    limit: Arc<ConnectionLimit>,
+    connections: Arc<Connections>,
     deadline: Instant,
     timeout: Duration,
     client: reqwest::Client,
@@ -769,7 +887,7 @@ fn open_within_limit(
 ) -> impl Future<Output = Opened> {
     async move {
         // Decided inside the arm, so the wait's figures are not kept across the exchange.
-        let (connection, shortened, response) = match limit.connection_by(deadline).await {
+        let (connection, shortened, response) = match connections.connection_by(deadline).await {
             Some((connection, waited)) => {
                 let left = deadline.saturating_duration_since(Instant::now());
                 (

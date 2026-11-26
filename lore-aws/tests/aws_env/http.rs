@@ -32,6 +32,7 @@ async fn the_service_client_ignores_the_environments_proxy() {
                 pool_idle_timeout_seconds: 5,
                 nodelay: true,
                 max_connections: None,
+                connection_acquire_timeout_millis: None,
             })
             .expect("a client builds");
 

@@ -24,8 +24,9 @@ pub enum TransportError {
     Body(String),
     /// The response was not the shape the protocol requires.
     Protocol(String),
-    /// Every connection the client may have in use stayed in use until the operation's deadline,
-    /// so the request was never sent.
+    /// Every connection the client may have in use stayed in use for as long as the request could
+    /// wait — the client's acquire timeout or the operation's deadline, whichever came first — so
+    /// the request was never sent.
     ConnectionLimit,
     /// Waiting for a connection cut the request's timeout short — its whole timeout fit before the
     /// operation's deadline when it began to wait, and no longer did once it had a connection — and
@@ -40,9 +41,10 @@ impl TransportError {
     /// A request that could not be built will not build on the next attempt either, and a body the
     /// client refuses to hold will be the same size when it arrives again. Both are properties of
     /// the exchange rather than of the moment it was attempted in, so waiting them out only delays
-    /// the report. A request that waited for a connection until the operation's deadline has no
-    /// budget left to be sent in, and neither has one that queued for a connection and then ran out
-    /// of what was left.
+    /// the report. A request the connection limit held back is shed rather than sent again at once,
+    /// since the connections it waited on are still busy and the caller's back-off paces the next
+    /// try. One that queued for a connection and then ran out of what was left has no budget to be
+    /// sent in.
     pub fn is_worth_resending(&self) -> bool {
         matches!(self, Self::Io(_) | Self::Body(_))
     }
@@ -56,8 +58,8 @@ impl fmt::Display for TransportError {
             Self::Body(why) => write!(f, "failed to read response body: {why}"),
             Self::Protocol(why) => write!(f, "malformed response: {why}"),
             Self::ConnectionLimit => f.write_str(
-                "no connection was released within the operation's budget; every connection \
-                 max_connections allows was in use",
+                "no connection was released in time; every connection max_connections allows \
+                 was in use",
             ),
             Self::ConnectionLimitTimeout => f.write_str(
                 "the exchange did not finish within the operation's budget, after waiting for a \

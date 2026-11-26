@@ -77,6 +77,7 @@ fn client_with_credentials(
         pool_idle_timeout_seconds: 5,
         nodelay: true,
         max_connections: None,
+        connection_acquire_timeout_millis: None,
     })
     .expect("a client builds");
 
@@ -1005,6 +1006,7 @@ async fn an_operation_that_finds_no_connection_by_its_deadline_is_not_resent() {
         pool_idle_timeout_seconds: 5,
         nodelay: true,
         max_connections: NonZeroUsize::new(1),
+        connection_acquire_timeout_millis: None,
     })
     .expect("a client builds");
 
@@ -1062,6 +1064,7 @@ async fn a_first_attempt_that_queued_and_ran_out_of_time_ends_as_a_connection_li
         pool_idle_timeout_seconds: 5,
         nodelay: true,
         max_connections: NonZeroUsize::new(1),
+        connection_acquire_timeout_millis: None,
     })
     .expect("a client builds");
 
@@ -1113,6 +1116,7 @@ async fn a_resend_that_queued_for_a_connection_and_ran_out_of_time_ends_as_a_tim
         pool_idle_timeout_seconds: 5,
         nodelay: true,
         max_connections: NonZeroUsize::new(1),
+        connection_acquire_timeout_millis: None,
     })
     .expect("a client builds");
 
@@ -1171,6 +1175,7 @@ async fn a_resend_held_back_by_the_connection_limit_ends_as_a_timeout() {
         pool_idle_timeout_seconds: 5,
         nodelay: true,
         max_connections: NonZeroUsize::new(1),
+        connection_acquire_timeout_millis: None,
     })
     .expect("a client builds");
 

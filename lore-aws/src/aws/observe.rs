@@ -111,15 +111,15 @@ fn unanswered<E: ServiceErrorCode>(
 }
 
 /// Log a call this client never sent, because every connection its `max_connections` setting
-/// allows stayed in use until the operation's deadline, returning its label.
+/// allows stayed in use for as long as the call could wait for one, returning its label.
 ///
 /// No service took part, so the message names the client's own limit rather than AWS. It is logged
 /// at debug, as a shed store call is: under load it is ordinary, and the label already counts it.
 fn unsent(elapsed: &Duration) -> StringValue {
     debug!(
         { ELAPSED_MS_FIELD } = elapsed.as_millis(),
-        "AWS call not sent: no connection was released within the operation's budget, and \
-         max_connections allows no more"
+        "AWS call not sent: no connection was released in time, and max_connections allows no \
+         more"
     );
 
     StringValue::from("ConnectionLimit")

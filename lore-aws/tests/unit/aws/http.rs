@@ -28,6 +28,7 @@ fn capped_client() -> HttpClient {
         pool_idle_timeout_seconds: 5,
         nodelay: true,
         max_connections: None,
+        connection_acquire_timeout_millis: None,
     })
     .expect("a client builds")
     .with_body_cap(CAP)
@@ -44,12 +45,25 @@ fn limited_settings(max: usize) -> HttpClientSettings {
         pool_idle_timeout_seconds: 5,
         nodelay: true,
         max_connections: Some(NonZeroUsize::new(max).expect("a limit is at least one")),
+        connection_acquire_timeout_millis: None,
     }
 }
 
 /// A client that has at most `max` connections in use at once.
 fn limited_client(max: usize) -> HttpClient {
     HttpClient::new(&limited_settings(max)).expect("a client builds")
+}
+
+/// A client that has at most `max` connections in use at once, and whose requests wait for one no
+/// longer than `acquire_timeout`.
+fn limited_client_waiting(max: usize, acquire_timeout: Duration) -> HttpClient {
+    HttpClient::new(&HttpClientSettings {
+        connection_acquire_timeout_millis: Some(
+            u64::try_from(acquire_timeout.as_millis()).expect("a test timeout fits"),
+        ),
+        ..limited_settings(max)
+    })
+    .expect("a client builds")
 }
 
 /// An operation deadline `after` from now.
@@ -68,6 +82,7 @@ fn a_client_builds_from_the_store_settings() {
         pool_idle_timeout_seconds: 30,
         nodelay: true,
         max_connections: None,
+        connection_acquire_timeout_millis: None,
     };
 
     assert!(HttpClient::new(&settings).is_ok());
@@ -179,6 +194,107 @@ async fn a_request_waits_for_a_connection_past_its_attempt_timeout() {
 
             assert_eq!(response.status, StatusCode::OK);
             assert_eq!(answering.request_count(), 1);
+        })
+        .await;
+}
+
+/// A request past the connection limit waits no longer than the client's acquire timeout, though
+/// its operation's deadline is far off, and is shed as held back by the limit without being sent.
+#[tokio::test]
+async fn a_request_past_the_connection_limit_is_shed_at_its_acquire_timeout() {
+    LORE_CONTEXT
+        .scope(crate::store::setup_execution("test".to_string()), async {
+            let server = StubServer::silent().await;
+            let client = limited_client_waiting(1, Duration::from_millis(100));
+
+            let _held = client.send(
+                HttpRequest::new(Method::GET, server.endpoint()),
+                Duration::from_secs(30),
+            );
+            server.wait_for_requests(1).await;
+
+            let started = Instant::now();
+            let error = client
+                .send_by(
+                    HttpRequest::new(Method::GET, server.endpoint()),
+                    Duration::from_secs(30),
+                    distant_deadline(),
+                )
+                .await
+                .expect_err("no connection is released within the acquire timeout");
+
+            assert!(
+                matches!(error, TransportError::ConnectionLimit),
+                "unexpected failure: {error:?}"
+            );
+            let waited = started.elapsed();
+            assert!(
+                waited >= Duration::from_millis(100) && waited < Duration::from_secs(5),
+                "the wait ends at the acquire timeout, not the deadline: waited {waited:?}"
+            );
+            assert_eq!(server.request_count(), 1);
+        })
+        .await;
+}
+
+/// An acquire timeout of zero sheds a request at once when every connection is in use.
+#[tokio::test]
+async fn an_acquire_timeout_of_zero_sheds_a_request_when_no_connection_is_free() {
+    LORE_CONTEXT
+        .scope(crate::store::setup_execution("test".to_string()), async {
+            let server = StubServer::silent().await;
+            let client = limited_client_waiting(1, Duration::ZERO);
+
+            let _held = client.send(
+                HttpRequest::new(Method::GET, server.endpoint()),
+                Duration::from_secs(30),
+            );
+            server.wait_for_requests(1).await;
+
+            let error = client
+                .send_streaming(
+                    HttpRequest::new(Method::GET, server.endpoint()),
+                    Duration::from_secs(30),
+                    distant_deadline(),
+                )
+                .await
+                .expect_err("no connection is free");
+
+            assert!(
+                matches!(error, TransportError::ConnectionLimit),
+                "unexpected failure: {error:?}"
+            );
+            assert_eq!(server.request_count(), 1);
+        })
+        .await;
+}
+
+/// A request past the connection limit is sent once a connection is released within its acquire
+/// timeout.
+#[tokio::test]
+async fn a_connection_released_within_the_acquire_timeout_is_taken() {
+    LORE_CONTEXT
+        .scope(crate::store::setup_execution("test".to_string()), async {
+            let silent = StubServer::silent().await;
+            let answering = StubServer::start(vec![StubResponse::ok("{}")]).await;
+            let client = limited_client_waiting(1, Duration::from_secs(2));
+
+            let _held = client.send(
+                HttpRequest::new(Method::GET, silent.endpoint()),
+                Duration::from_millis(200),
+            );
+            silent.wait_for_requests(1).await;
+
+            let response = client
+                .send_by(
+                    HttpRequest::new(Method::GET, answering.endpoint()),
+                    Duration::from_secs(5),
+                    distant_deadline(),
+                )
+                .await
+                .expect("the held connection is released within the acquire timeout");
+
+            assert_eq!(response.status, StatusCode::OK);
         })
         .await;
 }
@@ -817,6 +933,7 @@ async fn a_declared_body_read_in_pieces_arrives_whole() {
                 pool_idle_timeout_seconds: 5,
                 nodelay: true,
                 max_connections: None,
+                connection_acquire_timeout_millis: None,
             })
             .expect("a client builds");
 
