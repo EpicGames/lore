@@ -114,7 +114,7 @@ fn each_walk_makes_only_its_callers_hand_off() {
         .expect("a runtime");
 
     let pool = lore_io::pool::SyscallPool::new(1);
-    let ((), hops) = during_async(&runtime, pool.submit(|| ()));
+    let ((), hops) = during_async(&runtime, async { pool.submit(|| ()).await });
     check(
         "(a job)",
         "a submission to a pool",

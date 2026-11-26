@@ -7264,11 +7264,123 @@ mod tests {
             .expect("Test task failed");
     }
 
+    /// What a directory holds before `lore dirty move` moves it from `d` to `e`.
+    #[derive(Clone, Copy, Debug)]
+    enum MovedDirectory {
+        Empty,
+        OnlyDirectories,
+        AFile,
+    }
+
+    impl MovedDirectory {
+        const ALL: [Self; 3] = [Self::Empty, Self::OnlyDirectories, Self::AFile];
+
+        /// A committed repository holding `Top.txt` and `d` holding what `self` names, which the
+        /// working tree holds moved to `e`, the move marked with `lore dirty move`.
+        #[allow(clippy::disallowed_methods)] // A test fixture in its own temporary directory.
+        async fn dirty_moved(
+            self,
+        ) -> (
+            Arc<lore_revision::repository::RepositoryContext>,
+            lore_base::test_util::TempDir,
+        ) {
+            let (repository, tempdir) = committed_repository("", &["Top.txt".to_string()]).await;
+            let root = tempdir.to_path_buf();
+            std::fs::create_dir_all(root.join("d")).expect("Create directory failed");
+            match self {
+                Self::Empty => {}
+                Self::OnlyDirectories => {
+                    for below in ["d/Sub", "d/Other"] {
+                        std::fs::create_dir_all(root.join(below)).expect("Create directory failed");
+                    }
+                }
+                Self::AFile => test_file_write(root.join("d/k.txt").as_path(), b"k"),
+            }
+            stage_paths(&repository, &root, &["."], true, false).await;
+            commit::commit_boxed(
+                repository.clone(),
+                repository
+                    .try_write_token()
+                    .expect("The repository was opened for writing"),
+                CommitOptions::new("Directory".to_string()),
+            )
+            .await
+            .expect("Commit failed");
+            std::fs::rename(root.join("d"), root.join("e")).expect("Move failed");
+            let at = |path: &str| root.join(path).to_string_lossy().into_owned();
+            file::dirty::dirty_move(repository.clone(), at("d"), at("e"))
+                .await
+                .expect("Dirty move failed");
+            (repository, tempdir)
+        }
+
+        /// What a status reports of the move before a stage: the directory and each node that
+        /// moves with it, none staged.
+        fn reported(self) -> Vec<(String, bool)> {
+            let below: &[&str] = match self {
+                Self::Empty => &[],
+                Self::OnlyDirectories => &["V d/Other -> e/Other/", "V d/Sub -> e/Sub/"],
+                Self::AFile => &["V d/k.txt -> e/k.txt"],
+            };
+            std::iter::once("V d -> e/")
+                .chain(below.iter().copied())
+                .map(|entry| (entry.to_string(), false))
+                .collect()
+        }
+    }
+
+    /// A status of a directory `lore dirty move` moved, empty, holding only directories or holding
+    /// a file, reports the directory as moved from its committed path, with each directory below
+    /// it that moves with it, as it reports each file below it, with or without a scan.
+    #[tokio::test]
+    async fn a_status_reports_a_dirty_moved_directory_as_a_move() {
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(setup_test_execution(), async move {
+                for moved in MovedDirectory::ALL {
+                    let (repository, _tempdir) = moved.dirty_moved().await;
+                    for scan in [false, true] {
+                        assert_eq!(
+                            status_reported(&repository, None, scan).await,
+                            moved.reported(),
+                            "{moved:?}, scan {scan}"
+                        );
+                    }
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A status after a stage of the whole tree reports a directory `lore dirty move` moved, empty,
+    /// holding only directories or holding a file, as a staged move, which stands for what moves
+    /// with it, as a status reports a directory's move `lore stage move` staged.
+    #[tokio::test]
+    async fn a_status_reports_a_staged_dirty_moved_directory_as_a_staged_move() {
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(setup_test_execution(), async move {
+                for moved in MovedDirectory::ALL {
+                    let (repository, tempdir) = moved.dirty_moved().await;
+                    stage_paths(&repository, &tempdir, &["."], false, false).await;
+                    for scan in [false, true] {
+                        assert_eq!(
+                            status_reported(&repository, None, scan).await,
+                            [("V d -> e/".to_string(), true)],
+                            "{moved:?}, scan {scan}"
+                        );
+                    }
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
     /// A dirty copy into a directory the ignore file names marks a new node, which the tree does
     /// not track, so an ordinary status leaves it out and an ordinary stage stages nothing of it,
     /// where a copy into a directory no rule names is reported and staged. A dirty move there keeps
-    /// the committed node it moves, which the tree tracks wherever it moves, so it is reported as a
-    /// move into a directory no rule names is.
+    /// the committed node it moves, which the tree tracks wherever it moves, so it is reported and
+    /// staged as a move into a directory no rule names is.
     #[tokio::test]
     async fn a_dirty_copy_into_an_ignored_directory_stays_ignored_and_a_dirty_move_does_not() {
         #[allow(clippy::disallowed_methods)]
@@ -7307,15 +7419,12 @@ mod tests {
                 file::dirty::dirty_move(ruled.clone(), at("other.txt"), at("plain/other.txt"))
                     .await
                     .expect("Dirty move failed");
-                let moves = [
-                    ("V moved.txt -> bin/moved.txt".to_string(), false),
-                    ("V other.txt -> plain/other.txt".to_string(), false),
-                ];
-                let copy = |staged: bool| ("A plain/copy.txt".to_string(), staged);
                 let reported = |staged: bool| {
-                    std::iter::once(copy(staged))
-                        .chain(moves.iter().cloned())
-                        .collect::<Vec<_>>()
+                    vec![
+                        ("A plain/copy.txt".to_string(), staged),
+                        ("V moved.txt -> bin/moved.txt".to_string(), staged),
+                        ("V other.txt -> plain/other.txt".to_string(), staged),
+                    ]
                 };
                 assert_eq!(
                     status_reported(&ruled, None, false).await,

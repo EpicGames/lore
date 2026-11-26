@@ -207,6 +207,7 @@ async fn a_scanned_change_is_held_once_while_it_is_reported() {
             let scan_report = ScanReport {
                 summary: Arc::new(StatusSummaryStats::default()),
                 whole_deleted_directories: true,
+                moves_from: None,
             };
             let mut changes = state::ChangeStream::nothing();
 

@@ -197,12 +197,17 @@ impl Model {
     }
 
     /// Whether a stage of `path`, a path a move took a node to, finds a change at or below it to
-    /// stage: a new file, a file edited and marked dirty, or a removal marked dirty. A move marked
-    /// dirty alone is none, so the stage leaves it as it is.
+    /// stage: a new file, a file edited and marked dirty, a file a move marked dirty and no stage
+    /// took, or a removal marked dirty.
     fn changes_at_or_below(&self, path: &str) -> bool {
         self.subtree(path).iter().any(|held| {
             let entry = &self.paths[held];
-            !entry.directory && (entry.origin.is_none() || self.edited.contains(held))
+            !entry.directory
+                && (entry
+                    .origin
+                    .as_deref()
+                    .is_none_or(|origin| origin != held && !entry.staged)
+                    || self.edited.contains(held))
         }) || !self.dirty_deleted_below(path).is_empty()
     }
 
@@ -1185,12 +1190,13 @@ const OWN_CHANGE: u16 =
     NodeFlags::ActionBits.bits() | (NodeFlags::MergeBits.bits() & !NodeFlags::StagedMerge.bits());
 
 /// The directories of `before`, the staged tree the commit takes, that the commit deletes with
-/// everything below them as the working tree no longer holds them: each staged for what lies
-/// below it alone at or below one of `model`'s [`Model::unmarked`], but for one holding a committed
-/// node not staged, there or going back there with a move the commit leaves out, and each above
-/// such a one, which the commit keeps, as it deletes nothing that was not staged. Where the
-/// directory above those is one the working tree no longer holds staged with a change of its own
-/// ([`gone_with_a_change`]), they go with it instead.
+/// everything below them as the working tree no longer holds them, each at or below one of
+/// `model`'s [`Model::unmarked`]: a directory staged for what lies below it alone, and one of those
+/// unmarked that is not staged, which the commit stages so for its rehash ([`Model::settle_bare`]).
+/// The commit keeps one holding a committed node not staged, there or going back there with a move
+/// the commit leaves out, and each above such a one, as it deletes nothing that was not staged.
+/// Where the directory above those is one the working tree no longer holds staged with a change of
+/// its own ([`gone_with_a_change`]), they go with it instead.
 fn gone_directories(
     model: &Model,
     base: &BTreeMap<NodeID, Placed>,
@@ -1205,8 +1211,11 @@ fn gone_directories(
         .iter()
         .filter(|(id, at)| {
             at.node.is_directory()
-                && at.node.is_staged()
-                && at.node.flags & OWN_CHANGE == 0
+                && (if at.node.is_staged() {
+                    at.node.flags & OWN_CHANGE == 0
+                } else {
+                    unmarked.contains(id)
+                })
                 && within(before, **id, &unmarked)
         })
         .map(|(id, _)| *id)

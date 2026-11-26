@@ -52,6 +52,7 @@ use crate::lore_drain_tasks;
 use crate::lore_limit_drain_tasks;
 use crate::lore_trace;
 use crate::metadata::Metadata;
+use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
@@ -527,6 +528,9 @@ pub(crate) struct ScanReport {
     /// Whether a deleted directory is reported as one entry, as a plain status reports the marks
     /// a scan left, rather than with every entry below it, as `--scan` reports them.
     whole_deleted_directories: bool,
+    /// The revision the tree is staged on, where the report covers the whole tree, which a
+    /// directory marked dirty as moved is reported as moved from ([`directory_move`]).
+    moves_from: Option<Arc<State>>,
 }
 
 /// Reports every change a path's scan finds, answering with how many were reported and the first
@@ -568,8 +572,20 @@ async fn report_scan_changes(
             }
         }
         reported += 1;
-        if let Err(err) = report_scan_change(operation, repository, &report.summary, &change).await
-        {
+        let result = match report.moves_from.as_ref() {
+            Some(current) if adds_a_dirty_moved_directory(&change) => {
+                Box::pin(report_scan_directory_move(
+                    operation,
+                    repository,
+                    &report.summary,
+                    current,
+                    &change,
+                ))
+                .await
+            }
+            _ => report_scan_change(operation, repository, &report.summary, &change).await,
+        };
+        if let Err(err) = result {
             failure.get_or_insert(err);
         }
     }
@@ -597,6 +613,79 @@ async fn report_scan_change(
     ))
     .send();
     Ok(())
+}
+
+/// [`report_scan_change`] of `change`, an add of a directory marked dirty as moved, as the move
+/// from the path `current` holds it at ([`directory_move`]), or as it is where `current` holds it
+/// nowhere else. Boxed by its caller, which takes it only for such a change.
+async fn report_scan_directory_move(
+    operation: &InstanceOperationImpl,
+    repository: &Arc<RepositoryContext>,
+    summary: &StatusSummaryStats,
+    current: &Arc<State>,
+    change: &NodeChange,
+) -> Result<(), StatusError> {
+    let moved = directory_move(repository, current, change).await?;
+    report_scan_change(
+        operation,
+        repository,
+        summary,
+        moved.as_ref().unwrap_or(change),
+    )
+    .await
+}
+
+/// Whether `change` adds a directory that is marked dirty as moved and not staged, which
+/// [`directory_move`] reports as the move it is: the diff pairs a move by its file's identity,
+/// which a directory lacks.
+fn adds_a_dirty_moved_directory(change: &NodeChange) -> bool {
+    let flags = change.to.flags;
+    change.action == FileAction::Add
+        && flags.is_directory()
+        && flags.contains(NodeFlags::DirtyMove)
+        && !flags.contains(NodeFlags::Staged)
+}
+
+/// `change`, which adds a directory marked dirty as moved ([`adds_a_dirty_moved_directory`]), as
+/// the move from the path `current`, the revision the tree is staged on, holds the directory at.
+/// `None` where `current` holds no directory of that node in `repository`, or holds it at the
+/// change's own path.
+async fn directory_move(
+    repository: &Arc<RepositoryContext>,
+    current: &Arc<State>,
+    change: &NodeChange,
+) -> Result<Option<NodeChange>, StatusError> {
+    let to = &change.to.mapping;
+    if to.repository.id != repository.id {
+        return Ok(None);
+    }
+    let committed = match current.node(repository.clone(), to.node).await {
+        Ok(committed) => committed,
+        Err(error) if error.is_node_not_found() => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .forward::<StatusError>("Failed to read the committed node of a moved directory");
+        }
+    };
+    if !committed.is_directory() || committed.is_discarded() {
+        return Ok(None);
+    }
+    let source = current
+        .node_path(repository.clone(), to.node)
+        .await
+        .forward::<StatusError>("Failed to read the committed path of a moved directory")?;
+    if source.is_empty() || source.eq_ignore_ascii_case(to.path.as_str()) {
+        return Ok(None);
+    }
+    let mut moved = change.clone();
+    moved.action = FileAction::Move;
+    moved.from = change
+        .from
+        .invalid(RelativePath::new_from_clean_parts(&source, ""));
+    moved.from.mapping.state = current.clone();
+    moved.from.mapping.node = to.node;
+    moved.from.flags = change.to.flags & !NodeFlags::DirtyBits;
+    Ok(Some(moved))
 }
 
 /// Verify whether a dirty file change reflects a real on-disk modification,
@@ -739,6 +828,8 @@ struct StagedDiff {
     show_scan: bool,
     check_dirty: Option<Arc<InstanceOperationImpl>>,
     cleared_links: Arc<parking_lot::Mutex<Vec<LinkedState>>>,
+    /// As [`ScanReport::moves_from`].
+    moves_from: Option<Arc<State>>,
 }
 
 /// Report every change the diff against the staged state answers for.
@@ -758,6 +849,15 @@ async fn report_staged_changes(
     let summary = diff.summary.as_ref();
     for change in changes {
         if !reported_by_state_diff(change, diff.show_scan) {
+            continue;
+        }
+        if let Some(current) = diff.moves_from.as_ref()
+            && adds_a_dirty_moved_directory(change)
+            && Box::pin(report_staged_directory_move(
+                repository, current, change, summary,
+            ))
+            .await?
+        {
             continue;
         }
 
@@ -782,18 +882,44 @@ async fn report_staged_changes(
             cleared_dirty = true;
         }
 
-        if change.flags.is_dirty() && !cleared_dirty {
-            summary.classify(change);
-        }
-
-        let size = file_size_from_node_change_id(change).await?;
-        let mut data = LoreRepositoryStatusFileEventData::from_node_change(change, size);
-        if cleared_dirty {
-            data.flag_dirty = 0;
-        }
-        event::LoreEvent::RepositoryStatusFile(data).send();
+        emit_staged_change(change, summary, cleared_dirty).await?;
     }
     Ok(())
+}
+
+/// Counts `change` into `summary` where it is dirty, unless `cleared_dirty`, and sends it as a
+/// status file event, without its dirty flag where `cleared_dirty`.
+async fn emit_staged_change(
+    change: &NodeChange,
+    summary: &StatusSummaryStats,
+    cleared_dirty: bool,
+) -> Result<(), StatusError> {
+    if change.flags.is_dirty() && !cleared_dirty {
+        summary.classify(change);
+    }
+    let size = file_size_from_node_change_id(change).await?;
+    let mut data = LoreRepositoryStatusFileEventData::from_node_change(change, size);
+    if cleared_dirty {
+        data.flag_dirty = 0;
+    }
+    event::LoreEvent::RepositoryStatusFile(data).send();
+    Ok(())
+}
+
+/// Reports `change`, an add of a directory marked dirty as moved, as the move from the path
+/// `current` holds it at ([`directory_move`]), and answers whether it did. Boxed by its caller,
+/// which takes it only for such a change.
+async fn report_staged_directory_move(
+    repository: &Arc<RepositoryContext>,
+    current: &Arc<State>,
+    change: &NodeChange,
+    summary: &StatusSummaryStats,
+) -> Result<bool, StatusError> {
+    let Some(moved) = directory_move(repository, current, change).await? else {
+        return Ok(false);
+    };
+    emit_staged_change(&moved, summary, false).await?;
+    Ok(true)
 }
 
 /// Whether a layer's staged state still holds anything worth pinning: a dirty marker or a staged
@@ -999,10 +1125,11 @@ async fn report_repository_staged_diff(
 /// Compare the subtree a layer draws against its staged state, and report what differs at the
 /// mount it is materialized at.
 async fn report_layer_staged_diff(
-    diff: StagedDiff,
+    mut diff: StagedDiff,
     layer_state: layer::LayerState,
     selection: LayerSelection,
 ) -> Result<(), StatusError> {
+    diff.moves_from = None;
     let changes = state::diff_collect_subtree(
         layer::drawn_subtree_state(
             &layer_state.repository,
@@ -1886,6 +2013,10 @@ async fn report_tree_diffs(
     summary: &Arc<StatusSummaryStats>,
     plan: TreeDiffPlan,
 ) -> Result<Vec<LinkedState>, StatusError> {
+    let moves_from = paths
+        .iter()
+        .all(|path| path.as_ref().is_none_or(RelativePath::is_empty))
+        .then(|| state_current.clone());
     with_operation_if(
         repository.file_system(),
         plan.reads_working_tree(),
@@ -1897,6 +2028,7 @@ async fn report_tree_diffs(
                     show_scan: plan.scan,
                     check_dirty: operation.clone().filter(|_| plan.checks_dirty()),
                     cleared_links: Arc::default(),
+                    moves_from: moves_from.clone(),
                 };
                 let cleared = diff.cleared_links.clone();
                 report_staged_diffs(repository, paths, state_current, state_staged, layers, diff)
@@ -1921,6 +2053,7 @@ async fn report_tree_diffs(
             let report = ScanReport {
                 summary: summary.clone(),
                 whole_deleted_directories: !plan.scan_asked,
+                moves_from,
             };
             scan_paths(
                 operation,

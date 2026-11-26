@@ -854,6 +854,21 @@ pub(crate) async fn stage_filesystem_path_reaching(
             crate::path::emit_path_ignore(full_relative_path.as_str()).await;
             return Ok(NodeLink::default());
         }
+        if let Some(queue) = discards.as_deref()
+            && Box::pin(moved_away_from(
+                &repository,
+                &queue.committed,
+                &state,
+                &full_relative_path,
+            ))
+            .await?
+            .is_some()
+        {
+            lore_debug!(
+                "Path {full_relative_path} is the source of a move, staged at its destination"
+            );
+            return Ok(NodeLink::default());
+        }
         if !force {
             return Err(StageError::internal(format!(
                 "Invalid path {full_relative_path}"
@@ -948,6 +963,44 @@ pub(crate) async fn stage_filesystem_path_reaching(
     .await?;
 
     Ok(NodeLink::default())
+}
+
+/// The node the staged tree `state` holds moved away from `path`, where `committed`, the revision
+/// it is staged on, holds it at `path` outside any link: marked moved, dirty or staged, with the
+/// file ID it has there. `None` where `committed` holds no such node at `path`. Its callers take
+/// it only for a path the staged tree holds no node at, or an added or a moved one, on a path they
+/// box.
+pub(crate) async fn moved_away_from(
+    repository: &Arc<RepositoryContext>,
+    committed: &State,
+    state: &State,
+    path: &RelativePath,
+) -> Result<Option<NodeID>, StageError> {
+    let stop = committed
+        .find_to_link::<true>(repository, ROOT_NODE, path.as_str(), true)
+        .await
+        .forward::<StageError>("Failed to look up a path in the revision the stage is based on")?;
+    let (Stop::End, node) = (stop.at, stop.node) else {
+        return Ok(None);
+    };
+    if node == ROOT_NODE {
+        return Ok(None);
+    }
+    let was = committed
+        .node(repository.clone(), node)
+        .await
+        .forward::<StageError>("Failed to read a node of the revision the stage is based on")?;
+    let now = match state.node(repository.clone(), node).await {
+        Ok(now) => now,
+        Err(error) if error.is_node_not_found() => return Ok(None),
+        Err(error) => {
+            return Err(error).forward::<StageError>("Failed to read the staged node a move took");
+        }
+    };
+    Ok((!now.is_discarded()
+        && (now.is_dirty_move() || now.is_staged_move())
+        && now.address.context == was.address.context)
+        .then_some(node))
 }
 
 /// The node `state` holds at `id`, which the working tree lacks at the named `path`, with the
@@ -3510,7 +3563,10 @@ async fn holds_both_spellings(
 /// a newly staged add has, so the commit reads the file, as it reads a merged file in view. An
 /// empty file leaves a zero hash with size 0, which the commit takes from the node as it stands,
 /// and the file's mode with it. The file ID and the merge bits stay, and a staged add or move, a
-/// merge's included, keeps its action.
+/// merge's included, keeps its action. A file marked dirty as moved and not staged is staged as
+/// moved, whether or not its content changed ([`State::staged_edit_flags`]). A directory marked dirty
+/// as moved and not staged takes a bare staged bit, outside a merge, which the caller stages as the
+/// directory's whole move once its walks are done ([`crate::file::stage::stage_promoted_moves`]).
 #[allow(clippy::too_many_arguments, unused_assignments)]
 #[lore_macro::test_pub]
 pub(crate) async fn stage_node_from_metadata(
@@ -3915,7 +3971,23 @@ pub(crate) async fn stage_node_from_metadata(
         }
     }
 
-    if !node.is_staged()
+    if node.is_directory()
+        && node.is_dirty_move()
+        && !node.is_staged()
+        && !options.node_flags.contains(NodeFlags::StagedMerge)
+    {
+        state
+            .node_mark(
+                &repository,
+                node_link.node,
+                Mark::staged(NodeFlags::Staged, false),
+            )
+            .await
+            .forward::<StageError>("Failed to stage the move of a directory")?;
+        if let Some(ref tracker) = link_tracker {
+            tracker.on_node_changed(&repository);
+        }
+    } else if !node.is_staged()
         || force
         || options.node_flags.contains(NodeFlags::StagedMerge)
         || node.is_staged_merge_unresolved()
@@ -3925,6 +3997,7 @@ pub(crate) async fn stage_node_from_metadata(
         // unstaged; re-staging must promote it back to a staged add even when
         // the filesystem content compares equal to the node's stored hash.
         let was_dirty_add = node.is_dirty_add();
+        let dirty_moved_file = node.is_file() && node.is_dirty_move() && !node.is_staged();
         // Whether the node's own fields are written in place: a node of another kind than the
         // filesystem entry was staged for deletion above, and a new one added.
         let mut write_content = false;
@@ -3957,7 +4030,7 @@ pub(crate) async fn stage_node_from_metadata(
                 maybe_content_modified = true;
                 resolves_merge =
                     crate::commit::merged_past_the_view(&repository, &node_path, &node);
-            } else if was_dirty_add {
+            } else if was_dirty_add || dirty_moved_file {
                 maybe_content_modified = true;
             }
         } else if node.mode != 0 {
@@ -4001,6 +4074,8 @@ pub(crate) async fn stage_node_from_metadata(
 
             let (staged_flag, dirty_flag) = if was_dirty_add {
                 (NodeFlags::StagedAdd, NodeFlags::DirtyAdd)
+            } else if dirty_moved_file && !write_content {
+                State::staged_move_flags(&node)
             } else {
                 State::staged_edit_flags(&node)
             };
@@ -4041,6 +4116,10 @@ pub(crate) async fn stage_node_from_metadata(
     if let Some(action) = event_action.filter(|_| !added) {
         stats.record_action(action, node.is_directory());
         if !node.is_directory() {
+            if action == LoreFileAction::Move && from_path.is_none() {
+                from_path =
+                    Box::pin(committed_path(&repository, &state, (node_link.node, &node))).await?;
+            }
             event::LoreEvent::FileStageFile(LoreFileStageFileEventData {
                 from_path: from_path.into(),
                 path: relative_path.join(name.as_str()).into(),
@@ -4057,6 +4136,31 @@ pub(crate) async fn stage_node_from_metadata(
         added,
         marked_added: node.is_dirty_add() && !node.is_staged(),
     })
+}
+
+/// The path `node`, numbered `id` in `state`, has in the revision `state` is staged on, which the
+/// stage event of its move names as the path it came from. `None` where that revision holds no
+/// node of its kind and file ID at `id`. Boxed by its caller, as only a file staged as moved takes
+/// it.
+async fn committed_path(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    (id, node): (NodeID, &Node),
+) -> Result<Option<String>, StageError> {
+    let mut name = String::new();
+    let place = state
+        .base_place_below(
+            repository,
+            (state.committed_revision(), id, ROOT_NODE),
+            (
+                NodeFlags::from_bits_retain(node.flags),
+                node.address.context,
+            ),
+            &mut name,
+        )
+        .await
+        .forward::<StageError>("Failed to read the path a moved file had")?;
+    Ok(place.map(|(_, path)| path.to_string()))
 }
 
 #[derive(Copy, Clone, PartialEq)]

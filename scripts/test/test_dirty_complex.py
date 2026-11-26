@@ -1719,18 +1719,19 @@ def test_commit_dirty_only_move_reverted_in_tree(new_lore_repo):
 
 @pytest.mark.smoke
 def test_commit_warns_of_a_dirty_only_move_a_staged_add_displaces(new_lore_repo):
-    """A dirty-only move whose committed path a staged new file takes is left
+    """A dirty-only move whose committed path a staged new file takes, staged by
+    a scan of the directory above that path, which leaves the move out, is left
     out of the sealed tree, which holds the staged file alone at that path. The
     commit succeeds with a warning to the user, and the moved file is pending
     as an add afterward."""
     repo: Lore = new_lore_repo()
-    commit_base(repo, {"base.txt": "base\n", "other.txt": "other\n"})
+    commit_base(repo, {"s/base.txt": "base\n", "other.txt": "other\n"})
 
-    os.rename(repo._fix_path("base.txt"), repo._fix_path("moved.txt"))
-    repo.dirty_move("base.txt", "moved.txt", offline=True)
-    with repo.open_file("base.txt", "w+") as f:
+    os.rename(repo._fix_path("s/base.txt"), repo._fix_path("moved.txt"))
+    repo.dirty_move("s/base.txt", "moved.txt", offline=True)
+    with repo.open_file("s/base.txt", "w+") as f:
         f.write("replacement content\n")
-    repo.stage("base.txt", offline=True)
+    repo.stage("s", scan=True, offline=True)
 
     output = repo.commit("replace base", offline=True)
     assert any(line.startswith("[Warn]") for line in output.splitlines()), (
@@ -1754,7 +1755,7 @@ def test_commit_warns_of_a_dirty_only_move_a_staged_add_displaces(new_lore_repo)
     assert "moved.txt" not in dump, (
         f"the displaced move must be left out of the sealed tree:\n{dump}"
     )
-    with repo.open_file("base.txt", "r") as f:
+    with repo.open_file("s/base.txt", "r") as f:
         assert f.read() == "replacement content\n", "the staged file stays on disk"
 
 
@@ -7684,9 +7685,6 @@ def test_branchreset_refuses_staged_delete_nested(new_lore_repo):
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(
-    reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands"
-)
 def test_commit_staged_move(new_lore_repo):
     """Committing a staged move (rename on disk + dirty_move + stage) records
     the rename in the sealed tree: the destination is present, the source is

@@ -898,6 +898,93 @@ async fn a_moved_file_modified_before_the_commit_is_recorded_as_a_move() {
     release(handle, store_handle_id);
 }
 
+/// A file whose move is marked dirty and not staged, as `lore file dirty move` marks it, and then
+/// rewritten through the handle is staged as a move carrying the edit: the commit records the move
+/// with modify set and leaves the file with no change marked.
+#[tokio::test]
+async fn a_dirty_moved_file_modified_before_the_commit_is_recorded_as_a_move_with_modify() {
+    use lore_revision::change::Flags;
+    use lore_revision::node::NodeExtFlags;
+    use lore_revision::node::NodeFlags;
+    use lore_revision::state::Ext;
+    use lore_revision::state::Mark;
+    use lore_revision::state::NameChange;
+
+    let partition = Partition::from([0xe7u8; 16]);
+    let (handle, store_handle_id) = load_handle("dirty-move-modify-delta", partition).await;
+
+    let destination = seed(handle, ROOT_NODE, "dst", LoreNodeType::Directory).await;
+    let node_id = seed(handle, ROOT_NODE, "data.bin", LoreNodeType::File).await;
+    set_branch(handle, Context::from(uuid::Uuid::now_v7())).await;
+    run_commit(handle, 1).await;
+
+    let internal = rt_handle::lookup(handle).expect("the handle must resolve");
+    let execution = lore::call::setup_execution(LoreGlobalArgs::default(), None);
+    let state = internal.state_for_tests();
+    let repository = internal.repository_context.clone();
+    lore_base::runtime::LORE_CONTEXT
+        .scope(execution, async move {
+            let own = Mark::dirty(NodeFlags::DirtyMove, Ext::Set(NodeExtFlags::NoFlags), true);
+            state
+                .node_move(
+                    repository.clone(),
+                    node_id,
+                    destination,
+                    NameChange::Keep,
+                    own,
+                )
+                .await
+                .expect("the dirty move");
+            state
+                .node_mark_destination(&repository, destination, own)
+                .await
+                .expect("the destination marked");
+        })
+        .await;
+
+    run_modify(handle, node_id, 20, 2).await;
+    run_commit(handle, 2).await;
+
+    let internal = rt_handle::lookup(handle).expect("the handle must resolve");
+    let execution = lore::call::setup_execution(LoreGlobalArgs::default(), None);
+    let (delta, flags) = lore_base::runtime::LORE_CONTEXT
+        .scope(execution, async move {
+            let state = internal.state_for_tests();
+            let delta = state
+                .node_change(internal.repository_context.clone(), node_id)
+                .await
+                .expect("the published revision must carry a delta")
+                .expect("the moved file must be named in it");
+            let node = state
+                .node(internal.repository_context.clone(), node_id)
+                .await
+                .expect("the committed node");
+            (delta, node.flags)
+        })
+        .await;
+    assert_eq!(
+        delta.action,
+        FileAction::Move as u16,
+        "the delta records the move"
+    );
+    assert!(
+        Flags::from_bits_retain(delta.flags).contains(Flags::Modify),
+        "the move carries the edit: {delta:?}"
+    );
+    assert_eq!(
+        flags & (NodeFlags::StagedBits | NodeFlags::DirtyBits).bits(),
+        0,
+        "the committed file holds no change, flags {flags:#x}"
+    );
+    let info = fetch_node_info(handle, node_id).await;
+    assert_eq!(
+        (info.parent_id, info.size),
+        (destination, 20),
+        "the file is committed at its new place with its new content"
+    );
+    release(handle, store_handle_id);
+}
+
 /// Naming the node's current parent renames it where it is, which is the same
 /// operation with the reparenting left out.
 #[tokio::test]

@@ -328,26 +328,32 @@ async fn a_commit_deletes_a_dirty_moved_file_with_its_committed_directory() {
     .await;
 }
 
-/// A file moved with `lore dirty move` whose committed path a staged file has taken leaves the
-/// revision: the staged file takes the path, and the moved file commits nowhere. The commit warns,
+/// A file moved with `lore dirty move` whose committed path a staged file has taken, staged by a
+/// stage of the directory above that path, which leaves the move out, leaves the revision: the
+/// staged file takes the path, and the moved file commits nowhere. The commit warns,
 /// and the working tree's file at the moved path is marked dirty as added.
 #[tokio::test]
 async fn a_commit_drops_a_dirty_moved_file_whose_committed_path_a_staged_file_takes() {
     with_instance(|instance| async move {
-        let first = committed(&instance, &["base.txt", "other.txt"]).await;
-        let base = node_id_at(&instance, &first, "base.txt").await;
+        let first = committed(&instance, &["s/base.txt", "other.txt"]).await;
+        let directory = node_id_at(&instance, &first, "s").await;
+        let base = node_id_at(&instance, &first, "s/base.txt").await;
         let other = node_id_at(&instance, &first, "other.txt").await;
-        dirty_moved(&instance, "base.txt", "moved.txt").await;
-        written(&instance, &["base.txt"]);
-        let state = stage_path(&instance, "base.txt").await;
-        let replacement = node_id_at(&instance, &state, "base.txt").await;
+        dirty_moved(&instance, "s/base.txt", "moved.txt").await;
+        written(&instance, &["s/base.txt"]);
+        let state = stage_path(&instance, "s").await;
+        let replacement = node_id_at(&instance, &state, "s/base.txt").await;
         assert_ne!(replacement, base);
 
         let (revision, warnings) = committed_warning(&instance, "Replaced").await;
         assert_revision(
             &instance,
             &revision,
-            &[("base.txt", replacement), ("other.txt", other)],
+            &[
+                ("other.txt", other),
+                ("s", directory),
+                ("s/base.txt", replacement),
+            ],
         )
         .await;
         assert_eq!(warnings, 1);
@@ -364,26 +370,28 @@ async fn a_commit_drops_a_dirty_moved_file_whose_committed_path_a_staged_file_ta
 }
 
 /// A directory moved with `lore dirty move` out of its committed parent, which a second dirty move
-/// put below it and a staged file then displaced from its committed path, leaves the revision with
-/// its subtree: the revision holds the staged file where the parent was, and neither directory.
+/// put below it and a staged file then displaced from its committed path, staged by a stage of the
+/// directory above that path, which leaves the moves out, leaves the revision with its subtree: the
+/// revision holds the staged file where the parent was, and neither directory.
 /// The commit warns once, and the working tree's directory at the moved path is marked dirty as
 /// added, with what it holds.
 #[tokio::test]
 async fn a_commit_drops_dirty_moved_directories_a_staged_file_displaces() {
     with_instance(|instance| async move {
-        let first = committed(&instance, &["p/x/f.txt", "other.txt"]).await;
+        let first = committed(&instance, &["r/p/x/f.txt", "other.txt"]).await;
         let other = node_id_at(&instance, &first, "other.txt").await;
-        dirty_moved(&instance, "p/x", "x").await;
-        dirty_moved(&instance, "p", "x/p").await;
-        written(&instance, &["p"]);
-        let state = stage_path(&instance, "p").await;
-        let replacement = node_id_at(&instance, &state, "p").await;
+        let r = node_id_at(&instance, &first, "r").await;
+        dirty_moved(&instance, "r/p/x", "x").await;
+        dirty_moved(&instance, "r/p", "x/p").await;
+        written(&instance, &["r/p"]);
+        let state = stage_path(&instance, "r").await;
+        let replacement = node_id_at(&instance, &state, "r/p").await;
 
         let (revision, warnings) = committed_warning(&instance, "Replaced").await;
         assert_revision(
             &instance,
             &revision,
-            &[("other.txt", other), ("p", replacement)],
+            &[("other.txt", other), ("r", r), ("r/p", replacement)],
         )
         .await;
         assert_eq!(warnings, 1);
@@ -2224,8 +2232,9 @@ async fn a_walk_takes_the_live_node_at_the_name_of_a_file_staged_for_deletion() 
     }
 }
 
-/// A commit returns a file `lore dirty move` moved, the move not staged, to its committed place
-/// where the node another move took there is staged for deletion, rather than leaving it out.
+/// A commit returns a file `lore dirty move` moved, the move not staged, to its committed place,
+/// rather than leaving it out, where the node another move took there is staged for deletion by a
+/// stage of the directory above that place, which leaves the move out.
 #[tokio::test]
 async fn a_commit_returns_a_file_to_a_place_whose_holder_is_staged_for_deletion() {
     with_instance(|instance| async move {
@@ -2234,7 +2243,7 @@ async fn a_commit_returns_a_file_to_a_place_whose_holder_is_staged_for_deletion(
         dirty_moved(&instance, "a/f", "d/f").await;
         dirty_moved(&instance, "a/g", "a/f").await;
         std::fs::remove_file(instance.path.join("a/f")).expect("the delete on disk");
-        stage_path(&instance, "a/f").await;
+        stage_path(&instance, "a").await;
         let (revision, _) = committed_warning(&instance, "Deleted").await;
 
         let kept = tree_paths(&instance, &revision).await;

@@ -946,8 +946,15 @@ pub async fn stage(
             mut current_repository_paths,
             current_repository_directories,
             layer_paths,
-        } = route_and_resolve_targets(&repository, &state, &paths, &layer_target_refs, options)
-            .await?;
+        } = route_and_resolve_targets(
+            &repository,
+            &state_current,
+            &state,
+            &paths,
+            &layer_target_refs,
+            options,
+        )
+        .await?;
         let alone = if current_repository_directories.is_empty() {
             Vec::new()
         } else {
@@ -1180,7 +1187,7 @@ struct RoutedTargets {
 }
 
 /// Route each of `paths` through the configured layers and resolve what it
-/// stages.
+/// stages in `state`, the staged tree on `state_current`.
 ///
 /// A path inside a layer belongs to that layer alone and resolves to nothing
 /// here. A path a layer sits under takes the layers below it and resolves as
@@ -1198,6 +1205,7 @@ struct RoutedTargets {
 /// reading state it has to finish reading.
 async fn route_and_resolve_targets(
     repository: &Arc<RepositoryContext>,
+    state_current: &Arc<State>,
     state: &Arc<State>,
     paths: &LoreArray<LoreString>,
     layer_target_refs: &[&str],
@@ -1208,6 +1216,8 @@ async fn route_and_resolve_targets(
         current_repository_directories: Vec::new(),
         layer_paths: Vec::new(),
     };
+    let mut left = Vec::new();
+    let moves_possible = !Arc::ptr_eq(state, state_current);
     let mut resolve_tasks = JoinSet::new();
     let mut failure: Option<StageError> = None;
     let join_failure = |err: tokio::task::JoinError| {
@@ -1238,17 +1248,27 @@ async fn route_and_resolve_targets(
             LayerRoute::Disjoint => {}
         }
 
-        let task_repository = repository.clone();
-        let task_state = state.clone();
-        lore_spawn!(resolve_tasks, async move {
-            resolve_stage_target(task_repository, task_state, relative_path, options).await
-        });
+        lore_spawn!(
+            resolve_tasks,
+            resolve_stage_target(
+                repository.clone(),
+                state.clone(),
+                relative_path,
+                options,
+                moves_possible
+            )
+        );
         fan_out::join_below(
             &mut resolve_tasks,
             MAX_CONCURRENT_TREE_TASKS,
             &mut failure,
             join_failure,
-            |resolved| resolved.map(|resolved| resolved.collect_into(&mut routed)),
+            |resolved| {
+                resolved.map(|(target, path)| {
+                    target.collect_into(&mut routed);
+                    left.extend(path);
+                })
+            },
         )
         .await;
     }
@@ -1258,13 +1278,51 @@ async fn route_and_resolve_targets(
         1,
         &mut failure,
         join_failure,
-        |resolved| resolved.map(|resolved| resolved.collect_into(&mut routed)),
+        |resolved| {
+            resolved.map(|(target, path)| {
+                target.collect_into(&mut routed);
+                left.extend(path);
+            })
+        },
     )
     .await;
-    match failure {
-        Some(err) => Err(err),
-        None => Ok(routed),
+    if let Some(err) = failure {
+        return Err(err);
     }
+    if moves_possible && !left.is_empty() {
+        Box::pin(resolve_moved_destinations(
+            repository,
+            state_current,
+            state,
+            left,
+            options,
+            &mut routed,
+        ))
+        .await?;
+    }
+    Ok(routed)
+}
+
+/// Adds to `routed` what a stage of the new path of each node a move took from one of `left`
+/// resolves to ([`moved_destination`]), `left` being the paths of the targets that `state`, staged
+/// on `state_current`, holds no node at or an added or a moved one. Boxed by its caller, which takes
+/// it only for a stage naming such a path.
+async fn resolve_moved_destinations(
+    repository: &Arc<RepositoryContext>,
+    state_current: &State,
+    state: &State,
+    left: Vec<RelativePath>,
+    options: StageOptions,
+    routed: &mut RoutedTargets,
+) -> Result<(), StageError> {
+    for path in &left {
+        if let Some(destination) =
+            moved_destination(repository, state_current, state, path, options).await?
+        {
+            destination.collect_into(routed);
+        }
+    }
+    Ok(())
 }
 
 /// What one stage target resolves to.
@@ -1298,6 +1356,14 @@ impl ResolvedTarget {
 /// dirty as deleted resolve to the path itself, the last so that its deletion is
 /// staged whole, as [`State::collect_dirty_paths`] records one below.
 ///
+/// Answers the path as well where it may be one a move left, which the staged tree holds no node
+/// at, or an added or a moved one, for the caller to resolve the move's new path
+/// ([`moved_destination`]). Such a path naming a directory to collect is a cold path, collected
+/// boxed, so the path the answer keeps is not held beside the collection of every directory.
+///
+/// `moves_possible` is false where nothing is staged or marked, so that no dirty move can have left
+/// a path: a `scan` target then resolves to itself with no lookup.
+///
 /// The lookup follows link mounts, and a node it reaches through a link is read
 /// in the state holding it, otherwise a colliding block at the same coordinates
 /// in the parent state would misclassify the target. The returned paths stay
@@ -1307,46 +1373,110 @@ async fn resolve_stage_target(
     state: Arc<State>,
     relative_path: RelativePath,
     options: StageOptions,
-) -> Result<ResolvedTarget, StageError> {
-    if !options.scan {
-        let resolved: Option<(
-            Arc<State>,
-            Arc<RepositoryContext>,
-            crate::node::NodeID,
-            bool,
-        )> = if relative_path.is_empty() {
-            // Root path is always a directory in the main repository.
-            Some((state.clone(), repository.clone(), ROOT_NODE, true))
-        } else if let Ok(held) = state
-            .locate_held_node_below(repository.clone(), ROOT_NODE, relative_path.as_str())
-            .await
-            && held.id().is_valid_node_id()
-        {
-            let node = held
-                .read()
-                .await
-                .forward::<StageError>("Failed to resolve node for dirty staging")?;
-            let (id, (resolved_repository, resolved_state)) = held.into_parts();
-            Some((
-                resolved_state,
-                resolved_repository,
-                id,
-                node.is_directory() && !node.is_dirty_delete(),
-            ))
-        } else {
-            None
-        };
-
-        if let Some((resolved_state, resolved_repository, root_node, true)) = resolved {
-            let dirty_paths = resolved_state
-                .collect_dirty_paths(resolved_repository, root_node, relative_path.clone())
-                .await
-                .forward::<StageError>("Failed to collect dirty paths")?;
-            return Ok(ResolvedTarget::Multiple(dirty_paths));
-        }
+    moves_possible: bool,
+) -> Result<(ResolvedTarget, Option<RelativePath>), StageError> {
+    if options.scan && !moves_possible {
+        return Ok((ResolvedTarget::Single(relative_path), None));
     }
+    if relative_path.is_empty() {
+        let target = resolve_held_target(
+            (&state, &repository, ROOT_NODE),
+            true,
+            relative_path,
+            options,
+        )
+        .await?;
+        return Ok((target, None));
+    }
+    let Ok(held) = state
+        .locate_held_node_below(repository.clone(), ROOT_NODE, relative_path.as_str())
+        .await
+    else {
+        let left = Some(relative_path.clone());
+        return Ok((ResolvedTarget::Single(relative_path), left));
+    };
+    if !held.id().is_valid_node_id() {
+        return Ok((ResolvedTarget::Single(relative_path), None));
+    }
+    let (collects, left) = {
+        let node = held
+            .read()
+            .await
+            .forward::<StageError>("Failed to resolve node for dirty staging")?;
+        (
+            node.is_directory() && !node.is_dirty_delete(),
+            node.is_added() || node.is_dirty_move() || node.is_staged_move(),
+        )
+    };
+    let (id, (resolved_repository, resolved_state)) = held.into_parts();
+    let held = (&*resolved_state, &resolved_repository, id);
+    if !left {
+        let target = resolve_held_target(held, collects, relative_path, options).await?;
+        return Ok((target, None));
+    }
+    let target = if collects && !options.scan {
+        Box::pin(resolve_held_target(
+            held,
+            collects,
+            relative_path.clone(),
+            options,
+        ))
+        .await?
+    } else {
+        ResolvedTarget::Single(relative_path.clone())
+    };
+    Ok((target, Some(relative_path)))
+}
 
-    Ok(ResolvedTarget::Single(relative_path))
+/// What a stage of `path`, where `held` holds a node, resolves to: without `scan`, the paths
+/// [`State::collect_dirty_paths`] collects at it where it `collects`, a directory not marked
+/// deleted; the path itself otherwise.
+async fn resolve_held_target(
+    held: (&State, &Arc<RepositoryContext>, NodeID),
+    collects: bool,
+    path: RelativePath,
+    options: StageOptions,
+) -> Result<ResolvedTarget, StageError> {
+    if options.scan || !collects {
+        return Ok(ResolvedTarget::Single(path));
+    }
+    let (state, repository, node) = held;
+    Ok(ResolvedTarget::Multiple(
+        state
+            .collect_dirty_paths(repository.clone(), node, path)
+            .await
+            .forward::<StageError>("Failed to collect dirty paths")?,
+    ))
+}
+
+/// What a stage of the new path of the node a move took from `path` resolves to, where
+/// `state_current`, the revision `state` is staged on, holds a node there that `state` holds
+/// moved elsewhere ([`stage::moved_away_from`]): the new path itself, and, without `scan`, the
+/// dirty paths collected below a directory there, as [`resolve_stage_target`] resolves a path a
+/// stage names. `None` for any other path.
+async fn moved_destination(
+    repository: &Arc<RepositoryContext>,
+    state_current: &State,
+    state: &State,
+    path: &RelativePath,
+    options: StageOptions,
+) -> Result<Option<ResolvedTarget>, StageError> {
+    let Some(moved) = stage::moved_away_from(repository, state_current, state, path).await? else {
+        return Ok(None);
+    };
+    let destination = state
+        .node_path(repository.clone(), moved)
+        .await
+        .forward::<StageError>("Failed to resolve the path a dirty move took a node to")?;
+    let destination = RelativePath::new_from_clean_parts(&destination, "");
+    let collects = state
+        .node(repository.clone(), moved)
+        .await
+        .forward::<StageError>("Failed to read the node a dirty move took")?
+        .is_directory();
+    Ok(Some(
+        resolve_held_target((state, repository, moved), collects, destination, options).await?,
+    ))
 }
 
 /// Stages whole the move of each directory marked dirty as moved whose move a staged climb in

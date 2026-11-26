@@ -429,13 +429,20 @@ impl State {
     /// The staged and dirty flags an edit to `node` records, for the working-tree staging path
     /// staging a node again and for the C API's modify: a node staged for addition stays an
     /// addition, as it is in no revision yet for a commit to record a modification against; one
-    /// staged as moved stays a move, which carries the new content; and any other, one staged as
-    /// copied among them, is staged as modified.
+    /// staged as moved stays a move, which carries the new content; a file marked dirty as moved
+    /// and not staged is staged as moved with the modification beside it, which the commit records
+    /// as a move with modify set; and any other, one staged as copied among them, is staged as
+    /// modified.
     pub fn staged_edit_flags(node: &Node) -> (NodeFlags, NodeFlags) {
         if node.is_staged_add() {
             (NodeFlags::StagedAdd, NodeFlags::DirtyAdd)
         } else if node.is_staged_move() {
             (NodeFlags::StagedMove, NodeFlags::DirtyMove)
+        } else if node.is_file() && node.is_dirty_move() && !node.is_staged() {
+            (
+                NodeFlags::StagedMove | NodeFlags::StagedModify,
+                NodeFlags::DirtyMove | NodeFlags::DirtyModify,
+            )
         } else {
             (NodeFlags::StagedModify, NodeFlags::DirtyModify)
         }
