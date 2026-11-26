@@ -79,14 +79,21 @@ mod stat;
 pub mod stat;
 #[cfg(feature = "test-util")]
 pub mod test_util;
+#[cfg(not(feature = "test-util"))]
+mod unbuffered;
+#[cfg(feature = "test-util")]
+pub mod unbuffered;
 #[cfg(target_os = "linux")]
 mod uring;
 #[cfg(target_family = "windows")]
 pub mod win_path;
 
+pub use buffer::AlignedBuf;
 pub use buffer::StableBuf;
 pub use buffer::StableBufList;
 pub use buffer::StableBufListMut;
+pub use buffer::UNBUFFERED_ALIGNMENT;
+pub use buffer::unbuffered_len;
 pub use buffer::uninit_buffer;
 pub use dir::DirEntry;
 pub use dir::DirStream;
@@ -114,6 +121,8 @@ pub use psync::stat_blocking;
 pub use psync::sync_dir;
 pub use stat::Stat;
 pub use stat::StatKind;
+pub use unbuffered::unbuffered_fallbacks;
+pub use unbuffered::unbuffered_refused;
 #[cfg(target_os = "linux")]
 pub use uring::UringStats;
 

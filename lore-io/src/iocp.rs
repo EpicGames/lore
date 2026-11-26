@@ -290,6 +290,11 @@ pub struct IocpStats {
 /// `FlushFileBuffers`, `CreateFile` or the metadata calls: they block whoever issues them, so a
 /// pool thread is the right place for them and this backend cannot improve on it. They are defined
 /// here rather than left out because a backend owns its whole surface.
+///
+/// A file opened unbuffered ([`crate::OpenOptions::unbuffered`]) takes its overlapped writes past
+/// the file cache. The unbuffered whole-file write
+/// ([`crate::IoDriver::write_file_bytes_unbuffered`]) runs on the syscall pool, as for every
+/// backend.
 #[lore_macro::test_pub]
 pub(crate) struct IocpDriver {
     inner: Arc<IocpInner>,
@@ -770,7 +775,10 @@ impl IocpDriver {
         data: Bytes,
         durable: bool,
     ) -> std::io::Result<std::fs::Metadata> {
-        PsyncDriver.write_file_bytes(path, data, durable).await
+        PsyncDriver
+            .write_file_bytes(path, data, durable, false)
+            .await
+            .map(|(metadata, _)| metadata)
     }
 
     pub(crate) async fn metadata(&self, path: PathBuf) -> std::io::Result<std::fs::Metadata> {

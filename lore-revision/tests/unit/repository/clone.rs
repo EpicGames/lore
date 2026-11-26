@@ -1578,3 +1578,32 @@ async fn creating_over_an_existing_shared_store_refuses_a_local_mutable_store() 
         })
         .await;
 }
+
+/// A clone's options give the context it writes its files through direct file write where they
+/// ask for it, which its reads into files then take, and leave it as the instance's config sets it
+/// otherwise. The clone uploads nothing either way.
+#[tokio::test]
+async fn a_clone_asked_for_direct_file_write_writes_its_files_directly() {
+    for direct in [false, true] {
+        let (immutable, mutable) = lore_revision::repository::create_client_memory_stores()
+            .await
+            .expect("in-memory stores should be creatable");
+        let repository = RepositoryContext::new(crate::helper::default_repository_creation_args(
+            immutable, mutable,
+        ));
+
+        apply_clone_settings(
+            &repository,
+            &CloneOptions {
+                direct_file_write: direct,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            lore_revision::immutable::read_options_from_repository(&repository).direct_write,
+            direct
+        );
+        assert!(repository.disable_upload());
+    }
+}

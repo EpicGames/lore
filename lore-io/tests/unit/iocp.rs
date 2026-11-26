@@ -179,3 +179,54 @@ fn every_file_operation_is_completed_by_exactly_one_path() {
     assert_eq!(stats.submits, stats.inline + stats.reaped, "{stats:?}");
     let _ = std::fs::remove_file(&path);
 }
+
+/// The completion-port backend writes unbuffered: a file it opens unbuffered takes aligned
+/// overlapped writes cut to its length, and its unbuffered whole-file write holds exactly the
+/// content, written unbuffered.
+#[tokio::test]
+async fn the_completion_port_backend_writes_unbuffered() {
+    use lore_io::AlignedBuf;
+    use lore_io::BackendKind;
+    use lore_io::IoDriver;
+    use lore_io::OpenOptions;
+    use lore_io::UNBUFFERED_ALIGNMENT;
+
+    let driver = IoDriver::new(BackendKind::Iocp).expect("make the completion-port driver");
+    let dir = lore_base::test_util::TempDir::new("lore-io-iocp-unbuffered-");
+    let content: Vec<u8> = (0..2 * UNBUFFERED_ALIGNMENT + 123)
+        .map(|index| (index % 251) as u8)
+        .collect();
+
+    let unbuffered_file = dir.child("unbuffered_file");
+    let file = driver
+        .open(
+            &unbuffered_file,
+            &OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .unbuffered(true),
+        )
+        .await
+        .expect("open unbuffered");
+    let mut buffer = AlignedBuf::zeroed(content.len());
+    buffer.content_mut().copy_from_slice(&content);
+    file.write_all_at(buffer, 0)
+        .await
+        .expect("write unbuffered");
+    file.set_len(content.len() as u64, ())
+        .await
+        .expect("set the end of the file");
+    drop(file);
+    assert_eq!(std::fs::read(&unbuffered_file).expect("read back"), content);
+
+    let whole = dir.child("whole");
+    let (metadata, unbuffered) = driver
+        .write_file_bytes_unbuffered(&whole, bytes::Bytes::from(content.clone()), false)
+        .await
+        .expect("write the whole file");
+    assert!(unbuffered);
+    assert_eq!(metadata.len(), content.len() as u64);
+    assert_eq!(std::fs::read(&whole).expect("read back"), content);
+}

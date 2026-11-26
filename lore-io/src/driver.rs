@@ -794,12 +794,39 @@ impl IoDriver {
         check_whole_file_len(data.len())?;
         let path = path.as_ref().to_path_buf();
         match &*self.inner {
-            DriverInner::Psync(driver) => driver.write_file_bytes(path, data, durable).await,
+            DriverInner::Psync(driver) => driver
+                .write_file_bytes(path, data, durable, false)
+                .await
+                .map(|(metadata, _)| metadata),
             #[cfg(target_os = "linux")]
             DriverInner::Uring(driver) => driver.write_file_bytes(path, data, durable).await,
             #[cfg(target_family = "windows")]
             DriverInner::Iocp(driver) => driver.write_file_bytes(path, data, durable).await,
         }
+    }
+
+    /// Writes `data` as the entire contents of `path` as [`Self::write_file_bytes`] does, in one
+    /// job, unbuffered on Windows: the file is written past the file cache in one write of `data`
+    /// padded with zeros to a multiple of [`crate::UNBUFFERED_ALIGNMENT`], and its end then set to
+    /// the length of `data`, so it holds no cache pages afterwards and its first read comes from
+    /// the device. The copy into aligned memory goes to a buffer each pool thread keeps. A volume
+    /// that refuses the unbuffered open or write ([`crate::unbuffered_refused`]) has the file
+    /// written through the file cache, counted in [`crate::unbuffered_fallbacks`]. Elsewhere it
+    /// is [`Self::write_file_bytes`]. Answers the metadata and whether the file was written
+    /// unbuffered.
+    ///
+    /// Every backend runs this on the syscall pool, so it goes there directly, as
+    /// [`Self::write_file_segments_atomic`] does.
+    pub async fn write_file_bytes_unbuffered(
+        &self,
+        path: impl AsRef<Path>,
+        data: Bytes,
+        durable: bool,
+    ) -> std::io::Result<(std::fs::Metadata, bool)> {
+        check_whole_file_len(data.len())?;
+        PsyncDriver
+            .write_file_bytes(path.as_ref().to_path_buf(), data, durable, true)
+            .await
     }
 
     pub(crate) async fn read_at_raw(

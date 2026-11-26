@@ -83,9 +83,18 @@ The `[file]` table controls how the client writes files into the working tree. B
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `direct_write` | Boolean | `false` | Write to target files directly instead of writing a temporary file and moving it into place. Writes may not be atomic, so an error can leave a file in an inconsistent state. |
+| `direct_write` | Boolean | `false` | Write to target files directly instead of writing a temporary file and moving it into place, and on Windows write each file of one fragment past the file cache ([`direct_write` on Windows](#direct_write-on-windows)). Writes may not be atomic, so an error can leave a file in an inconsistent state. |
 | `flush_write` | Boolean | `false` | Flush file data to disk after each write. Parsed from the config but not currently wired to any write path, so setting it has no effect today. |
 
+#### `direct_write` on Windows
+
+On Windows, `direct_write` also writes each file of one fragment, at most 256 KiB, past the file cache: unbuffered, with `FILE_FLAG_NO_BUFFERING`, in one write. The data goes to the device as it is written, and the lazy writer has nothing left to write afterwards. A larger file is written through the file cache. A file that `lore_storage_get_file` writes sparse is written through the file cache. Where the volume refuses unbuffered writes, as a network share or an unusual sector size does, the file is written through the file cache, and the client logs a warning once per command, and again each time commands that run at the same time in one process, such as the Lore service, alternate.
+
+The cost is on the first read: a file written this way isn't in the file cache after the command, so its first read comes from the device. Measured on a Windows cloud VM with NTFS in a VHDX, reading about 22 GB of whole directories with eight readers right after a clone took 8.8 to 11.3 seconds from a clone written this way, against 6.3 to 7.2 seconds from one written through the file cache.
+
+`lore clone --direct-file-write` writes the clone's files this way without setting this field. The new instance's `direct_write` stays `false`, and later commands such as `lore sync` follow it.
+
+On Linux and macOS, `direct_write` writes files in place through the file cache.
 ### `[sync]` table
 
 | Field | Type | Default | Description |

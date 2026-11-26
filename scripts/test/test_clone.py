@@ -162,10 +162,14 @@ def test_clone_direct_file_write(new_lore_repo):
     Verify that clone with --direct-file-write produces correct files on disk.
 
     --direct-file-write skips the default atomic write strategy (write to temp
-    file then rename) and writes directly to the destination path. The result
-    must be identical to a normal clone.
+    file then rename) and writes directly to the destination path, on Windows
+    past the file cache. The result must be identical to a normal clone, a file
+    of many fragments included. The flag applies to the clone alone: the new
+    instance's `[file] direct_write` stays as it is, and a later sync writes as
+    that says.
     """
     repo: Lore = new_lore_repo()
+    large = bytes((index * 7 + index // 4096) % 251 for index in range(3 * 1024 * 1024 + 777))
 
     repo.write_commit_push(
         "Initial commit",
@@ -173,10 +177,22 @@ def test_clone_direct_file_write(new_lore_repo):
             "text.txt": "hello world\n",
             "subdir/nested.txt": "nested content\n",
             "binary.bin": b"\x00\x01\x02\xff" * 256,
+            "large.bin": large,
         },
     )
 
     clone = repo.clone(direct_file_write=True)
+
+    with clone.open_file("large.bin", "rb") as f:
+        assert f.read() == large, "fragmented file content mismatch"
+    with clone.open_file(".lore/config.toml") as f:
+        config = tomllib.loads(f.read())
+    assert config["file"]["direct_write"] is False, "the flag is not written to the config"
+
+    repo.write_commit_push("Change the large file", {"large.bin": large[::-1]})
+    clone.sync()
+    with clone.open_file("large.bin", "rb") as f:
+        assert f.read() == large[::-1], "a later sync writes the change"
 
     # Verify text files
     with clone.open_file("text.txt") as f:

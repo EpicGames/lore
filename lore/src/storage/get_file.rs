@@ -207,7 +207,7 @@ async fn resolve_get_file_item(
         return Err(invalid_item("item has an empty path"));
     }
     if item.address.hash == Hash::default() {
-        write_all_to_file(Path::new(path_str), bytes::Bytes::new(), false)
+        write_all_to_file(Path::new(path_str), bytes::Bytes::new(), false, false)
             .await
             .internal("writing the empty file for a zero-hash item")?;
         return Ok(());

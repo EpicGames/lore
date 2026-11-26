@@ -175,27 +175,24 @@ impl PsyncDriver {
             .await
     }
 
+    /// Writes `data` as the whole contents of `path` in one job: through the file cache, or
+    /// with `unbuffered` as [`crate::unbuffered::write_file`] writes it, answering whether it
+    /// wrote it unbuffered.
     pub(crate) async fn write_file_bytes(
         &self,
         path: PathBuf,
         data: Bytes,
         durable: bool,
-    ) -> std::io::Result<std::fs::Metadata> {
+        unbuffered: bool,
+    ) -> std::io::Result<(std::fs::Metadata, bool)> {
         SyscallPool::global()
             .submit(move || {
-                use std::io::Write;
-                let mut file = crate::file::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .to_std_blocking()
-                    .open(path)?;
-                file.write_all(data.as_ref())?;
-                if durable {
-                    file.sync_data()?;
+                if unbuffered {
+                    crate::unbuffered::write_file(&path, &data, durable)
+                } else {
+                    crate::unbuffered::write_file_cached(&path, &data, durable)
+                        .map(|metadata| (metadata, false))
                 }
-                file.metadata()
             })
             .await
     }

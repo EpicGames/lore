@@ -355,7 +355,8 @@ pub struct CloneOptions {
     pub bare: bool,
     /// Ignore existing files
     pub ignore_existing: bool,
-    /// Use direct file write
+    /// Write the clone's files with direct file write, whatever the new instance's
+    /// `[file] direct_write` says, which the clone leaves as it is
     pub direct_file_write: bool,
     /// Access recording whose paths a virtual clone warms in the background: one
     /// repository-relative path per line, directories ending with `/`
@@ -1499,6 +1500,17 @@ pub async fn clone(
     result
 }
 
+/// Sets on `repository`, the context a clone materializes its files through, what the clone's
+/// `options` ask of it: no upload, and direct file write where `options.direct_file_write` asks,
+/// whatever the new instance's `[file] direct_write` says.
+#[lore_macro::test_pub]
+fn apply_clone_settings(repository: &RepositoryContext, options: &CloneOptions) {
+    repository.set_disable_upload(true);
+    if options.direct_file_write {
+        repository.set_direct_file_write(true);
+    }
+}
+
 /// Undoes a FUSE clone's mount after a failure past a successful `create_local`. A no-op off
 /// Linux and when `is_fuse` is false; best-effort otherwise, logged and never allowed to shadow
 /// the original failure it is cleaning up after.
@@ -1592,7 +1604,7 @@ async fn clone_into(
     );
     let repository = Arc::new(new_context);
 
-    repository.set_disable_upload(true);
+    apply_clone_settings(&repository, &options);
 
     // Prune stale instances in the background when using a shared store.
     // AbortOnDropHandle ensures the task is cancelled if clone fails early.

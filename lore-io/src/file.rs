@@ -19,6 +19,8 @@ pub struct OpenOptions {
     create: bool,
     create_new: bool,
     truncate: bool,
+    #[cfg(target_family = "windows")]
+    unbuffered: bool,
     #[cfg(not(target_family = "windows"))]
     custom_flags: i32,
     #[cfg(target_family = "windows")]
@@ -55,6 +57,28 @@ impl OpenOptions {
         self
     }
 
+    /// Opens the file for unbuffered I/O: on Windows with `FILE_FLAG_NO_BUFFERING`, so its reads
+    /// and writes bypass the file cache, and each takes memory, an offset and a length aligned to
+    /// [`crate::UNBUFFERED_ALIGNMENT`], as an [`crate::AlignedBuf`] holds. A volume that refuses
+    /// it fails the open ([`crate::unbuffered_refused`]). Elsewhere it opens the file as without it.
+    pub fn unbuffered(self, unbuffered: bool) -> OpenOptions {
+        #[cfg(target_family = "windows")]
+        {
+            OpenOptions { unbuffered, ..self }
+        }
+        #[cfg(not(target_family = "windows"))]
+        {
+            let _ = unbuffered;
+            self
+        }
+    }
+
+    /// Whether the file opens for unbuffered I/O ([`Self::unbuffered`]).
+    #[cfg(target_family = "windows")]
+    pub(crate) fn is_unbuffered(&self) -> bool {
+        self.unbuffered
+    }
+
     /// Adds `flags` to the flags of the `open(2)` call, mirroring
     /// `std::os::unix::fs::OpenOptionsExt::custom_flags`. For a caller that must not follow a
     /// link at the path, or wait on a FIFO there, while it holds other locks.
@@ -88,15 +112,18 @@ impl OpenOptions {
         {
             use std::os::windows::fs::OpenOptionsExt;
 
+            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
+
             let mut options = self.to_std_blocking();
-            options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED);
+            options.custom_flags(FILE_FLAG_OVERLAPPED | crate::unbuffered::open_flags(self));
             options
         }
     }
 
     /// The options for a handle a pool thread drives with ordinary synchronous calls, which an
-    /// overlapped handle cannot serve. Carries the same share modes as [`to_std`](Self::to_std),
-    /// so a one-shot whole-file operation guards the file exactly as a long-lived handle does.
+    /// overlapped handle cannot serve. Carries the same share modes and unbuffered flag as
+    /// [`to_std`](Self::to_std), so a one-shot whole-file operation guards the file exactly as a
+    /// long-lived handle does.
     pub(crate) fn to_std_blocking(&self) -> std::fs::OpenOptions {
         let mut options = std::fs::OpenOptions::new();
         options
@@ -132,6 +159,7 @@ impl OpenOptions {
                 self.share_mode
                     .unwrap_or(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
             );
+            options.custom_flags(crate::unbuffered::open_flags(self));
         }
         options
     }

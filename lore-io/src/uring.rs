@@ -531,7 +531,10 @@ impl UringDriver {
         data: Bytes,
         durable: bool,
     ) -> std::io::Result<std::fs::Metadata> {
-        PsyncDriver.write_file_bytes(path, data, durable).await
+        PsyncDriver
+            .write_file_bytes(path, data, durable, false)
+            .await
+            .map(|(metadata, _)| metadata)
     }
 
     pub(crate) async fn metadata(&self, path: PathBuf) -> std::io::Result<std::fs::Metadata> {

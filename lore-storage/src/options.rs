@@ -215,7 +215,8 @@ pub struct ReadOptions {
     /// than with `AddressNotFound`, which stays the answer for an address the local store does not
     /// hold.
     pub strict_local: bool,
-    /// Write to file directly
+    /// Write to file directly, with no temporary file, and on Windows a file of one fragment past the
+    /// file cache unless with `sparse_write` ([`Self::writes_unbuffered`])
     pub direct_write: bool,
     /// Make the file a read of a fragment list writes sparse before sizing it
     /// ([`lore_io::IoFile::set_len_sparse`]), so a hole of the content holds no storage on a file
@@ -284,6 +285,13 @@ impl Default for ReadOptions {
 }
 
 impl ReadOptions {
+    /// Whether a read into a file writes a file of one fragment unbuffered, past the file cache, as
+    /// [`lore_io::IoDriver::write_file_bytes_unbuffered`] writes it: on Windows, with `direct_write`
+    /// and without `sparse_write`. A fragment list is written through the file cache.
+    pub fn writes_unbuffered(&self) -> bool {
+        cfg!(target_family = "windows") && self.direct_write && !self.sparse_write
+    }
+
     pub fn with_decompress(mut self) -> Self {
         self.decompress = true;
         self

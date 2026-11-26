@@ -402,7 +402,8 @@ cannot. A bare or virtual instance writes no files and reads them from the remot
   cherry-picking in such an instance: the commit can delete a directory the instance never had on disk, with everything
   in it
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into
-  place
+  place, and on Windows write files of one fragment past the file cache. Applies to this clone only: the new instance's
+  `[file] direct_write` setting is left as it is, and later commands follow that setting
 * `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory, over a shared store as if --use-shared-store were given
 
   Default value: `none`
@@ -2284,7 +2285,8 @@ cannot. A bare or virtual instance writes no files and reads them from the remot
   cherry-picking in such an instance: the commit can delete a directory the instance never had on disk, with everything
   in it
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into
-  place
+  place, and on Windows write files of one fragment past the file cache. Applies to this clone only: the new instance's
+  `[file] direct_write` setting is left as it is, and later commands follow that setting
 * `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory, over a shared store as if --use-shared-store were given
 
   Default value: `none`
