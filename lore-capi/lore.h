@@ -2722,9 +2722,9 @@ typedef struct lore_shared_store_list_item_t {
   struct lore_string_t remote_url;
   // Path to the shared store on disk.
   struct lore_string_t store_path;
-  // Paths to instances using the shared store
+  // Paths to instances using the shared store, empty for a store listed without its instances.
   struct lore_string_array_t instance_paths;
-  // Ids of instances using the shared store
+  // Ids of instances using the shared store, empty for a store listed without its instances.
   struct lore_instance_id_array_t instance_ids;
 } lore_shared_store_list_item_t;
 
@@ -5778,7 +5778,8 @@ typedef struct lore_shared_store_info_args_t {
 
 // Arguments for listing the registry of shared stores.
 typedef struct lore_shared_store_list_args_t {
-  // Whether to load each shared store to search for each instance using it.
+  // Whether to load each shared store to search for each instance using it. A store another
+  // process still holds after the listing's wait is listed without its instances.
   uint8_t include_instances;
 } lore_shared_store_list_args_t;
 
@@ -12661,7 +12662,7 @@ void lore_shared_store_info_async(const struct lore_global_args_t *globals,
 //
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
-// | `LORE_EVENT_SHARED_STORE_LIST` | `lore_shared_store_list_event_data_t` | Emitted on success carrying every registered shared store, and the instances using each when `include_instances` is set, leaving out an instance registration the store can't read, which a `LORE_EVENT_LOG` warning counts |
+// | `LORE_EVENT_SHARED_STORE_LIST` | `lore_shared_store_list_event_data_t` | Emitted on success carrying every registered shared store, and the instances using each when `include_instances` is set, leaving out an instance registration the store can't read, which a `LORE_EVENT_LOG` warning counts. A store another process still holds once the listing has waited 3 seconds in all is carried without its instances, and a `LORE_EVENT_LOG` warning names it. With `include_instances` set and a service running in another process, the listing runs in the service, so this includes a store the calling process holds |
 int32_t lore_shared_store_list(const struct lore_global_args_t *globals,
                                const struct lore_shared_store_list_args_t *args,
                                struct lore_event_callback_config_t callback);
@@ -12687,7 +12688,7 @@ int32_t lore_shared_store_list(const struct lore_global_args_t *globals,
 //
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
-// | `LORE_EVENT_SHARED_STORE_LIST` | `lore_shared_store_list_event_data_t` | Emitted on success carrying every registered shared store, and the instances using each when `include_instances` is set, leaving out an instance registration the store can't read, which a `LORE_EVENT_LOG` warning counts |
+// | `LORE_EVENT_SHARED_STORE_LIST` | `lore_shared_store_list_event_data_t` | Emitted on success carrying every registered shared store, and the instances using each when `include_instances` is set, leaving out an instance registration the store can't read, which a `LORE_EVENT_LOG` warning counts. A store another process still holds once the listing has waited 3 seconds in all is carried without its instances, and a `LORE_EVENT_LOG` warning names it. With `include_instances` set and a service running in another process, the listing runs in the service, so this includes a store the calling process holds |
 void lore_shared_store_list_async(const struct lore_global_args_t *globals,
                                   const struct lore_shared_store_list_args_t *args,
                                   struct lore_event_callback_config_t callback);

@@ -71,7 +71,8 @@ pub struct SharedStoreInfoArgs {}
 
 #[derive(Args)]
 pub struct SharedStoreListArgs {
-    /// Look up all instances each shared store is used by.
+    /// Look up the instances using each shared store. A store another process still holds after a
+    /// 3-second wait is listed without them, with a warning.
     #[clap(long, default_missing_value = "true")]
     include_instances: Option<bool>,
 }

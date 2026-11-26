@@ -26,10 +26,12 @@ use crate::remote::call::Relayed;
 use crate::remote::call::ServiceCallError;
 use crate::remote::call::run_service_call;
 use crate::remote::command::LoreCommand;
+use crate::remote::service_process::Reached;
 use crate::remote::service_process::ServiceProcessError;
 use crate::remote::service_process::ServiceStart;
 use crate::remote::service_process::connect_or_spawn_service;
 use crate::remote::service_process::connect_to_running_service;
+use crate::remote::service_process::reach_running_service;
 use crate::remote::service_process::running_as_service;
 use crate::remote::service_process::service_in_use;
 use crate::remote::service_process::service_in_use_blocking;
@@ -615,5 +617,46 @@ pub(crate) fn dispatch_call<
             let handler = pin!(handler(globals, args, callback));
             handler.await
         }
+    }
+}
+
+/// Runs the call of `args` on the Lore service where one runs in another process, and with
+/// `handler` here otherwise, never starting one: for a call that may run in any process and would
+/// wait here for what a running service holds. Runs it here as well where the move reply has
+/// handed it back, from this relay or an earlier one.
+///
+/// Pins each branch's future, and leaves `Fut` unbound by `Send`, for the reasons [`dispatch_call`]
+/// gives.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub(crate) fn on_running_service_or_here<
+    ArgsType: LoreArgs,
+    Handler: Fn(LoreGlobalArgs, ArgsType, LoreEventCallback) -> Fut,
+    Fut: Future<Output = i32> + 'static,
+>(
+    globals: LoreGlobalArgs,
+    args: ArgsType,
+    callback: LoreEventCallback,
+    handler: Handler,
+) -> impl Future<Output = i32> {
+    async move {
+        if !running_as_service()
+            && !crate::call::runs_during_external_root_move()
+            && let Ok(Reached::Connected(connection)) = reach_running_service().await
+        {
+            let relayed = {
+                let relay = pin!(run_service_call(
+                    Some(connection),
+                    globals,
+                    args.to_command(),
+                    callback
+                ));
+                relay.await
+            };
+            return relayed_status(relayed).await;
+        }
+        let handler = pin!(handler(globals, args, callback));
+        handler.await
     }
 }

@@ -146,7 +146,7 @@ impl LogFileWriter {
 
 /// Log dispatch callback for the lore crate.
 /// Writes to the log file (if configured) and dispatches through the execution context.
-fn lore_log_dispatch(level: LoreLogLevel, location: &str, message: &str) {
+pub(crate) fn lore_log_dispatch(level: LoreLogLevel, location: &str, message: &str) {
     let execution = try_execution_context();
 
     // Write to log file if configured

@@ -3,10 +3,17 @@
 """Shared test utility functions."""
 
 import os
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from lore_parsers import parse_jsonl, parse_status_json, to_posix
+from lore_parsers import (
+    SharedStoreList,
+    parse_jsonl,
+    parse_shared_store_list,
+    parse_status_json,
+    to_posix,
+)
 
 if TYPE_CHECKING:
     from lore import Lore
@@ -159,3 +166,38 @@ def commit_unstaged_below_a_staged_deletion(repo: "Lore", r: str) -> None:
         posix_join(r, "a", "y"),
         posix_join(r, "a", "z"),
     ]
+
+
+def store_listing(stores: SharedStoreList, instance: "Lore") -> str | None:
+    """The path of the shared store in `stores` that lists `instance`, or `None`
+    where none lists it."""
+    wanted = os.path.realpath(instance.path)
+    for store, entry in stores.entries.items():
+        if any(os.path.realpath(path) == wanted for _, path in entry.instances or []):
+            return store
+    return None
+
+
+def shared_stores_listed_outside_the_service(
+    repo: "Lore",
+) -> tuple[SharedStoreList, str]:
+    """The shared stores with their instances, as `lore shared-store list` lists
+    them run in `repo` with relaying off, and the command's output.
+
+    Runs the CLI directly, bounded, as a listing that waits for a store the
+    service holds would otherwise run until the test's own timeout."""
+    listed = subprocess.run(
+        [
+            *(repo.lore_executable_path, "shared-store", "list"),
+            *("--include-instances", "true"),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+        env=repo.sandboxed_env(LORE_USE_SERVICE="0"),
+        cwd=repo.path,
+        timeout=60,
+    )
+    output = listed.stdout + listed.stderr
+    assert listed.returncode == 0, output
+    return parse_shared_store_list(listed.stdout), output

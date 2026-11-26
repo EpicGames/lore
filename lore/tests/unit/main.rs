@@ -20,6 +20,7 @@ mod revision_graph;
 mod revision_tree;
 mod sandbox_tests;
 mod service;
+mod shared_store;
 mod storage;
 #[path = "../test_util.rs"]
 mod test_util;

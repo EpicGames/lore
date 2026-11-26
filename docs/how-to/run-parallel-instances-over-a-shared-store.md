@@ -172,6 +172,8 @@ Store at path: /home/you/.local/share/lore/shared_store/127.0.0.1_41337
 
 `--include-instances` takes a value, `true` or `false`.
 
+The listing waits 3 seconds in all for the stores other processes hold. A store another process still holds after that is listed without its instances, and a warning names it. Run the command again once that process is done.
+
 ## Remove an instance
 
 1. **Commit what you want to keep.**
@@ -256,6 +258,8 @@ To delete a store and everything in it:
 1. **Remove every instance over it.**
 
     `lore shared-store list --include-instances true` lists them, for every repository on the server. Remove each one as in [Remove an instance](#remove-an-instance).
+
+    A store the listing names in a warning is in use, and its instances aren't listed. Don't delete it until a listing gives no warning naming it.
 
 2. **Delete the store directory.**
 

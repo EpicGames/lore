@@ -3,8 +3,8 @@
 """FUSE instances served by the background service: clone, read, sync, a clone
 that starts the service, a service stop that meets a busy mount, a forced stop after a
 replacement service remounted, two service starts racing one that is mounting, the
-relayed staged-link and latest-list listings, an interactive commit through the mount,
-and a diff after a sync."""
+relayed staged-link and latest-list listings, a listing of the shared stores outside the
+service, an interactive commit through the mount, and a diff after a sync."""
 
 import contextlib
 import errno
@@ -29,6 +29,7 @@ from service_util import (
     LORE_SERVICE_SOCKET_VAR,
     SERVICE_UNAVAILABLE,
 )
+from test_utils import shared_stores_listed_outside_the_service, store_listing
 
 from lore import Lore, external_root
 
@@ -184,11 +185,7 @@ def test_reset_through_fuse_puts_back_the_spelling_the_revision_holds(
 def store_holding(repo: Lore, instance: Lore) -> str | None:
     """The path of the shared store whose registry lists `instance`, read through
     `repo`, an ordinary clone, or `None` where none lists it."""
-    wanted = os.path.realpath(instance.path)
-    for store, entry in repo.shared_store_list(include_instances=True).entries.items():
-        if any(os.path.realpath(path) == wanted for _, path in entry.instances or []):
-            return store
-    return None
+    return store_listing(repo.shared_store_list(include_instances=True), instance)
 
 
 @pytest.mark.smoke
@@ -213,6 +210,23 @@ def test_fuse_clone_uses_a_shared_store_unasked(
     assert store is not None and os.path.realpath(store).startswith(base + os.sep), (
         f"the store under {base} lists the clone, not {store}"
     )
+
+
+@pytest.mark.smoke
+def test_shared_store_list_outside_the_service_lists_a_mounted_clone(
+    new_lore_repo, fuse_mounts
+):
+    """A listing of the shared stores with their instances, run outside the
+    service with relaying off, lists a mounted virtual clone, whose store the
+    service holds for as long as it serves the clone, rather than waiting for
+    the store until the service stops."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("initial", {"readme.txt": b"listed beside the service\n"})
+    fuse = fuse_clone(repo, fuse_mounts)
+
+    stores, output = shared_stores_listed_outside_the_service(repo)
+
+    assert store_listing(stores, fuse) is not None, output
 
 
 @pytest.mark.smoke

@@ -601,8 +601,8 @@ pub struct LoreSharedStoreListItem {
     pub remote_url: LoreString,
     /// Path to the shared store on disk.
     pub store_path: LoreString,
-    /// Paths to instances using the shared store
+    /// Paths to instances using the shared store, empty for a store listed without its instances.
     pub instance_paths: LoreArray<LoreString>,
-    /// Ids of instances using the shared store
+    /// Ids of instances using the shared store, empty for a store listed without its instances.
     pub instance_ids: LoreArray<InstanceId>,
 }

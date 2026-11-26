@@ -14,7 +14,11 @@ from error_types import (
 from lore_parsers import parse_jsonl, parse_status_json
 from service_util import LORE_SERVICE_ENVIRONMENT, stop_lore_service
 from test_repository_info import get_instance_id
-from test_utils import unstaged_entries
+from test_utils import (
+    shared_stores_listed_outside_the_service,
+    store_listing,
+    unstaged_entries,
+)
 
 from lore import Lore, external_root, per_url_store_path
 
@@ -477,6 +481,25 @@ def test_swfs_forced_switch_after_a_commit_keeps_the_working_tree(
         assert f.read() == b"main\n"
     repo.write_files({"after.txt": b"written after the switch\n"})
     assert sorted(os.listdir(repo.path)) == ["after.txt", "f.txt"]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_shared_store_list_outside_the_service_lists_a_mounted_clone(
+    new_lore_repo, background_lore_service
+):
+    """A listing of the shared stores with their instances, run outside the
+    service with relaying off, lists a mounted SWFS clone, whose store the
+    service holds for as long as it serves the clone, rather than waiting for
+    the store until the service stops."""
+    repo: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    repo.write_commit_push("initial", {"readme.txt": b"listed beside the service\n"})
+    swfs_repo = _swfs_clone(repo)
+
+    stores, output = shared_stores_listed_outside_the_service(repo)
+
+    assert store_listing(stores, swfs_repo) is not None, output
 
 
 def _swfs_create(new_lore_repo) -> Lore:

@@ -46,6 +46,11 @@ pub(crate) fn during_external_root_move<F: Future>(call: F) -> impl Future<Outpu
     EXTERNAL_ROOT_MOVE.scope((), call)
 }
 
+/// Whether the running call is one the move reply handed back, which runs here.
+pub(crate) fn runs_during_external_root_move() -> bool {
+    EXTERNAL_ROOT_MOVE.try_with(|()| ()).is_ok()
+}
+
 /// Runs `call`, relayed from a process with `environment`, so that the execution context it sets
 /// up reads that environment in place of this process's.
 #[lore_macro::test_pub]
@@ -385,7 +390,7 @@ async fn prepare_repository_call(
         .await;
     let failure = match found {
         Ok(dotpath) if dotpath.is_dir() => return Ok((repository_path, execution)),
-        Ok(_) if EXTERNAL_ROOT_MOVE.try_with(|()| ()).is_ok() => {
+        Ok(_) if runs_during_external_root_move() => {
             LoreErrorDetail::from_error(&ServiceCallError::from(ServiceUnavailable {
                 reason: format!(
                     "{} holds no Lore directory, and {EXTERNAL_ROOT_MOVING}",

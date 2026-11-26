@@ -6829,7 +6829,7 @@ pub type LoreSharedStoreListArgs = crate::shared_store::LoreSharedStoreListArgs;
 ///
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
-/// | `LORE_EVENT_SHARED_STORE_LIST` | `lore_shared_store_list_event_data_t` | Emitted on success carrying every registered shared store, and the instances using each when `include_instances` is set, leaving out an instance registration the store can't read, which a `LORE_EVENT_LOG` warning counts |
+/// | `LORE_EVENT_SHARED_STORE_LIST` | `lore_shared_store_list_event_data_t` | Emitted on success carrying every registered shared store, and the instances using each when `include_instances` is set, leaving out an instance registration the store can't read, which a `LORE_EVENT_LOG` warning counts. A store another process still holds once the listing has waited 3 seconds in all is carried without its instances, and a `LORE_EVENT_LOG` warning names it. With `include_instances` set and a service running in another process, the listing runs in the service, so this includes a store the calling process holds |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_shared_store_list(
     globals: &LoreGlobalArgs,
@@ -6860,7 +6860,7 @@ pub extern "C" fn lore_shared_store_list(
 ///
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
-/// | `LORE_EVENT_SHARED_STORE_LIST` | `lore_shared_store_list_event_data_t` | Emitted on success carrying every registered shared store, and the instances using each when `include_instances` is set, leaving out an instance registration the store can't read, which a `LORE_EVENT_LOG` warning counts |
+/// | `LORE_EVENT_SHARED_STORE_LIST` | `lore_shared_store_list_event_data_t` | Emitted on success carrying every registered shared store, and the instances using each when `include_instances` is set, leaving out an instance registration the store can't read, which a `LORE_EVENT_LOG` warning counts. A store another process still holds once the listing has waited 3 seconds in all is carried without its instances, and a `LORE_EVENT_LOG` warning names it. With `include_instances` set and a service running in another process, the listing runs in the service, so this includes a store the calling process holds |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_shared_store_list_async(
     globals: &LoreGlobalArgs,

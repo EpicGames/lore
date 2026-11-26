@@ -68,6 +68,11 @@ impl SharedStoreRegistryEntry {
         &self.path
     }
 
+    /// The directory of this shared store's stores.
+    pub fn store_dir(&self) -> PathBuf {
+        Path::new(&self.path).join(SHARED_STORE_DIR)
+    }
+
     /// A context on the zero repository over this shared store's stores, which it claims for
     /// its lifetime as a command does.
     ///
@@ -77,7 +82,7 @@ impl SharedStoreRegistryEntry {
     pub async fn create_null_repository_context(
         &self,
     ) -> Result<Arc<RepositoryContext>, RepositoryError> {
-        let path_buf = PathBuf::from(&self.path).join(SHARED_STORE_DIR);
+        let path_buf = self.store_dir();
         let (immutable_store, opening) = create_immutable_store_at_path(
             path_buf.clone(),
             ImmutableStoreCreateOptions::none(),

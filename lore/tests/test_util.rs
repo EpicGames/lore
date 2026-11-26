@@ -206,3 +206,45 @@ impl Drop for Replier {
         }
     }
 }
+
+/// Registers the shared stores in `stores`, directories that hold a `shared_store` directory, in
+/// the registry of the global directory `global`.
+#[allow(dead_code)]
+pub fn register(global: &std::path::Path, stores: &[&std::path::Path]) {
+    let mut registry = lore_revision::shared_store::registry::SharedStoreRegistry::default();
+    for store in stores {
+        registry
+            .register("lore://127.0.0.1:1".to_owned(), store)
+            .expect("register the store");
+    }
+    let directory = global
+        .join("data")
+        .join(lore_revision::shared_store::SHARED_STORES_DIR);
+    std::fs::create_dir_all(&directory).expect("make the registry's directory");
+    std::fs::write(
+        directory.join(lore_revision::shared_store::registry::REGISTRY),
+        toml::to_string(&registry).expect("serialize the registry"),
+    )
+    .expect("write the registry");
+}
+
+/// A hold on the lock of the shared store in `store`, a directory that holds or is to hold a
+/// `shared_store` directory, as another process holds it, with the store's `immutable` directory
+/// made.
+#[allow(dead_code)]
+pub async fn hold_store(store: &std::path::Path) -> lore_base::fs::lock::FSLock {
+    let immutable = store
+        .join(lore_revision::shared_store::SHARED_STORE_DIR)
+        .join("immutable");
+    std::fs::create_dir_all(&immutable).expect("make the store's immutable directory");
+    lore_base::fs::lock::FSLock::acquire_exact_path(&immutable.join("lock"))
+        .await
+        .expect("hold the store's lock")
+}
+
+/// The path a listing of the shared stores gives for the store in `store`, as the registry
+/// records it.
+#[allow(dead_code)]
+pub fn listed_path(store: &std::path::Path) -> String {
+    lore_revision::util::path::clean(store.display().to_string())
+}

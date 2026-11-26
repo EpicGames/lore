@@ -2812,7 +2812,8 @@ Show information about the registry of shared stores
 
 ###### **Options:**
 
-* `--include-instances <INCLUDE_INSTANCES>` — Look up all instances each shared store is used by
+* `--include-instances <INCLUDE_INSTANCES>` — Look up the instances using each shared store. A store another process
+  still holds after a 3-second wait is listed without them, with a warning
 
   Possible values: `true`, `false`
 

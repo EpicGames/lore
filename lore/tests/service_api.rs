@@ -1280,6 +1280,28 @@ mod tests {
         assert_eq!(replier.answered(), 1, "the call reached the socket");
     }
 
+    /// A relayed listing of the shared stores with their instances, which the service socket
+    /// answers with the move reply, runs in this process without asking the socket again.
+    #[test]
+    #[serial]
+    fn a_listing_with_instances_answered_with_the_move_reply_asks_the_socket_once() {
+        let settings = machine_settings("service-api-move-reply-listing-");
+        let replier = relaying_to_a_move(&settings);
+
+        assert_eq!(
+            lore::interface::lore_shared_store_list(
+                &globals(),
+                &LoreSharedStoreListArgs {
+                    include_instances: 1
+                },
+                no_callback()
+            ),
+            0,
+            "the list runs here"
+        );
+        assert_eq!(replier.answered(), 1, "the call asked the socket once");
+    }
+
     /// A relayed call at a path that holds no Lore directory, as a virtual instance's mount
     /// point holds none while the service is stopped, fails with `ServiceUnavailable` once the
     /// service socket has answered with the move reply, in place of the open's own failure.
