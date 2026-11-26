@@ -469,6 +469,55 @@ mod tests {
         assert_eq!(dedup(&["Foo/x", "bar/Y"]), vec!["Foo/x", "bar/Y"]);
     }
 
+    /// Each component the paths spell apart is handed over as the kept paths spell it, with
+    /// the name another path gave it, a child under the spelling its parent was brought onto;
+    /// paths that agree hand over nothing.
+    #[test]
+    fn dedup_to_supersets_noting_hands_over_the_spellings_it_replaces() {
+        fn noted(inputs: &[&str]) -> (Vec<String>, Vec<(String, String)>) {
+            let paths: Vec<RelativePath> = inputs
+                .iter()
+                .map(|p| RelativePath::new_from_initial_path(p).expect("Path init failed"))
+                .collect();
+            let mut respelled = Vec::new();
+            let kept = RelativePath::dedup_to_supersets_noting(paths, |kept, other| {
+                respelled.push((kept.as_str().to_owned(), other.as_str().to_owned()));
+            });
+            respelled.sort();
+            respelled.dedup();
+            (
+                kept.into_iter().map(|p| p.as_str().to_owned()).collect(),
+                respelled,
+            )
+        }
+        let pair = |kept: &str, other: &str| (kept.to_owned(), other.to_owned());
+
+        assert_eq!(noted(&["Game/fyre/a.txt", "Game/fyre/b.txt"]).1, Vec::new());
+        assert_eq!(
+            noted(&[
+                "Repro/Dir_Net/Meshes/B.txt",
+                "Repro/Dir_net/Meshes/Parts/P.txt",
+                "Repro/Dir_net/Meshes/Parts/C.txt",
+            ]),
+            (
+                vec![
+                    "Repro/Dir_Net/Meshes/B.txt".to_owned(),
+                    "Repro/Dir_Net/Meshes/Parts/C.txt".to_owned(),
+                    "Repro/Dir_Net/Meshes/Parts/P.txt".to_owned(),
+                ],
+                vec![pair("Repro/Dir_Net", "Repro/Dir_net")]
+            )
+        );
+        assert_eq!(
+            noted(&["Dir_Net/Meshes/a", "dir_net/meshes/b", "DIR_NET/z"]).1,
+            vec![
+                pair("Dir_Net", "DIR_NET"),
+                pair("Dir_Net", "dir_net"),
+                pair("Dir_Net/Meshes", "dir_net/meshes"),
+            ]
+        );
+    }
+
     /// Node lookup hashes names lowercased, so a path resolved from user input
     /// can differ in case from the stored paths it is compared against.
     /// `covers` alone would miss those; the prefix boundary still has to hold.

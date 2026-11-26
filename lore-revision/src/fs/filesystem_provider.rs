@@ -975,7 +975,10 @@ pub trait InstanceOperation: Send + Sync {
 
     /// Moves what the file system holds at `from` to `to`, unifying the two where `to` is
     /// occupied rather than refusing: a file takes the place of the file there, and a directory
-    /// hands each of its children over under these same rules before it goes.
+    /// hands each of its children over before it goes, a child directory under these same rules.
+    /// A child file replaces no file the destination holds: one holding the same content is
+    /// removed, and one holding other content fails the move. A file moved to another spelling
+    /// of its own name, where the working tree holds a file under each, is settled the same way.
     ///
     /// A `from` and `to` of different kinds, one a file and one a directory, is refused, there
     /// being no move that leaves one of them.
@@ -1677,6 +1680,27 @@ impl InstanceOperationImpl {
             #[cfg(target_os = "linux")]
             StaticDispatchInstanceOperation::Fuse(this) => this.remove_recursive(path).await,
         }
+    }
+
+    /// Renames `from` to `to`, another spelling of its name, as [`InstanceOperation::rename`]
+    /// does. A dry run moves nothing: over the OS file system it checks what the rename checks
+    /// and has the operation's later reads of `to` answer from where the content stays
+    /// ([`OsOperation::respell_unmoved`](super::os::OsOperation::respell_unmoved)), so that it
+    /// fails where the rename fails and reads what the rename leaves. A dry run over another
+    /// provider answers as for a rename, checking nothing.
+    ///
+    /// The dry run's check is boxed as the cold path it is.
+    pub async fn rename_to_spelling(
+        &self,
+        from: &RelativePath,
+        to: &RelativePath,
+    ) -> Result<(), FsError> {
+        if self.dry_run
+            && let StaticDispatchInstanceOperation::Os(this) = &self.dispatch
+        {
+            return Box::pin(this.respell_unmoved(from, to)).await;
+        }
+        self.rename(from, to).await
     }
 
     /// Renames `from` to `to` as [`InstanceOperation::rename`] does. Where the rename is refused,

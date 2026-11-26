@@ -604,6 +604,180 @@ async fn rename_merges_a_directory_into_the_one_at_the_destination() {
     assert!(!from.exists(), "the source must be gone");
 }
 
+/// A directory merged into the one at the destination replaces no file there: a child file
+/// holding the content the destination's file holds is dropped, the destination keeping its own.
+#[tokio::test]
+async fn rename_merging_a_directory_drops_a_file_the_destination_holds_alike() {
+    let dir = temp_dir();
+    let from = dir.path().join("from");
+    let to = dir.path().join("to");
+    std::fs::create_dir_all(from.join("nested")).expect("create source");
+    std::fs::create_dir_all(to.join("nested")).expect("create destination");
+    std::fs::write(from.join("nested").join("same"), b"alike").expect("write child");
+    std::fs::write(to.join("nested").join("same"), b"alike").expect("write held child");
+    std::fs::write(from.join("carried"), b"carried").expect("write carried child");
+    let operation = os_operation(dir.path()).await;
+
+    operation
+        .rename(&relative("from"), &relative("to"))
+        .await
+        .expect("the merge must land");
+
+    assert_eq!(
+        Some(b"alike".to_vec()),
+        std::fs::read(to.join("nested").join("same")).ok()
+    );
+    assert_eq!(
+        Some(b"carried".to_vec()),
+        std::fs::read(to.join("carried")).ok()
+    );
+    assert!(!from.exists(), "the source must be gone");
+}
+
+/// A child file holding other content than the file the destination holds under its name fails
+/// the merge, and both keep what they hold.
+#[tokio::test]
+async fn rename_merging_a_directory_refuses_a_file_the_destination_holds_otherwise() {
+    let dir = temp_dir();
+    let from = dir.path().join("from");
+    let to = dir.path().join("to");
+    std::fs::create_dir(&from).expect("create source");
+    std::fs::create_dir(&to).expect("create destination");
+    for (directory, content) in [(&from, &b"incoming"[..]), (&to, b"held")] {
+        std::fs::write(directory.join("taken"), content).expect("write child");
+    }
+    std::fs::write(from.join("longer"), b"incoming, and longer").expect("write child");
+    std::fs::write(to.join("longer"), b"held").expect("write held child");
+    let operation = os_operation(dir.path()).await;
+
+    operation
+        .rename(&relative("from"), &relative("to"))
+        .await
+        .expect_err("a file of other content must not be replaced");
+
+    assert_eq!(Some(b"held".to_vec()), std::fs::read(to.join("taken")).ok());
+    assert_eq!(
+        Some(b"held".to_vec()),
+        std::fs::read(to.join("longer")).ok()
+    );
+    let left: Vec<Option<Vec<u8>>> = ["taken", "longer"]
+        .iter()
+        .map(|name| std::fs::read(from.join(name)).ok())
+        .collect();
+    assert_eq!(
+        vec![
+            Some(b"incoming".to_vec()),
+            Some(b"incoming, and longer".to_vec())
+        ],
+        left,
+        "the source keeps the files that were refused or not reached"
+    );
+}
+
+/// A file moved to another spelling of its name, where the file system holds a file under each,
+/// replaces nothing: the source is dropped where the two hold the same content, and the move
+/// fails, both kept, where they hold other content. Only a file system that tells case apart
+/// holds the two.
+#[tokio::test]
+async fn rename_to_another_spelling_replaces_no_file() {
+    for (incoming, landed) in [(&b"held"[..], true), (b"other", false)] {
+        let dir = temp_dir();
+        if case_insensitive(dir.path()) {
+            return;
+        }
+        std::fs::write(dir.path().join("Orange.txt"), b"held").expect("write destination");
+        std::fs::write(dir.path().join("orange.txt"), incoming).expect("write source");
+        let operation = os_operation(dir.path()).await;
+
+        let moved = operation
+            .rename(&relative("orange.txt"), &relative("Orange.txt"))
+            .await;
+
+        assert_eq!(landed, moved.is_ok(), "content alike: {landed}");
+        assert_eq!(
+            Some(b"held".to_vec()),
+            std::fs::read(dir.path().join("Orange.txt")).ok(),
+            "the destination keeps its own, content alike: {landed}"
+        );
+        assert_eq!(
+            (!landed).then(|| incoming.to_vec()),
+            std::fs::read(dir.path().join("orange.txt")).ok(),
+            "the source is dropped only where alike: {landed}"
+        );
+    }
+}
+
+/// A dry run renaming a path to another spelling of its name moves nothing, and the operation
+/// then reads the new spelling from where the content stays: a path below a respelled directory,
+/// a directory below it respelled in turn, and the listing of a directory held under both
+/// spellings, which lists the children of both. A file the rename would replace with other
+/// content fails the dry run. Only a file system that tells case apart holds the spellings
+/// apart.
+#[tokio::test]
+async fn rename_to_spelling_in_a_dry_run_moves_nothing_and_reads_as_moved() {
+    let dir = temp_dir();
+    if case_insensitive(dir.path()) {
+        return;
+    }
+    let root = dir.path();
+    for held in ["dir/Sub", "Both/Deep", "both/Deep", "Apart", "apart"] {
+        std::fs::create_dir_all(root.join(held)).expect("create directory");
+    }
+    for (file, content) in [
+        ("dir/Sub/x", "x"),
+        ("Both/a", "a"),
+        ("both/b", "b"),
+        ("both/Deep/c", "c"),
+        ("Apart/same", "one"),
+        ("apart/same", "other"),
+    ] {
+        std::fs::write(root.join(file), content).expect("write file");
+    }
+    let dry_run = crate::fs::filesystem_provider::test_execution_with(
+        lore_revision::interface::LoreGlobalArgs {
+            dry_run: 1,
+            ..Default::default()
+        },
+    );
+    let operation = LORE_CONTEXT.scope(dry_run, os_operation(root)).await;
+
+    // The renames a stage unifying spellings asks for, outermost first.
+    for (from, to) in [("dir", "Dir"), ("Dir/Sub", "Dir/sub"), ("both", "Both")] {
+        operation
+            .rename_to_spelling(&relative(from), &relative(to))
+            .await
+            .expect("a dry run of a rename that replaces nothing");
+    }
+    operation
+        .rename_to_spelling(&relative("apart"), &relative("Apart"))
+        .await
+        .expect_err("the rename would replace a file holding other content");
+
+    // Every new spelling reads what the rename would have left there.
+    for moved in ["Dir/sub/x", "Both/a", "Both/b", "Both/Deep/c"] {
+        let info = operation.file_info(&relative(moved)).await.expect("stat");
+        assert!(info.is_file(), "{moved} reads as moved");
+    }
+    let mut listing = operation
+        .read_directory(&relative("Both"))
+        .await
+        .expect("list the directory held under both spellings");
+    let mut listed = Vec::new();
+    while let Some(entry) = listing.next().await {
+        listed.push(entry.expect("entry").name);
+    }
+    listed.sort();
+    assert_eq!(listed, ["Deep", "a", "b"]);
+
+    // Nothing moved on the file system.
+    for held in ["dir/Sub/x", "both/b", "both/Deep/c", "apart/same"] {
+        assert!(root.join(held).exists(), "{held} stays where it was");
+    }
+    for absent in ["Dir", "Both/b", "Both/Deep/c"] {
+        assert!(!root.join(absent).exists(), "{absent} was not created");
+    }
+}
+
 /// A rename into a directory the file system lacks is refused for a directory as for a file: the
 /// source keeps what it holds, and nothing is created at the destination.
 #[tokio::test]

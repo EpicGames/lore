@@ -2268,6 +2268,11 @@ fn stage_absent_delete_recurse(
 ///
 /// In `Error` mode (default `stage` without `--case`), no resolution is attempted so the
 /// downstream code can report the mismatch to the user.
+///
+/// A merge that fails, as one that would replace a file with other content does, fails the
+/// stage with the entries left as listed. A dry run merges nothing and reads the winner as merged
+/// ([`unify_case`]). The merge is boxed as the cold path it is: only a directory holding two
+/// spellings of a name takes it.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_case_variant_collisions(
     operation: &Arc<InstanceOperationImpl>,
@@ -2340,7 +2345,7 @@ async fn resolve_case_variant_collisions(
                     let from_path = relative_path.clone().push_and_freeze(&entry.name);
                     let to_path = relative_path.clone().push_and_freeze(winner_name);
                     lore_debug!("Case variant collision: unifying {from_path} into {to_path}");
-                    let _ = operation.rename(&from_path, &to_path).await;
+                    Box::pin(unify_case(operation, &from_path, &to_path)).await?;
                 }
             }
         }
@@ -3513,15 +3518,17 @@ impl StagedChild {
     }
 }
 
-/// Renames `from` to `to` on the filesystem, which differ only in case. A refusal the stage error
-/// declares, such as a read-only instance, stays that error.
-async fn unify_case(
+/// Renames `from` to `to` on the filesystem, which differ only in case. A dry run moves nothing
+/// and reads `to` from where its content stays
+/// ([`InstanceOperationImpl::rename_to_spelling`]). A refusal the stage error declares, such as
+/// a read-only instance, stays that error.
+pub(crate) async fn unify_case(
     operation: &InstanceOperationImpl,
     from: &RelativePath,
     to: &RelativePath,
 ) -> Result<(), StageError> {
     operation
-        .rename(from, to)
+        .rename_to_spelling(from, to)
         .await
         .forward_any_with::<StageError, _>(|| {
             format!("Unable to rename file system path {from} to {to}")

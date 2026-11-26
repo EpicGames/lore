@@ -672,6 +672,18 @@ impl RelativePath {
         }
     }
 
+    /// The view of the leading components that end `len` bytes into the path and `len_lower`
+    /// bytes into its lowercase form. The data is shared, so this costs no allocation.
+    fn leading(&self, len: usize, len_lower: usize) -> Self {
+        Self {
+            data: self.data.clone(),
+            start: self.start,
+            end: self.start + offset(len),
+            start_lower: self.start_lower,
+            end_lower: self.start_lower + offset(len_lower),
+        }
+    }
+
     /// What stands above the last component, which is the empty path where the path holds
     /// only one. See [`pop_name`](Self::pop_name).
     pub fn parent_path(&self) -> Self {
@@ -1033,6 +1045,18 @@ impl RelativePath {
     /// scan-against-all pass over 900,000 paths is ~4×10¹¹ comparisons, each one
     /// chasing a separate allocation, which does not finish in an hour.
     pub fn dedup_to_supersets(paths: Vec<RelativePath>) -> Vec<RelativePath> {
+        Self::dedup_to_supersets_noting(paths, |_, _| {})
+    }
+
+    /// [`Self::dedup_to_supersets`], which hands `respelled` each directory it brings onto
+    /// another spelling: the directory as the returned paths spell it, and as a path given spelled
+    /// it instead, both views of paths given, which cost no allocation. A caller that unifies the
+    /// working tree takes from them the spellings the returned paths no longer carry. A spelling
+    /// is handed over once per path given that used it, and nothing is where the paths agree.
+    pub fn dedup_to_supersets_noting(
+        paths: Vec<RelativePath>,
+        mut respelled: impl FnMut(RelativePath, RelativePath),
+    ) -> Vec<RelativePath> {
         if paths.iter().any(|p| p.is_empty()) {
             return Vec::new();
         }
@@ -1053,7 +1077,7 @@ impl RelativePath {
         let mut result: Vec<RelativePath> = Vec::with_capacity(sorted.len());
         for path in sorted {
             let path = match result.last() {
-                Some(kept) => unify_case_with(kept, &path).unwrap_or(path),
+                Some(kept) => unify_case_with(kept, &path, &mut respelled).unwrap_or(path),
                 None => path,
             };
             if !result
@@ -1085,13 +1109,21 @@ fn component_prefix_len(path: &str, count: usize) -> usize {
 /// Components are shared as far as their lowercase forms run together: below the
 /// first component the two genuinely disagree on they are in different
 /// directories and neither says anything about the other.
-fn unify_case_with(established: &RelativePath, path: &RelativePath) -> Option<RelativePath> {
+///
+/// `respelled` is handed each shared directory the two spell apart: a view of `established`
+/// down to it, and a view of `path` down to it.
+fn unify_case_with(
+    established: &RelativePath,
+    path: &RelativePath,
+    mut respelled: impl FnMut(RelativePath, RelativePath),
+) -> Option<RelativePath> {
     let mut established_names = established.as_str().split('/');
     let mut established_lower = established.as_lowercase_str().split('/');
     let mut path_lower = path.as_lowercase_str().split('/');
 
     let mut shared = 0;
     let mut differs = false;
+    let (mut established_end, mut path_end, mut lower_end) = (0, 0, 0);
     for name in path.as_str().split('/') {
         let (Some(established_name), Some(established_name_lower), Some(name_lower)) = (
             established_names.next(),
@@ -1103,7 +1135,17 @@ fn unify_case_with(established: &RelativePath, path: &RelativePath) -> Option<Re
         if established_name_lower != name_lower {
             break;
         }
-        differs |= established_name != name;
+        let separator = usize::from(shared > 0);
+        established_end += established_name.len() + separator;
+        path_end += name.len() + separator;
+        lower_end += name_lower.len() + separator;
+        if established_name != name {
+            differs = true;
+            respelled(
+                established.leading(established_end, lower_end),
+                path.leading(path_end, lower_end),
+            );
+        }
         shared += 1;
     }
     if !differs {

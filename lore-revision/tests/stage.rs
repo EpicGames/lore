@@ -1243,6 +1243,581 @@ mod tests {
             .expect("Test task failed");
     }
 
+    /// The staged action of the node at `path`: `A`, `M`, `D`, or `-` where it is not staged.
+    async fn staged_action(
+        repository: &Arc<RepositoryContext>,
+        state: &state::State,
+        path: &str,
+    ) -> &'static str {
+        let node_link = state
+            .find_node_link(repository.clone(), path)
+            .await
+            .expect("Failed to find the node");
+        let node = state
+            .node(repository.clone(), node_link.node)
+            .await
+            .expect("Failed to load the node");
+        if node.is_staged_delete() {
+            "D"
+        } else if node.is_staged_add() {
+            "A"
+        } else if node.is_staged_modify() {
+            "M"
+        } else {
+            "-"
+        }
+    }
+
+    /// Files staged together under `Keep` below a directory the working tree holds under two
+    /// spellings, the tree's and another, each file given under the spelling it stands under: the
+    /// other spelling is merged into the tree's on disk, so every file is staged under the tree's
+    /// spelling, a changed one as modified and a new one as added, forced or not. Only a
+    /// case-sensitive file system holds the two side by side.
+    #[tokio::test]
+    #[allow(clippy::large_futures)]
+    async fn stage_keep_case_of_targets_spelling_a_directory_two_ways() {
+        for force in [true, false] {
+            in_execution(async move {
+                let (immutable_store, mutable_store, _) =
+                    test_store_create().await.expect("Failed to create stores");
+                let fixture = test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                if case_insensitive(&fixture.path) {
+                    return;
+                }
+                let tracked = fixture
+                    .path
+                    .join("CaseRepro")
+                    .join("Dir_Net")
+                    .join("Meshes");
+                std::fs::create_dir_all(tracked.join("Parts")).expect("Create directory failed");
+                test_file_write(&tracked.join("A.txt"), b"a");
+                test_file_write(&tracked.join("Parts").join("P.txt"), b"p");
+                test_commit_tree(&fixture, "Initial").await;
+                std::fs::remove_file(tracked.join("A.txt")).expect("remove A.txt");
+                std::fs::remove_file(tracked.join("Parts").join("P.txt")).expect("remove P.txt");
+
+                let other = fixture
+                    .path
+                    .join("CaseRepro")
+                    .join("Dir_net")
+                    .join("Meshes");
+                std::fs::create_dir_all(other.join("Parts")).expect("Create directory failed");
+                test_file_write(&tracked.join("B.txt"), b"b");
+                test_file_write(&other.join("Parts").join("P.txt"), b"p changed");
+                test_file_write(&other.join("Parts").join("C.txt"), b"c");
+                test_file_write(&other.join("Unnamed.txt"), b"u");
+
+                let stage = file::stage::stage(
+                    fixture.repository.clone(),
+                    &fixture.write_token,
+                    LoreArray::from_vec(vec![
+                        LoreString::from(&tracked.join("B.txt")),
+                        LoreString::from(&other.join("Parts").join("P.txt")),
+                        LoreString::from(&other.join("Parts").join("C.txt")),
+                    ]),
+                    StageOptions {
+                        case_change: stage::StageCaseChange::Keep,
+                        scan: true,
+                        ..Default::default()
+                    },
+                );
+                let signature = if force {
+                    LORE_CONTEXT.scope(forced_execution(), stage).await
+                } else {
+                    stage.await
+                }
+                .expect("Failed to stage the two spellings");
+
+                assert_eq!(
+                    vec!["Dir_Net".to_string()],
+                    names_folding_to(&fixture.path.join("CaseRepro"), "dir_net"),
+                    "Keep merges the other spelling into the tree's, forced {force}"
+                );
+                for (name, content) in [
+                    ("B.txt", &b"b"[..]),
+                    ("Parts/P.txt", b"p changed"),
+                    ("Parts/C.txt", b"c"),
+                    ("Unnamed.txt", b"u"),
+                ] {
+                    assert_eq!(
+                        std::fs::read(tracked.join(name)).ok().as_deref(),
+                        Some(content),
+                        "{name} under the tree's spelling, forced {force}"
+                    );
+                }
+
+                let repository = fixture.repository.clone();
+                let state = state::State::deserialize(repository.clone(), signature)
+                    .await
+                    .expect("Failed to deserialize the staged state");
+                for (name, action) in [("B.txt", "A"), ("Parts/P.txt", "M"), ("Parts/C.txt", "A")] {
+                    assert_eq!(
+                        staged_action(
+                            &repository,
+                            &state,
+                            &format!("CaseRepro/Dir_Net/Meshes/{name}")
+                        )
+                        .await,
+                        action,
+                        "{name}, forced {force}"
+                    );
+                }
+            })
+            .await;
+        }
+    }
+
+    /// A file the working tree holds under both spellings of a directory with other content
+    /// fails the stage under `Keep`, forced or not, and neither file is replaced.
+    #[tokio::test]
+    #[allow(clippy::large_futures)]
+    async fn stage_keep_case_of_targets_spelling_a_directory_two_ways_replaces_no_file() {
+        for force in [true, false] {
+            in_execution(async move {
+                let (immutable_store, mutable_store, _) =
+                    test_store_create().await.expect("Failed to create stores");
+                let fixture = test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                if case_insensitive(&fixture.path) {
+                    return;
+                }
+                let tracked = fixture.path.join("Dir_Net");
+                let other = fixture.path.join("Dir_net");
+                std::fs::create_dir_all(&tracked).expect("Create directory failed");
+                test_file_write(&tracked.join("A.txt"), b"a");
+                test_commit_tree(&fixture, "Initial").await;
+                std::fs::create_dir_all(&other).expect("Create directory failed");
+                test_file_write(&tracked.join("B.txt"), b"b");
+                test_file_write(&other.join("A.txt"), b"other");
+                test_file_write(&other.join("C.txt"), b"c");
+
+                let stage = file::stage::stage(
+                    fixture.repository.clone(),
+                    &fixture.write_token,
+                    LoreArray::from_vec(vec![
+                        LoreString::from(&tracked.join("B.txt")),
+                        LoreString::from(&other.join("C.txt")),
+                    ]),
+                    StageOptions {
+                        case_change: stage::StageCaseChange::Keep,
+                        scan: true,
+                        ..Default::default()
+                    },
+                );
+                let staged = if force {
+                    LORE_CONTEXT.scope(forced_execution(), stage).await
+                } else {
+                    stage.await
+                };
+
+                assert!(staged.is_err(), "the stage must fail, forced {force}");
+                assert_eq!(
+                    std::fs::read(tracked.join("A.txt")).ok().as_deref(),
+                    Some(&b"a"[..]),
+                    "the tree's spelling keeps its file, forced {force}"
+                );
+                assert_eq!(
+                    std::fs::read(other.join("A.txt")).ok().as_deref(),
+                    Some(&b"other"[..]),
+                    "the other spelling keeps its file, forced {force}"
+                );
+            })
+            .await;
+        }
+    }
+
+    /// A tracked file staged under `Keep` by another spelling of its name, the working tree
+    /// holding a file under each: with the same content the other spelling is dropped and the
+    /// stage succeeds, and with other content the stage fails and both files keep theirs, forced
+    /// or not.
+    #[tokio::test]
+    #[allow(clippy::large_futures)]
+    async fn stage_keep_case_of_a_file_spelled_two_ways_replaces_no_file() {
+        for (force, alike) in [(false, true), (true, true), (false, false), (true, false)] {
+            in_execution(async move {
+                let (immutable_store, mutable_store, _) =
+                    test_store_create().await.expect("Failed to create stores");
+                let fixture = test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                if case_insensitive(&fixture.path) {
+                    return;
+                }
+                let tracked = fixture.path.join("Orange.txt");
+                let other = fixture.path.join("orange.txt");
+                test_file_write(&tracked, b"held");
+                test_commit_tree(&fixture, "Initial").await;
+                let incoming: &[u8] = if alike { b"held" } else { b"other" };
+                test_file_write(&other, incoming);
+
+                let stage = file::stage::stage(
+                    fixture.repository.clone(),
+                    &fixture.write_token,
+                    LoreArray::from_vec(vec![LoreString::from(&other)]),
+                    StageOptions {
+                        case_change: stage::StageCaseChange::Keep,
+                        ..Default::default()
+                    },
+                );
+                let staged = if force {
+                    LORE_CONTEXT.scope(forced_execution(), stage).await
+                } else {
+                    stage.await
+                };
+
+                assert_eq!(staged.is_ok(), alike, "forced {force}, alike {alike}");
+                assert_eq!(
+                    std::fs::read(&tracked).ok().as_deref(),
+                    Some(&b"held"[..]),
+                    "the tree's spelling keeps its file, forced {force}, alike {alike}"
+                );
+                assert_eq!(
+                    std::fs::read(&other).ok(),
+                    (!alike).then(|| incoming.to_vec()),
+                    "the other spelling is dropped only where alike, forced {force}"
+                );
+            })
+            .await;
+        }
+    }
+
+    /// An execution of a dry run.
+    fn dry_run_execution() -> Arc<ExecutionContext> {
+        test_execution_with(LoreGlobalArgs {
+            dry_run: 1,
+            ..Default::default()
+        })
+    }
+
+    /// A dry run staging under `Keep` moves nothing in the working tree and stages what the
+    /// stage itself would: a changed file as modified and a new one as added, each under the
+    /// tree's spelling. Covers a directory the working tree holds under another spelling than
+    /// the tree's alone, staged by its files and by a walk from the root, and one it holds
+    /// under both spellings. Only a case-sensitive file system spells the two apart.
+    #[tokio::test]
+    #[allow(clippy::large_futures)]
+    async fn stage_keep_case_dry_run_stages_under_the_trees_spelling_and_moves_nothing() {
+        for (both_spellings, from_root) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            in_execution(async move {
+                let (immutable_store, mutable_store, _) =
+                    test_store_create().await.expect("Failed to create stores");
+                let fixture = test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                if case_insensitive(&fixture.path) {
+                    return;
+                }
+                let layout = format!("both spellings {both_spellings}, from the root {from_root}");
+                let tracked = fixture.path.join("Dir_Net");
+                let other = fixture.path.join("Dir_net");
+                std::fs::create_dir_all(tracked.join("Parts")).expect("Create directory failed");
+                test_file_write(&tracked.join("A.txt"), b"a");
+                test_file_write(&tracked.join("Parts").join("P.txt"), b"p");
+                test_commit_tree(&fixture, "Initial").await;
+
+                // Either the whole directory goes to the other spelling, or only the changed
+                // file and the new one stand under it, beside the tree's.
+                if both_spellings {
+                    std::fs::remove_file(tracked.join("Parts").join("P.txt")).expect("remove P");
+                    std::fs::create_dir_all(other.join("Parts")).expect("Create directory failed");
+                } else {
+                    std::fs::rename(&tracked, &other).expect("respell the directory");
+                }
+                test_file_write(&other.join("Parts").join("P.txt"), b"p changed");
+                test_file_write(&other.join("Parts").join("C.txt"), b"c");
+
+                let mut held_before = Vec::new();
+                collect_filesystem(&fixture.path, "", &mut held_before);
+
+                let targets = if from_root {
+                    vec![LoreString::from(&fixture.path)]
+                } else {
+                    vec![
+                        LoreString::from(&other.join("Parts").join("P.txt")),
+                        LoreString::from(&other.join("Parts").join("C.txt")),
+                    ]
+                };
+                let signature = LORE_CONTEXT
+                    .scope(
+                        dry_run_execution(),
+                        file::stage::stage(
+                            fixture.repository.clone(),
+                            &fixture.write_token,
+                            LoreArray::from_vec(targets),
+                            StageOptions {
+                                case_change: stage::StageCaseChange::Keep,
+                                scan: true,
+                                ..Default::default()
+                            },
+                        ),
+                    )
+                    .await
+                    .expect("Failed to stage in a dry run");
+
+                // The dry run moved, removed and wrote nothing.
+                let mut held_after = Vec::new();
+                collect_filesystem(&fixture.path, "", &mut held_after);
+                assert_eq!(held_before, held_after, "{layout}");
+                assert_eq!(
+                    std::fs::read(other.join("Parts").join("P.txt"))
+                        .ok()
+                        .as_deref(),
+                    Some(&b"p changed"[..]),
+                    "{layout}"
+                );
+
+                // It staged each file as the stage would, under the tree's spelling.
+                let repository = fixture.repository.clone();
+                let state = state::State::deserialize(repository.clone(), signature)
+                    .await
+                    .expect("Failed to deserialize the staged state");
+                for (name, action) in [("A.txt", "-"), ("Parts/P.txt", "M"), ("Parts/C.txt", "A")] {
+                    assert_eq!(
+                        staged_action(&repository, &state, &format!("Dir_Net/{name}")).await,
+                        action,
+                        "{name}, {layout}"
+                    );
+                }
+            })
+            .await;
+        }
+    }
+
+    /// A directory staged under `Keep` by its own path, together with a new file given under
+    /// another spelling of that directory, which the working tree holds beside it: the other
+    /// spelling is merged into the directory and the file is staged below it as added. Covers the
+    /// two at the root and below a directory itself spelled both ways, and a dry run, which stages
+    /// the same and moves nothing. Only a case-sensitive file system holds the two side by side.
+    #[tokio::test]
+    #[allow(clippy::large_futures)]
+    async fn stage_keep_case_of_a_directory_and_a_file_under_its_other_spelling() {
+        for (nested, dry_run) in [(false, false), (true, false), (false, true), (true, true)] {
+            in_execution(async move {
+                let (immutable_store, mutable_store, _) =
+                    test_store_create().await.expect("Failed to create stores");
+                let fixture = test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                if case_insensitive(&fixture.path) {
+                    return;
+                }
+                let layout = format!("nested {nested}, dry run {dry_run}");
+                let (above, other_above, tree_above) = if nested {
+                    (fixture.path.join("Top"), fixture.path.join("top"), "Top/")
+                } else {
+                    (fixture.path.clone(), fixture.path.clone(), "")
+                };
+                let tracked = above.join("Dir_Net");
+                let other = other_above.join("Dir_net");
+                std::fs::create_dir_all(&tracked).expect("Create directory failed");
+                test_file_write(&tracked.join("A.txt"), b"a");
+                test_commit_tree(&fixture, "Initial").await;
+                std::fs::create_dir_all(&other).expect("Create directory failed");
+                test_file_write(&tracked.join("A.txt"), b"a changed");
+                test_file_write(&other.join("C.txt"), b"c");
+
+                let mut held_before = Vec::new();
+                collect_filesystem(&fixture.path, "", &mut held_before);
+
+                let stage = file::stage::stage(
+                    fixture.repository.clone(),
+                    &fixture.write_token,
+                    LoreArray::from_vec(vec![
+                        LoreString::from(&tracked),
+                        LoreString::from(&other.join("C.txt")),
+                    ]),
+                    StageOptions {
+                        case_change: stage::StageCaseChange::Keep,
+                        scan: true,
+                        ..Default::default()
+                    },
+                );
+                let signature = if dry_run {
+                    LORE_CONTEXT.scope(dry_run_execution(), stage).await
+                } else {
+                    stage.await
+                }
+                .expect("Failed to stage the directory and the file");
+
+                // The stage merges the other spelling away; the dry run leaves all as it was.
+                let mut held_after = Vec::new();
+                collect_filesystem(&fixture.path, "", &mut held_after);
+                if dry_run {
+                    assert_eq!(held_before, held_after, "{layout}");
+                } else {
+                    assert_eq!(
+                        held_after,
+                        [
+                            format!("{tree_above}Dir_Net/A.txt"),
+                            format!("{tree_above}Dir_Net/C.txt")
+                        ],
+                        "{layout}"
+                    );
+                }
+
+                // Both files are staged under the tree's spelling.
+                let repository = fixture.repository.clone();
+                let state = state::State::deserialize(repository.clone(), signature)
+                    .await
+                    .expect("Failed to deserialize the staged state");
+                for (name, action) in [("A.txt", "M"), ("C.txt", "A")] {
+                    assert_eq!(
+                        staged_action(&repository, &state, &format!("{tree_above}Dir_Net/{name}"))
+                            .await,
+                        action,
+                        "{name}, {layout}"
+                    );
+                }
+            })
+            .await;
+        }
+    }
+
+    /// A dry run staging under `Keep` fails where the stage itself would: a file the working
+    /// tree holds with other content under both spellings of a directory, or of its own name.
+    /// It leaves both files as they stand.
+    #[tokio::test]
+    #[allow(clippy::large_futures)]
+    async fn stage_keep_case_dry_run_fails_where_a_file_would_be_replaced() {
+        for in_directory in [true, false] {
+            in_execution(async move {
+                let (immutable_store, mutable_store, _) =
+                    test_store_create().await.expect("Failed to create stores");
+                let fixture = test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                if case_insensitive(&fixture.path) {
+                    return;
+                }
+                // The same file under two spellings: of its directory, or of its own name.
+                let (tracked, other, target) = if in_directory {
+                    let other = fixture.path.join("Dir_net");
+                    (
+                        fixture.path.join("Dir_Net").join("A.txt"),
+                        other.join("A.txt"),
+                        other.join("C.txt"),
+                    )
+                } else {
+                    let other = fixture.path.join("orange.txt");
+                    (fixture.path.join("Orange.txt"), other.clone(), other)
+                };
+                std::fs::create_dir_all(tracked.parent().expect("parent"))
+                    .expect("Create directory failed");
+                test_file_write(&tracked, b"held");
+                test_commit_tree(&fixture, "Initial").await;
+                std::fs::create_dir_all(other.parent().expect("parent"))
+                    .expect("Create directory failed");
+                test_file_write(&other, b"other");
+                test_file_write(&target, b"other");
+
+                let staged = LORE_CONTEXT
+                    .scope(
+                        dry_run_execution(),
+                        file::stage::stage(
+                            fixture.repository.clone(),
+                            &fixture.write_token,
+                            LoreArray::from_vec(vec![LoreString::from(&target)]),
+                            StageOptions {
+                                case_change: stage::StageCaseChange::Keep,
+                                scan: true,
+                                ..Default::default()
+                            },
+                        ),
+                    )
+                    .await;
+
+                // The dry run fails as the stage does, and neither file changed.
+                assert!(staged.is_err(), "in a directory {in_directory}");
+                assert_eq!(std::fs::read(&tracked).ok().as_deref(), Some(&b"held"[..]));
+                assert_eq!(std::fs::read(&other).ok().as_deref(), Some(&b"other"[..]));
+            })
+            .await;
+        }
+    }
+
+    /// A walk staging under `Keep` that lists a directory under both spellings fails where
+    /// merging the two would replace a file with other content, as a stage and as a dry run, and
+    /// both files keep theirs. Only a case-sensitive file system holds the two side by side.
+    #[tokio::test]
+    #[allow(clippy::large_futures)]
+    async fn stage_keep_case_walk_fails_where_merging_two_spellings_would_replace_a_file() {
+        for dry_run in [false, true] {
+            in_execution(async move {
+                let (immutable_store, mutable_store, _) =
+                    test_store_create().await.expect("Failed to create stores");
+                let fixture = test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                if case_insensitive(&fixture.path) {
+                    return;
+                }
+                let tracked = fixture.path.join("Dir_Net");
+                let other = fixture.path.join("Dir_net");
+                std::fs::create_dir_all(&tracked).expect("Create directory failed");
+                test_file_write(&tracked.join("A.txt"), b"held");
+                test_commit_tree(&fixture, "Initial").await;
+                std::fs::create_dir_all(&other).expect("Create directory failed");
+                test_file_write(&other.join("A.txt"), b"other");
+
+                // Staged from the root, so the walk meets both spellings in one listing.
+                let stage = file::stage::stage(
+                    fixture.repository.clone(),
+                    &fixture.write_token,
+                    LoreArray::from_vec(vec![LoreString::from(&fixture.path)]),
+                    StageOptions {
+                        case_change: stage::StageCaseChange::Keep,
+                        scan: true,
+                        ..Default::default()
+                    },
+                );
+                let staged = if dry_run {
+                    LORE_CONTEXT.scope(dry_run_execution(), stage).await
+                } else {
+                    stage.await
+                };
+
+                assert!(staged.is_err(), "the stage must fail, dry run {dry_run}");
+                assert_eq!(
+                    std::fs::read(tracked.join("A.txt")).ok().as_deref(),
+                    Some(&b"held"[..]),
+                    "dry run {dry_run}"
+                );
+                assert_eq!(
+                    std::fs::read(other.join("A.txt")).ok().as_deref(),
+                    Some(&b"other"[..]),
+                    "dry run {dry_run}"
+                );
+            })
+            .await;
+        }
+    }
+
     /// What a staging left behind: whether it succeeded, the names the file
     /// system holds, and the names the tree holds.
     #[derive(Debug, PartialEq, Eq)]

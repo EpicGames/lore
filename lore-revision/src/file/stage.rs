@@ -190,7 +190,87 @@ struct StageWalk {
     link_tracker: Arc<LinkTracker>,
     global_mask: Option<Arc<Vec<String>>>,
     prefixes: Option<Arc<crate::util::fs::ResolvedPrefixes>>,
+    /// Under `Keep`, the directories the targets spelled in two or more cases
+    /// ([`RespelledDirectories`]).
+    respelled: RespelledDirectories,
     options: StageOptions,
+}
+
+/// The directories the targets of a stage spelled in two or more cases, each as the targets were
+/// brought onto it and as a target spelled it instead
+/// ([`RelativePath::dedup_to_supersets_noting`]), ordered by the first and then by the name the
+/// second ends in, each pair once. A case-sensitive file system can hold the second as a
+/// directory of its own. The paths are views of the targets, so a pair holds no string of its own,
+/// and the list is empty, with no allocation, for targets that agree.
+#[derive(Default)]
+struct RespelledDirectories(Vec<(RelativePath, RelativePath)>);
+
+impl RespelledDirectories {
+    /// Takes `other`, a spelling of the directory the targets were brought onto as `kept`, unless
+    /// it is held.
+    fn note(&mut self, kept: RelativePath, other: RelativePath) {
+        let held = self.0.binary_search_by(|(held_kept, held_other)| {
+            (held_kept.as_str().cmp(kept.as_str()))
+                .then_with(|| held_other.name().cmp(other.name()))
+        });
+        if let Err(at) = held {
+            self.0.insert(at, (kept, other));
+        }
+    }
+
+    /// The directories `depth` components deep that `created` holds, each at the path it was
+    /// created at with a spelling the targets gave it instead. Empty, with no allocation, where
+    /// no such directory was spelled in two cases.
+    fn created_at(
+        &self,
+        depth: usize,
+        created: &AncestorNodes<'_, CreatedAncestor>,
+    ) -> Vec<(RelativePath, RelativePath)> {
+        (self.0.iter())
+            .filter(|(kept, _)| path_depth(kept.as_str()) == depth)
+            .filter_map(|(kept, other)| {
+                let ancestor = created.get(kept.as_str())?;
+                Some((ancestor.path.clone(), other.clone()))
+            })
+            .collect()
+    }
+
+    /// The directories `created` does not hold, each with a spelling the targets gave it instead,
+    /// parents before the directories below them: a target that is a directory itself, and a
+    /// directory only one target lies below, which no creation unified. Each is placed below the
+    /// deepest directory `created` holds above it, at the path that one was created at, and is
+    /// otherwise as the targets spelled it. Empty, with no allocation, where every directory
+    /// spelled in two cases was created.
+    fn not_created(
+        &self,
+        created: &AncestorNodes<'_, CreatedAncestor>,
+    ) -> Vec<(RelativePath, RelativePath)> {
+        (self.0.iter())
+            .filter(|(kept, _)| created.get(kept.as_str()).is_none())
+            .map(|(kept, other)| {
+                let kept = match walk_start(kept.clone(), created) {
+                    WalkStart::BelowAncestor {
+                        path, remainder, ..
+                    } => path.join(remainder.as_str()),
+                    WalkStart::FromRoot(kept) => kept,
+                };
+                (kept, other.clone())
+            })
+            .collect()
+    }
+
+    /// [`Self::created_at`] for the depth above `level`, a level of shared ancestors about to
+    /// be created.
+    fn created_above(
+        &self,
+        level: &[DepthPath],
+        created: &AncestorNodes<'_, CreatedAncestor>,
+    ) -> Vec<(RelativePath, RelativePath)> {
+        match level.first().map(DepthPath::depth) {
+            Some(depth) if depth > 1 && !self.0.is_empty() => self.created_at(depth - 1, created),
+            _ => Vec::new(),
+        }
+    }
 }
 
 impl StageWalk {
@@ -302,22 +382,27 @@ async fn precreate_shared_ancestors<'a>(
 ) -> Result<AncestorNodes<'a, CreatedAncestor>, StageError> {
     let mut options = walk.options;
     options.no_children = true;
-    fan_out::create_shared_ancestors(
+    let created = fan_out::create_shared_ancestors(
         shared_ancestors,
         |level, nodes| {
-            resolve_level_children(
-                level
-                    .iter()
-                    .map(|ancestor| {
-                        let given = RelativePath::new_from_clean_parts(ancestor.path(), "");
-                        AncestorWalk {
-                            resolved: resolved_or_given(&given, walk.prefixes.as_deref()),
-                            walk: walk.walk(given, nodes),
-                            known: KnownChild::Unresolved,
-                        }
-                    })
-                    .collect(),
-            )
+            let unify = walk.respelled.created_above(level, nodes);
+            let level = level
+                .iter()
+                .map(|ancestor| {
+                    let given = RelativePath::new_from_clean_parts(ancestor.path(), "");
+                    AncestorWalk {
+                        resolved: resolved_or_given(&given, walk.prefixes.as_deref()),
+                        walk: walk.walk(given, nodes),
+                        known: KnownChild::Unresolved,
+                    }
+                })
+                .collect();
+            async move {
+                if !unify.is_empty() {
+                    Box::pin(unify_other_spellings(&walk.operation, unify)).await?;
+                }
+                resolve_level_children(level).await
+            }
         },
         |_,
          _,
@@ -371,7 +456,50 @@ async fn precreate_shared_ancestors<'a>(
         },
         |err| StageError::internal_with_context(err, "Failed to join pre-create task"),
     )
-    .await
+    .await?;
+    let unify = walk.respelled.created_at(
+        shared_ancestors.last().map_or(0, DepthPath::depth),
+        &created,
+    );
+    if !unify.is_empty() {
+        Box::pin(unify_other_spellings(&walk.operation, unify)).await?;
+    }
+    Ok(created)
+}
+
+/// Merges into each directory of `respelled`, a shared ancestor given at the path the tree spells
+/// it at once staged or a directory the walks have yet to reach as the targets spelled it, the
+/// directory the working tree holds beside it under the name the path paired with it ends in, a
+/// spelling the targets gave it in another case, so that every target below it is found under
+/// one spelling: the tree's, or the one the walk that reaches the directory unifies with the
+/// tree's. The merge is the operation's rename, which
+/// unifies the two directories and replaces no file. A name that is the ancestor's own, one the
+/// working tree holds nothing under, and one naming the entry the ancestor does, as on a file
+/// system that folds case, are passed over.
+///
+/// A cold path, boxed by its caller: only a stage whose targets spell a shared directory in two
+/// cases takes it.
+async fn unify_other_spellings(
+    operation: &InstanceOperationImpl,
+    respelled: Vec<(RelativePath, RelativePath)>,
+) -> Result<(), StageError> {
+    for (kept, other) in &respelled {
+        if other.name() == kept.name() {
+            continue;
+        }
+        let other =
+            RelativePath::new_from_clean_parts(kept.parent().unwrap_or_default(), other.name());
+        if operation
+            .names_one_entry(&other, kept)
+            .await
+            .forward_any::<StageError>("Failed to compare two spellings of a directory")?
+            == Some(false)
+        {
+            lore_debug!("Unifying {other} into {kept}, the spelling the tree carries");
+            stage::unify_case(operation, &other, kept).await?;
+        }
+    }
+    Ok(())
 }
 
 /// The child each walk of a level of shared ancestors names below its start, from one listing of
@@ -971,8 +1099,13 @@ pub async fn stage(
         // A root target covers the whole tree; otherwise collapse overlaps so a
         // parent target subsumes anything that would be staged beneath it.
         let stage_root = current_repository_paths.iter().any(|p| p.is_empty());
+        let mut respelled = RespelledDirectories::default();
         let antichain: Vec<RelativePath> = if stage_root {
             vec![RelativePath::new()]
+        } else if matches!(options.case_change, stage::StageCaseChange::Keep) {
+            RelativePath::dedup_to_supersets_noting(current_repository_paths, |kept, other| {
+                respelled.note(kept, other);
+            })
         } else {
             RelativePath::dedup_to_supersets(current_repository_paths)
         };
@@ -993,10 +1126,15 @@ pub async fn stage(
             stats: stats.clone(),
             link_tracker: link_tracker.clone(),
             global_mask: global_mask.clone(),
+            respelled,
             options,
         };
 
         let ancestors = precreate_shared_ancestors(&walk, &shared_ancestors, &discards).await?;
+        let unify = walk.respelled.not_created(&ancestors);
+        if !unify.is_empty() {
+            Box::pin(unify_other_spellings(&walk.operation, unify)).await?;
+        }
 
         let mut tasks: JoinSet<Result<crate::node::NodeLink, StageError>> = JoinSet::new();
         let mut failure =
@@ -2210,6 +2348,7 @@ pub mod test_util {
             link_tracker,
             global_mask: None,
             prefixes: None,
+            respelled: super::RespelledDirectories::default(),
             options: StageOptions::default(),
         };
         let shared = super::created_first(&RelativePath::dedup_to_supersets(targets.to_vec()), &[]);

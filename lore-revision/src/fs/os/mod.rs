@@ -16,6 +16,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -25,6 +27,7 @@ use lore_base::types::Address;
 use lore_base::types::Fragment;
 use lore_error_set::prelude::*;
 use lore_io::StatKind;
+use parking_lot::RwLock;
 
 use super::filesystem_provider::CaseLookup;
 use super::filesystem_provider::CloneAnswer;
@@ -72,6 +75,7 @@ impl OsFilesystem {
     pub fn begin_operation(&self) -> OsOperation {
         OsOperation {
             filesystem_root: self.filesystem_root.clone(),
+            unmoved: UnmovedPaths::default(),
         }
     }
 }
@@ -112,14 +116,145 @@ pub struct OsOperation {
     /// Where the mounted filesystem starts, which every repository in it shares: a link
     /// or layer context inherits its parent's path, so this is not a repository's root.
     filesystem_root: Arc<Path>,
+    /// The moves a dry run answered for without making them.
+    unmoved: UnmovedPaths,
+}
+
+/// The moves a dry run answered for without making them ([`OsOperation::respell_unmoved`]): each
+/// path a move would have filled, with the path that holds what it would have moved there,
+/// ordered by the first. Empty in every operation that is not a dry run's, which `any` answers
+/// without taking the lock.
+#[derive(Default)]
+struct UnmovedPaths {
+    any: AtomicBool,
+    moves: RwLock<Vec<(RelativePath, RelativePath)>>,
+}
+
+impl UnmovedPaths {
+    /// Has every path at `to` and below it answer from `held` and below it.
+    fn note(&self, to: RelativePath, held: RelativePath) {
+        let mut moves = self.moves.write();
+        if let Err(at) = moves.binary_search_by(|(noted, _)| noted.as_str().cmp(to.as_str())) {
+            moves.insert(at, (to, held));
+        }
+        self.any.store(true, Ordering::Release);
+    }
+
+    /// The children the noted moves would have left in the directory `path` itself, each by its
+    /// name there and the path that holds it.
+    fn children_of(&self, path: &RelativePath) -> Vec<(String, RelativePath)> {
+        let moves = self.moves.read();
+        let first = moves.partition_point(|(to, _)| to.as_str() <= path.as_str());
+        moves[first..]
+            .iter()
+            .take_while(|(to, _)| to.as_str().starts_with(path.as_str()))
+            .filter(|(to, _)| {
+                to.below(path)
+                    .is_some_and(|below| !below.is_empty() && !below.contains('/'))
+            })
+            .map(|(to, held)| (to.name().to_owned(), held.clone()))
+            .collect()
+    }
+
+    /// The path that holds what a move would have left at `path`: the one noted for `path` or
+    /// for the nearest directory above it, with the names of `path` below that directory. `None`
+    /// where no move reaches `path`, which then holds its own.
+    #[cold]
+    #[inline(never)]
+    fn held_at(&self, path: &RelativePath) -> Option<RelativePath> {
+        let moves = self.moves.read();
+        let spelled = path.as_str();
+        let mut end = spelled.len();
+        loop {
+            let above = &spelled[..end];
+            if let Ok(at) = moves.binary_search_by(|(noted, _)| noted.as_str().cmp(above)) {
+                let below = spelled[end..].trim_start_matches('/');
+                return Some(RelativePath::new_from_clean_parts(
+                    moves[at].1.as_str(),
+                    below,
+                ));
+            }
+            end = above.rfind('/')?;
+        }
+    }
 }
 
 impl OsOperation {
     /// Where `path` is on disk, under the root the operation was opened on -- the top-level
-    /// repository every link and layer in it shares.
+    /// repository every link and layer in it shares. In a dry run that answered for a move to
+    /// `path` or above it without making it, where the file system holds what the move would
+    /// have left there.
     pub(crate) fn absolute(&self, path: &RelativePath) -> Result<PathBuf, FsError> {
+        if self.unmoved.any.load(Ordering::Acquire)
+            && let Some(held) = self.unmoved.held_at(path)
+        {
+            return self.placed(&held);
+        }
+        self.placed(path)
+    }
+
+    /// Where `path` is below the root the operation was opened on, as it is spelled.
+    fn placed(&self, path: &RelativePath) -> Result<PathBuf, FsError> {
         path.to_absolute_path(&self.filesystem_root)
             .forward::<FsError>("placing a path below the filesystem root")
+    }
+
+    /// The entries a listing of `path` adds for the children a dry run answered for moving there
+    /// without moving them, each measured where the file system holds it. One that holds
+    /// nothing a listing yields is left out, as a listing leaves it out.
+    ///
+    /// A cold path, boxed by its caller: only a dry run that met a spelling the tree does not
+    /// carry takes it.
+    async fn unmoved_children(&self, path: &RelativePath) -> Result<Vec<DirectoryEntry>, FsError> {
+        let children = self.unmoved.children_of(path);
+        let mut entries = Vec::with_capacity(children.len());
+        for (name, held) in children {
+            let info = match lore_io::IoDriver::global().stat(self.placed(&held)?).await {
+                Ok(stat) => FileInfo::from_stat(&stat),
+                Err(_) => continue,
+            };
+            if info.is_dir() || info.is_file() {
+                entries.push(DirectoryEntry::new(name, info));
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Checks what [`InstanceOperation::rename`] of `from` to `to`, another spelling of its name,
+    /// checks, and moves nothing, for a dry run: a file the move would replace with other content
+    /// fails it as it fails the rename. Each path the move would have filled is noted with the
+    /// path that still holds its content, and every later read through the operation answers
+    /// from there ([`Self::absolute`]), so the dry run reads what the rename would have left.
+    /// A file the rename would drop for holding what `to` holds stays, `to` answering for it.
+    ///
+    /// Walks a directory held under both spellings child by child, as the rename does, a child
+    /// whose name is not text left out: no path of the tree reaches it. A cold path, boxed by its
+    /// caller: only a dry run meeting a spelling the tree does not carry takes it, and it allocates a
+    /// path per child of such a directory.
+    pub(crate) async fn respell_unmoved(
+        &self,
+        from: &RelativePath,
+        to: &RelativePath,
+    ) -> Result<(), FsError> {
+        let driver = lore_io::IoDriver::global();
+        let held = self.unmoved.held_at(from).unwrap_or_else(|| from.clone());
+        let mut pending = vec![(held, to.clone())];
+        while let Some((from, to)) = pending.pop() {
+            let from_path = self.placed(&from)?;
+            match held_duplicate(&from_path, &self.absolute(&to)?).await? {
+                HeldDuplicate::Nothing => self.unmoved.note(to, from),
+                HeldDuplicate::Alike | HeldDuplicate::OneEntry => {}
+                HeldDuplicate::Directories => {
+                    let mut listing = driver.read_dir(&from_path).await?;
+                    while let Some(entry) = listing.next().await {
+                        if let Some(name) = entry?.file_name.to_str() {
+                            pending.push((from.join(name), to.join(name)));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Deletes a directory and its contents as [`InstanceOperation::remove_recursive`] does, but
@@ -137,6 +272,9 @@ impl OsOperation {
 /// dispatch to the io driver.
 pub struct OsDirectoryListing {
     entries: lore_io::DirStream,
+    /// The children a dry run answered for moving here without moving them
+    /// ([`UnmovedPaths::children_of`]), listed after the directory's own.
+    unmoved: Vec<DirectoryEntry>,
 }
 
 impl OsDirectoryListing {
@@ -182,7 +320,9 @@ impl OsDirectoryListing {
                 Err(err) => return Some(Err(err)),
             }
         }
-        None
+        self.unmoved
+            .pop()
+            .map(|entry| Ok(ListedEntry::Tracked(entry)))
     }
 }
 
@@ -286,13 +426,22 @@ impl InstanceOperation for OsOperation {
     }
 
     /// A path holding no directory, nothing or a file, is not found ([`listing_failure`]).
+    ///
+    /// In a dry run that answered for moves without making them, the children those moves would
+    /// have left in the directory are listed with its own, read on the cold path
+    /// [`Self::unmoved_children`] is boxed as.
     async fn read_directory(&self, path: &RelativePath) -> Result<DirectoryListing, FsError> {
         let entries = lore_io::IoDriver::global()
             .read_dir(self.absolute(path)?)
             .await
             .map_err(|error| listing_failure(error, path))?;
+        let unmoved = if self.unmoved.any.load(Ordering::Acquire) {
+            Box::pin(self.unmoved_children(path)).await?
+        } else {
+            Vec::new()
+        };
         Ok(DirectoryListing::new(StaticDispatchDirectoryListing::Os(
-            Box::new(OsDirectoryListing { entries }),
+            Box::new(OsDirectoryListing { entries, unmoved }),
         )))
     }
 
@@ -357,8 +506,16 @@ impl InstanceOperation for OsOperation {
         Ok(())
     }
 
+    /// Only a move to another spelling of the path's own name is checked for a file it would
+    /// replace ([`held_duplicate_dropped`]), boxed as the cold path it is: no other rename pays
+    /// for it.
     async fn rename(&self, from: &RelativePath, to: &RelativePath) -> Result<(), FsError> {
+        let respelled =
+            from.as_str() != to.as_str() && from.as_lowercase_str() == to.as_lowercase_str();
         let (from, to) = (self.absolute(from)?, self.absolute(to)?);
+        if respelled && Box::pin(held_duplicate_dropped(&from, &to)).await? {
+            return Ok(());
+        }
         rename_unifying(&from, &to).await?;
         Ok(())
     }
@@ -712,9 +869,12 @@ fn rename_unifying<'a>(
 /// having been refused with `refused`.
 ///
 /// A file goes to `to_path` whether or not a file is there, one that is there being removed first.
-/// A directory hands each child over to `to_path` through [`rename_unifying`], a child whose name
-/// the destination also holds being unified again, before it goes; a destination that is not there
-/// is created to take them. A `from_path` and `to_path` of different kinds are refused, there being
+/// A directory hands each child over to `to_path` through [`rename_unifying`], a child directory
+/// whose name the destination also holds being unified again, before it goes; a destination that
+/// is not there is created to take them. A child file replaces no file the destination holds
+/// ([`held_duplicate_dropped`]): one holding the same content is removed, and one holding other
+/// content fails the unification, which leaves the children handed over before it where they
+/// went and the rest where they were. A `from_path` and `to_path` of different kinds are refused, there being
 /// no move that leaves one of them.
 ///
 /// A `to_path` naming the entry `from_path` does, as another spelling of its name does on a file
@@ -784,7 +944,9 @@ fn unify_refused_rename<'a>(
             for name in names {
                 let from_path = from_path.join(&name);
                 let to_path = to_path.join(&name);
-                rename_unifying(&from_path, &to_path).await?;
+                if !held_duplicate_dropped(&from_path, &to_path).await? {
+                    rename_unifying(&from_path, &to_path).await?;
+                }
             }
             driver.remove_dir_all(from_path).await?;
         }
@@ -792,6 +954,110 @@ fn unify_refused_rename<'a>(
         lore_debug!("Renamed {} -> {}", from_path.display(), to_path.display());
         Ok(())
     }
+}
+
+/// Settles a move onto a destination holding a file, for a child a directory hands over to the
+/// directory it is unified into and for a path moved to another spelling of its own name, so that
+/// neither replaces a file: a file holding the content the destination's file holds is removed,
+/// the destination keeping its own, and `true` is answered. A file the move may not replace is
+/// refused and both are left as they stand ([`held_duplicate`]). `false` where the destination
+/// holds nothing, the two are directories, or the two name one entry: the caller moves or
+/// unifies those.
+async fn held_duplicate_dropped(from_path: &Path, to_path: &Path) -> std::io::Result<bool> {
+    if !matches!(
+        held_duplicate(from_path, to_path).await?,
+        HeldDuplicate::Alike
+    ) {
+        return Ok(false);
+    }
+    lore_debug!(
+        "Dropping {}, {} holds the same content",
+        from_path.display(),
+        to_path.display()
+    );
+    lore_io::IoDriver::global().remove_file(from_path).await?;
+    Ok(true)
+}
+
+/// What a move finds at its destination ([`held_duplicate`]).
+enum HeldDuplicate {
+    /// The destination holds nothing, so the move replaces nothing.
+    Nothing,
+    /// The two name one entry, as two spellings do on a file system that folds case, or cannot
+    /// be told apart.
+    OneEntry,
+    /// The two are directories, which are unified child by child.
+    Directories,
+    /// The two are files holding the same content.
+    Alike,
+}
+
+/// What moving `from_path` finds at `to_path`, changing neither. A file moved onto a file holding
+/// other content is refused as already existing, and a file against anything but a file or a
+/// directory as unsupported.
+async fn held_duplicate(from_path: &Path, to_path: &Path) -> std::io::Result<HeldDuplicate> {
+    let driver = lore_io::IoDriver::global();
+    let to = match driver.symlink_stat(to_path).await {
+        Ok(stat) => stat,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HeldDuplicate::Nothing);
+        }
+        Err(err) => return Err(err),
+    };
+    if !matches!(
+        driver.names_one_entry(from_path, to_path).await,
+        Ok(Some(false))
+    ) {
+        return Ok(HeldDuplicate::OneEntry);
+    }
+    let from = driver.symlink_stat(from_path).await?;
+    match (from.kind, to.kind) {
+        (StatKind::Directory, StatKind::Directory) => Ok(HeldDuplicate::Directories),
+        (StatKind::File, StatKind::File) => {
+            if from.len != to.len
+                || !Box::pin(holds_same_content(from_path, to_path, from.len)).await?
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "Unable to unify {} into {}, the two hold different content",
+                        from_path.display(),
+                        to_path.display()
+                    ),
+                ));
+            }
+            Ok(HeldDuplicate::Alike)
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Unable to rename, file/directory mismatch",
+        )),
+    }
+}
+
+/// Whether the files at `left` and `right`, each `len` bytes long, hold the same bytes, read a
+/// block at a time so that neither is held whole.
+///
+/// A cold path, boxed by its caller: only a file moved onto a file of the same length takes it.
+async fn holds_same_content(left: &Path, right: &Path, len: u64) -> std::io::Result<bool> {
+    const BLOCK: usize = 1024 * 1024;
+    let driver = lore_io::IoDriver::global();
+    let options = lore_io::OpenOptions::new().read(true);
+    let left = driver.open(left, &options).await?;
+    let right = driver.open(right, &options).await?;
+    let mut offset = 0;
+    while offset < len {
+        let block = usize::try_from(len - offset).map_or(BLOCK, |rest| rest.min(BLOCK));
+        let (left, right) = tokio::try_join!(
+            left.read_exact_at(block, offset),
+            right.read_exact_at(block, offset)
+        )?;
+        if left != right {
+            return Ok(false);
+        }
+        offset += block as u64;
+    }
+    Ok(true)
 }
 
 /// What removing the directory `path` answers for `error`: a path holding nothing is not found.
