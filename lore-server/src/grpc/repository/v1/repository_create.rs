@@ -36,6 +36,9 @@ use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::get_is_service_account;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
+use crate::grpc::handlers::repository_create::bind_created_name;
+use crate::grpc::handlers::repository_create::name_held_by_other;
+use crate::grpc::handlers::repository_query::repair_missing_name;
 use crate::grpc::hook_error_to_status;
 use crate::grpc::none_or_status;
 use crate::grpc::requested_repository_id;
@@ -269,16 +272,11 @@ async fn repository_create_inner(
                 .await
                 .filter_slow_down()?
                 .is_err()
-            {
-                info!(
-                    "Recreating repository name {} -> ID {} mapping",
-                    name, repository.id
-                );
-                // no filter_slow_down()? usage here: the create has already
-                // succeeded, so this mapping repair must not fail it.
-                let _ = repository::store_name_to_id(repository.clone(), name, repository.id)
+                && repair_missing_name(repository.clone(), name, repository.id)
                     .await
-                    .inspect_err(|err| info!("Recreate name -> ID mapping failed: {err}"));
+                    .is_some()
+            {
+                return Err(name_held_by_other(name, repository.id));
             }
 
             Ok((metadata, metadata_hash))
@@ -365,15 +363,7 @@ async fn repository_create_inner(
             ))
         })?;
 
-    repository::store_name_to_id(repository.clone(), name, repository.id)
-        .await
-        .filter_slow_down()?
-        .warn_map_err(|err| {
-            Status::internal(format!(
-                "Failed to store name to ID lookup for {name} -> {}: {err}",
-                repository.id
-            ))
-        })?;
+    bind_created_name(repository.clone(), name).await?;
 
     info!("Created repository {} with ID {}", name, repository.id);
 

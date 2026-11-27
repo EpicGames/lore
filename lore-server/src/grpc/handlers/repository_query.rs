@@ -8,11 +8,13 @@ use lore_base::error::RepositoryNotFound;
 use lore_base::error::SlowDown;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Context;
+use lore_base::types::Hash;
 use lore_error_set::prelude::*;
 use lore_proto::RepositoryQueryRequest;
 use lore_proto::RepositoryQueryResponse;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository;
+use lore_revision::repository::NameBind;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryError;
 use lore_revision::state::no_link_traversal;
@@ -125,31 +127,7 @@ pub async fn repository_query_id(
         .await
         .forward_with::<RepositoryError, _>(|| format!("Repository {id} metadata not found"))?;
 
-    // Verify the name -> ID mapping resolves back to the same ID, repair if missing
-    let name_repository = Arc::new(repository.to_server_context(RepositoryId::default()));
-    match repository::id_from_name(name_repository, &metadata.name).await {
-        Ok(resolved_id) if resolved_id != id => {
-            warn!(
-                "Repository {} name {} maps to different repository {}, returning not found",
-                id, metadata.name, resolved_id
-            );
-            return Err(RepositoryError::from(RepositoryNotFound {
-                repository: id.to_string(),
-            }));
-        }
-        Err(_) => {
-            info!(
-                "Repairing missing name -> ID mapping: {} -> {}",
-                metadata.name, id
-            );
-            // no filter_slow_down()? usage here: repairing the name mapping is
-            // best-effort, and the repository has already been resolved.
-            let _ = repository::store_name_to_id(repository.clone(), &metadata.name, id)
-                .await
-                .inspect_err(|err| warn!("Failed to repair name -> ID mapping: {err}"));
-        }
-        Ok(_) => {}
-    }
+    check_name_binds_id(repository.clone(), &metadata.name, id).await?;
 
     info!("Repository query ID {id} found {metadata:?}");
     Ok(RepositoryData {
@@ -178,11 +156,7 @@ pub async fn repository_query_name(
     }
 
     let repository = Arc::new(repository.to_server_context(id));
-    let metadata_hash = repository::metadata_hash(repository.clone())
-        .await
-        .forward_with::<RepositoryError, _>(|| {
-            format!("Repository {name} metadata hash not found")
-        })?;
+    let metadata_hash = metadata_hash_or_remove_name(repository.clone(), name, id).await?;
     let metadata = repository::metadata(repository.clone(), metadata_hash)
         .await
         .forward_with::<RepositoryError, _>(|| format!("Repository {name} metadata not found"))?;
@@ -193,9 +167,7 @@ pub async fn repository_query_name(
             "Stale name -> ID mapping: {} maps to {} but metadata name is {}, deleting mapping",
             name, id, metadata.name
         );
-        let _ = repository::delete_name_to_id(repository.clone(), name)
-            .await
-            .inspect_err(|err| warn!("Failed to delete stale name -> ID mapping: {err}"));
+        remove_stale_name(repository.clone(), name, id).await;
         return Err(RepositoryError::from(RepositoryNotFound {
             repository: name.to_string(),
         }));
@@ -207,6 +179,85 @@ pub async fn repository_query_name(
         name: metadata.name,
         metadata: metadata_hash,
     })
+}
+
+/// Fails with [`RepositoryNotFound`] where `name`, the name in the metadata of `id`, maps to
+/// another repository. A missing mapping is bound to `id` first ([`repair_missing_name`]).
+pub(crate) async fn check_name_binds_id(
+    repository: Arc<RepositoryContext>,
+    name: &str,
+    id: RepositoryId,
+) -> Result<(), RepositoryError> {
+    let name_repository = Arc::new(repository.to_server_context(RepositoryId::default()));
+    let holder = match repository::id_from_name(name_repository, name).await {
+        Ok(resolved_id) => (resolved_id != id).then_some(resolved_id),
+        Err(_) => repair_missing_name(repository, name, id).await,
+    };
+    match holder {
+        Some(holder) => {
+            warn!(
+                "Repository {id} name {name} maps to different repository {holder}, returning not found"
+            );
+            Err(RepositoryError::from(RepositoryNotFound {
+                repository: id.to_string(),
+            }))
+        }
+        None => Ok(()),
+    }
+}
+
+/// Binds `name` to `id` while the name is unbound, and answers the other repository that holds
+/// the name, if one does. A write that fails, `SlowDown` included, is logged and answers `None`, so
+/// the caller goes on, and a later lookup repairs the name.
+pub(crate) async fn repair_missing_name(
+    repository: Arc<RepositoryContext>,
+    name: &str,
+    id: RepositoryId,
+) -> Option<RepositoryId> {
+    match repository::bind_name_to_id(repository, name, id).await {
+        Ok(NameBind::HeldByOther(holder)) => Some(holder),
+        Ok(NameBind::Bound) => {
+            info!("Repaired missing name -> ID mapping: {name} -> {id}");
+            None
+        }
+        Ok(NameBind::AlreadyBound) => None,
+        Err(err) => {
+            warn!("Failed to repair name -> ID mapping: {err}");
+            None
+        }
+    }
+}
+
+/// The metadata hash of `id`, which `name` maps to. Where `id` has no metadata, the mapping is
+/// removed while it maps to `id` ([`remove_stale_name`]), and the read's error is answered.
+pub(crate) async fn metadata_hash_or_remove_name(
+    repository: Arc<RepositoryContext>,
+    name: &str,
+    id: RepositoryId,
+) -> Result<Hash, RepositoryError> {
+    let result = repository::metadata_hash(repository.clone()).await;
+    if let Err(err) = &result
+        && err.is_address_not_found()
+    {
+        warn!(
+            "Stale name -> ID mapping: {name} maps to {id}, which has no metadata, deleting mapping"
+        );
+        remove_stale_name(repository, name, id).await;
+    }
+    result
+        .forward_with::<RepositoryError, _>(|| format!("Repository {name} metadata hash not found"))
+}
+
+/// Removes the mapping of `name` while it maps to `id`. A mapping to another ID, or none, is kept. A
+/// write that fails is logged.
+pub(crate) async fn remove_stale_name(
+    repository: Arc<RepositoryContext>,
+    name: &str,
+    id: RepositoryId,
+) {
+    let _ = repository::unbind_name_to_id(repository, name, id)
+        .await
+        .inspect_err(|err| warn!("Failed to delete stale name -> ID mapping: {err}"));
 }
 
 /// The repository-query lookup check, on the configured authorizer, for the

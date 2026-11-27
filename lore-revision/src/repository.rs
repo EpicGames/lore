@@ -5424,20 +5424,6 @@ pub async fn store_name_to_id(
         .forward::<RepositoryError>("Failed to store repository metadata")
 }
 
-pub async fn delete_name_to_id(
-    repository: Arc<RepositoryContext>,
-    name: impl AsRef<str>,
-) -> Result<(), RepositoryError> {
-    let (key, key_type) = mutable_name_key(repository.salt(), ID, name.as_ref());
-    let handle = repository
-        .try_write_mutable_store()
-        .ok_or_else(|| RepositoryError::from(WriteRequired))?;
-    handle
-        .store(RepositoryId::default(), key, Hash::default(), key_type)
-        .await
-        .forward::<RepositoryError>("Failed to store repository metadata")
-}
-
 /// The outcome of [`bind_name_to_id`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NameBind {

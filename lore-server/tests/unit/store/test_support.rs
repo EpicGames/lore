@@ -875,3 +875,226 @@ pub async fn test_store_create() -> Result<
         })
         .await
 }
+
+/// A [`lore_storage::MutableStore`] in which another writer stores `racing` under the key of the
+/// first repository name mapping a caller writes, just before that write, as a write that races
+/// the caller's would. Every operation delegates to the wrapped store.
+pub struct RacedNameWriteStore {
+    inner: Arc<dyn lore_storage::MutableStore>,
+    racing: std::sync::Mutex<Option<lore_base::types::Hash>>,
+}
+
+impl RacedNameWriteStore {
+    /// A store whose first name mapping write is preceded by a write that binds the name to
+    /// `racing`.
+    pub fn binding(
+        inner: Arc<dyn lore_storage::MutableStore>,
+        racing: lore_revision::lore::RepositoryId,
+    ) -> Arc<dyn lore_storage::MutableStore> {
+        Arc::new(Self {
+            inner,
+            racing: std::sync::Mutex::new(Some(lore_base::types::Hash::from_context(
+                racing.into(),
+            ))),
+        })
+    }
+
+    async fn race(
+        &self,
+        partition: lore_base::types::Partition,
+        key: lore_base::types::Hash,
+        key_type: lore_base::types::KeyType,
+    ) {
+        if key_type != lore_base::types::KeyType::RepositoryId {
+            return;
+        }
+        let racing = self.racing.lock().expect("the racing value").take();
+        if let Some(racing) = racing {
+            self.inner
+                .clone()
+                .store(partition, key, racing, key_type)
+                .await
+                .expect("the racing write");
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl lore_storage::MutableStore for RacedNameWriteStore {
+    /// Joins the claim of the store this one wraps.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        lore_storage::MutableStore::hold_for_command(self.inner.clone()).await
+    }
+
+    fn stored_typed_key(
+        &self,
+        key: lore_base::types::Hash,
+        key_type: lore_base::types::KeyType,
+    ) -> lore_base::types::Hash {
+        self.inner.stored_typed_key(key, key_type)
+    }
+
+    /// Joins the claim of the store this one wraps.
+    fn try_join_claim(&self) -> Option<lore_storage::local::store_lock::StoreGuard> {
+        self.inner.try_join_claim()
+    }
+
+    async fn load(
+        self: Arc<Self>,
+        partition: lore_base::types::Partition,
+        key: lore_base::types::Hash,
+        key_type: lore_base::types::KeyType,
+    ) -> Result<lore_base::types::Hash, StoreError> {
+        self.inner.clone().load(partition, key, key_type).await
+    }
+
+    async fn store(
+        self: Arc<Self>,
+        partition: lore_base::types::Partition,
+        key: lore_base::types::Hash,
+        value: lore_base::types::Hash,
+        key_type: lore_base::types::KeyType,
+    ) -> Result<(), StoreError> {
+        self.race(partition, key, key_type).await;
+        self.inner
+            .clone()
+            .store(partition, key, value, key_type)
+            .await
+    }
+
+    async fn compare_and_swap(
+        self: Arc<Self>,
+        partition: lore_base::types::Partition,
+        key: lore_base::types::Hash,
+        expected: lore_base::types::Hash,
+        value: lore_base::types::Hash,
+        key_type: lore_base::types::KeyType,
+    ) -> Result<lore_base::types::Hash, StoreError> {
+        self.race(partition, key, key_type).await;
+        self.inner
+            .clone()
+            .compare_and_swap(partition, key, expected, value, key_type)
+            .await
+    }
+
+    async fn list(
+        self: Arc<Self>,
+        partition: lore_base::types::Partition,
+        key_type: lore_base::types::KeyType,
+        consistency: lore_storage::ReadConsistency,
+    ) -> Result<lore_storage::KeyValueStream, StoreError> {
+        self.inner
+            .clone()
+            .list(partition, key_type, consistency)
+            .await
+    }
+
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
+        self.inner.clone().flush(options).await
+    }
+}
+
+/// Writes the metadata blob of a repository `id` named `name`, created by `alice`, and its
+/// pointer, without a name mapping, and answers a server context for `id`.
+pub async fn seed_metadata(
+    immutable_store: Arc<dyn ImmutableStore>,
+    mutable_store: Arc<dyn lore_storage::MutableStore>,
+    id: lore_revision::lore::RepositoryId,
+    name: &str,
+) -> Arc<lore_revision::repository::RepositoryContext> {
+    let repository = Arc::new(
+        lore_revision::repository::RepositoryContext::new_server_context(
+            immutable_store,
+            mutable_store,
+            id,
+            lore_revision::state::allow_all_repositories(),
+        ),
+    );
+    let metadata_hash = lore_revision::repository::metadata_store(
+        repository.clone(),
+        lore_revision::repository::RepositoryMetadata {
+            name: name.to_string(),
+            creator: "alice".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("Failed to store repository metadata");
+    lore_revision::repository::metadata_store_hash(repository.clone(), metadata_hash)
+        .await
+        .expect("Failed to store repository metadata hash");
+    repository
+}
+
+/// The repository `name` maps to in the name index of `mutable_store`. An unbound name panics.
+pub async fn bound_id(
+    immutable_store: Arc<dyn ImmutableStore>,
+    mutable_store: Arc<dyn lore_storage::MutableStore>,
+    name: &str,
+) -> lore_revision::lore::RepositoryId {
+    let repository = Arc::new(
+        lore_revision::repository::RepositoryContext::new_server_context(
+            immutable_store,
+            mutable_store,
+            lore_revision::lore::RepositoryId::default(),
+            lore_revision::state::allow_all_repositories(),
+        ),
+    );
+    lore_revision::repository::id_from_name(repository, name)
+        .await
+        .expect("the name is bound")
+}
+
+pub struct TestInstrumentProvider;
+
+impl lore_telemetry::InstrumentProvider for TestInstrumentProvider {
+    fn namespace(&self) -> &'static str {
+        "test"
+    }
+}
+
+/// Binds `name` to `id` in the name index of `mutable_store`, without metadata for `id`.
+pub async fn bind_without_metadata(
+    immutable_store: Arc<dyn ImmutableStore>,
+    mutable_store: Arc<dyn lore_storage::MutableStore>,
+    name: &str,
+    id: lore_revision::lore::RepositoryId,
+) {
+    let repository = Arc::new(
+        lore_revision::repository::RepositoryContext::new_server_context(
+            immutable_store,
+            mutable_store,
+            id,
+            lore_revision::state::allow_all_repositories(),
+        ),
+    );
+    lore_revision::repository::store_name_to_id(repository, name, id)
+        .await
+        .expect("Failed to store the name mapping");
+}
+
+/// Whether `name` is unbound in the name index of `mutable_store`. Any other failure panics.
+pub async fn unbound(
+    immutable_store: Arc<dyn ImmutableStore>,
+    mutable_store: Arc<dyn lore_storage::MutableStore>,
+    name: &str,
+) -> bool {
+    let repository = Arc::new(
+        lore_revision::repository::RepositoryContext::new_server_context(
+            immutable_store,
+            mutable_store,
+            lore_revision::lore::RepositoryId::default(),
+            lore_revision::state::allow_all_repositories(),
+        ),
+    );
+    match lore_revision::repository::id_from_name(repository, name).await {
+        Ok(_) => false,
+        Err(err) if err.is_address_not_found() => true,
+        Err(err) => panic!("reading the mapping of {name}: {err}"),
+    }
+}

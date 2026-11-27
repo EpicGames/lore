@@ -500,3 +500,42 @@ mod cancelled_request {
         .await;
     }
 }
+
+mod name_race {
+    use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+
+    use super::*;
+    use crate::store::test_support::RacedNameWriteStore;
+    use crate::store::test_support::bound_id;
+
+    /// Another repository binds the deleted repository's name after the delete read it. The
+    /// delete keeps that binding.
+    #[tokio::test]
+    async fn a_delete_keeps_a_name_another_repository_bound_since() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let id = random::<RepositoryId>();
+            let other = random::<RepositoryId>();
+            seed_repository(immutable_store.clone(), mutable_store.clone(), id, "alice").await;
+
+            handler(
+                delete_request(id, AuthorizationToken::default()),
+                &RepositoryRegistry::Unregistered,
+                &(Arc::new(AllowAllRepositoryAuthorizer) as Arc<dyn RepositoryAuthorizer>),
+                immutable_store.clone(),
+                RacedNameWriteStore::binding(mutable_store.clone(), other),
+                &TestInstrumentProvider,
+            )
+            .await
+            .expect("the delete succeeds");
+
+            assert_eq!(
+                bound_id(immutable_store, mutable_store, "the-repository").await,
+                other
+            );
+        }))
+        .await;
+    }
+}

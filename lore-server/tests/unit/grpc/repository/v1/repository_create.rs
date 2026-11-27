@@ -472,3 +472,105 @@ mod cancelled_request {
         .await;
     }
 }
+
+mod name_race {
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_proto::lore::repository::v1::RepositoryCreateRequest;
+    use lore_revision::lore::RepositoryId;
+    use lore_server::authnz::repository_registry::RepositoryRegistry;
+    use lore_server::grpc::repository::v1::repository_create::*;
+    use lore_server::hooks::HookDispatcher;
+    use rand::random;
+    use tonic::Request;
+
+    use crate::store::test_support::RacedNameWriteStore;
+    use crate::store::test_support::TestInstrumentProvider;
+    use crate::store::test_support::bind_without_metadata;
+    use crate::store::test_support::bound_id;
+    use crate::store::test_support::test_store_create;
+
+    /// Another repository binds the name after the create checked it. The create answers
+    /// `ALREADY_EXISTS` and keeps that binding.
+    #[tokio::test]
+    async fn a_create_keeps_a_name_another_repository_bound_since_its_check() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let id = random::<RepositoryId>();
+        let other = random::<RepositoryId>();
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let request = Request::new(RepositoryCreateRequest {
+                id: bytes::Bytes::copy_from_slice(id.data()),
+                name: "the-repository".into(),
+                default_branch_id: bytes::Bytes::from(lore_base::types::Context::from(
+                    uuid::Uuid::now_v7(),
+                )),
+                default_branch_name: "main".into(),
+                ..Default::default()
+            });
+            let status = handler(
+                request,
+                &RepositoryRegistry::Unregistered,
+                immutable_store.clone(),
+                RacedNameWriteStore::binding(mutable_store.clone(), other),
+                &None,
+                &HookDispatcher::empty(),
+                &TestInstrumentProvider,
+            )
+            .await
+            .expect_err("another repository holds the name");
+            assert_eq!(status.code(), tonic::Code::AlreadyExists, "{status:?}");
+
+            assert_eq!(
+                bound_id(immutable_store, mutable_store, "the-repository").await,
+                other
+            );
+        }))
+        .await;
+    }
+
+    /// The name maps to a repository that has no metadata, as a delete that raced a lookup by ID
+    /// can leave it. A create of the name takes it.
+    #[tokio::test]
+    async fn a_create_takes_a_name_bound_to_a_repository_without_metadata() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let id = random::<RepositoryId>();
+        let deleted = random::<RepositoryId>();
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            bind_without_metadata(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                "the-repository",
+                deleted,
+            )
+            .await;
+            let request = Request::new(RepositoryCreateRequest {
+                id: bytes::Bytes::copy_from_slice(id.data()),
+                name: "the-repository".into(),
+                default_branch_id: bytes::Bytes::from(lore_base::types::Context::from(
+                    uuid::Uuid::now_v7(),
+                )),
+                default_branch_name: "main".into(),
+                ..Default::default()
+            });
+            handler(
+                request,
+                &RepositoryRegistry::Unregistered,
+                immutable_store.clone(),
+                mutable_store.clone(),
+                &None,
+                &HookDispatcher::empty(),
+                &TestInstrumentProvider,
+            )
+            .await
+            .expect("the create takes the name");
+            assert_eq!(
+                bound_id(immutable_store, mutable_store, "the-repository").await,
+                id
+            );
+        }))
+        .await;
+    }
+}

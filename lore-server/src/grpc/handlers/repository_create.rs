@@ -11,6 +11,7 @@ use lore_revision::branch;
 use lore_revision::lore::RepositoryId;
 use lore_revision::lore::execution_context;
 use lore_revision::repository;
+use lore_revision::repository::NameBind;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
 use lore_revision::state::no_link_traversal;
@@ -23,6 +24,7 @@ use tracing::Span;
 use tracing::info;
 use tracing::warn;
 
+use super::repository_query::repair_missing_name;
 use super::repository_query::repository_query_id;
 use super::repository_query::repository_query_name;
 use crate::authnz::repository_registry::RepositoryRegistry;
@@ -201,16 +203,11 @@ async fn repository_create(
             .await
             .filter_slow_down()?
             .is_err()
-            {
-                info!(
-                    "Recreating repository name {} -> ID {} mapping",
-                    name, repository.id
-                );
-                // no filter_slow_down()? usage here: the create has already
-                // succeeded, so this mapping repair must not fail it.
-                let _ = repository::store_name_to_id(repository.clone(), name, repository.id)
+                && repair_missing_name(repository.clone(), name, repository.id)
                     .await
-                    .inspect_err(|err| info!("Recreate name -> ID mapping failed: {err}"));
+                    .is_some()
+            {
+                return Err(name_held_by_other(name, repository.id));
             }
 
             Ok(data)
@@ -310,15 +307,7 @@ async fn repository_create(
             ))
         })?;
 
-    repository::store_name_to_id(repository.clone(), name, repository.id)
-        .await
-        .filter_slow_down()?
-        .warn_map_err(|err| {
-            Status::internal(format!(
-                "Failed to store name to ID lookup for {name} -> {}: {err}",
-                repository.id
-            ))
-        })?;
+    bind_created_name(repository.clone(), name).await?;
 
     info!("Created repository {} with ID {}", name, repository.id);
 
@@ -327,4 +316,32 @@ async fn repository_create(
         name: name.to_string(),
         metadata,
     })
+}
+
+/// Binds `name` to the repository a create stores, as the create's last write. A name that another
+/// repository bound since the create checked it answers `ALREADY_EXISTS`, and the mapping is kept.
+pub(crate) async fn bind_created_name(
+    repository: Arc<RepositoryContext>,
+    name: &str,
+) -> Result<(), Status> {
+    let bind = repository::bind_name_to_id(repository.clone(), name, repository.id)
+        .await
+        .filter_slow_down()?
+        .warn_map_err(|err| {
+            Status::internal(format!(
+                "Failed to store name to ID lookup for {name} -> {}: {err}",
+                repository.id
+            ))
+        })?;
+    match bind {
+        NameBind::Bound | NameBind::AlreadyBound => Ok(()),
+        NameBind::HeldByOther(_) => Err(name_held_by_other(name, repository.id)),
+    }
+}
+
+/// The answer to a create of `id` under `name` where another repository holds the name.
+pub(crate) fn name_held_by_other(name: &str, id: RepositoryId) -> Status {
+    Status::already_exists(format!(
+        "Repository name {name} maps to a repository other than {id}"
+    ))
 }

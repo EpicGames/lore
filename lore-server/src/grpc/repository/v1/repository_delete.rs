@@ -7,7 +7,6 @@ use lore_base::types::Hash;
 use lore_proto::lore::repository::v1::RepositoryDeleteRequest;
 use lore_proto::lore::repository::v1::RepositoryDeleteResponse;
 use lore_revision::branch;
-use lore_revision::lore::RepositoryId;
 use lore_revision::lore::execution_context;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
@@ -87,16 +86,12 @@ pub async fn handler(
             check_request_cancelled()?;
             registry.remove(authorization, id).await?;
 
-            repository::store_name_to_id(
-                repository.clone(),
-                metadata.name.as_str(),
-                RepositoryId::default(),
-            )
-            .await
-            .filter_slow_down()?
-            .warn_map_err(|err| {
-                Status::internal(format!("Failed to delete repository name mapping: {err}"))
-            })?;
+            repository::unbind_name_to_id(repository.clone(), metadata.name.as_str(), id)
+                .await
+                .filter_slow_down()?
+                .warn_map_err(|err| {
+                    Status::internal(format!("Failed to delete repository name mapping: {err}"))
+                })?;
 
             repository::metadata_store_hash(repository.clone(), Hash::default())
                 .await

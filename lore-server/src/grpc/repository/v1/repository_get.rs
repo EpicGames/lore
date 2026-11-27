@@ -21,7 +21,6 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 use tracing::debug;
-use tracing::info;
 use tracing::warn;
 
 use super::record::build_repository;
@@ -36,8 +35,11 @@ use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::get_is_service_account;
 use crate::grpc::get_user_id;
 use crate::grpc::get_verified_token;
+use crate::grpc::handlers::repository_query::check_name_binds_id;
 use crate::grpc::handlers::repository_query::check_repository_query_authorization;
 use crate::grpc::handlers::repository_query::lookup_error_status;
+use crate::grpc::handlers::repository_query::metadata_hash_or_remove_name;
+use crate::grpc::handlers::repository_query::remove_stale_name;
 use crate::util::setup_execution;
 
 /// `lore.repository.v1.RepositoryService.RepositoryGet` handler.
@@ -203,30 +205,7 @@ pub(super) async fn repository_load_id(
         .await
         .forward_with::<RepositoryError, _>(|| format!("Repository {id} metadata not found"))?;
 
-    let name_repository = Arc::new(repository.to_server_context(RepositoryId::default()));
-    match repository::id_from_name(name_repository, &metadata.name).await {
-        Ok(resolved_id) if resolved_id != id => {
-            warn!(
-                "Repository {} name {} maps to different repository {}, returning not found",
-                id, metadata.name, resolved_id
-            );
-            return Err(RepositoryError::from(RepositoryNotFound {
-                repository: id.to_string(),
-            }));
-        }
-        Err(_) => {
-            info!(
-                "Repairing missing name -> ID mapping: {} -> {}",
-                metadata.name, id
-            );
-            // no filter_slow_down()? usage here: repairing the name mapping is
-            // best-effort, and the repository has already been resolved.
-            let _ = repository::store_name_to_id(repository.clone(), &metadata.name, id)
-                .await
-                .inspect_err(|err| warn!("Failed to repair name -> ID mapping: {err}"));
-        }
-        Ok(_) => {}
-    }
+    check_name_binds_id(repository.clone(), &metadata.name, id).await?;
 
     Ok((metadata, metadata_hash))
 }
@@ -255,11 +234,7 @@ pub(super) async fn repository_load_name(
     }
 
     let repository = Arc::new(repository.to_server_context(id));
-    let metadata_hash = repository::metadata_hash(repository.clone())
-        .await
-        .forward_with::<RepositoryError, _>(|| {
-            format!("Repository {name} metadata hash not found")
-        })?;
+    let metadata_hash = metadata_hash_or_remove_name(repository.clone(), name, id).await?;
     let metadata = repository::metadata(repository.clone(), metadata_hash)
         .await
         .forward_with::<RepositoryError, _>(|| format!("Repository {name} metadata not found"))?;
@@ -269,9 +244,7 @@ pub(super) async fn repository_load_name(
             "Stale name -> ID mapping: {} maps to {} but metadata name is {}, deleting mapping",
             name, id, metadata.name
         );
-        let _ = repository::delete_name_to_id(repository.clone(), name)
-            .await
-            .inspect_err(|err| warn!("Failed to delete stale name -> ID mapping: {err}"));
+        remove_stale_name(repository.clone(), name, id).await;
         return Err(RepositoryError::from(RepositoryNotFound {
             repository: name.to_string(),
         }));

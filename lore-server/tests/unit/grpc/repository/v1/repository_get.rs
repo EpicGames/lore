@@ -348,3 +348,208 @@ mod forwarded_request {
         }
     }
 }
+
+/// The repairs a lookup makes to the name mapping keep a mapping another repository wrote since
+/// the lookup read it.
+mod name_repairs {
+    use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use lore_server::grpc::repository::v1::repository_get::*;
+    use rand::random;
+
+    use super::*;
+    use crate::store::test_support::RacedNameWriteStore;
+    use crate::store::test_support::bind_without_metadata;
+    use crate::store::test_support::bound_id;
+    use crate::store::test_support::seed_metadata;
+    use crate::store::test_support::test_store_create;
+    use crate::store::test_support::unbound;
+
+    fn get_by_id(id: RepositoryId) -> Request<RepositoryGetRequest> {
+        Request::new(RepositoryGetRequest {
+            query: Some(Query::Id(bytes::Bytes::copy_from_slice(id.data()))),
+        })
+    }
+
+    fn get_by_name(name: &str) -> Request<RepositoryGetRequest> {
+        Request::new(RepositoryGetRequest {
+            query: Some(Query::Name(name.into())),
+        })
+    }
+
+    /// Another repository binds the name in the metadata before the lookup by ID writes the
+    /// missing mapping. The lookup keeps that binding and answers `NOT_FOUND`.
+    #[tokio::test]
+    async fn a_lookup_by_id_keeps_a_name_another_repository_bound_since() {
+        let id = random::<RepositoryId>();
+        let other = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            seed_metadata(immutable_store.clone(), mutable_store.clone(), id, "repo").await;
+            let err = handler(
+                get_by_id(id),
+                Arc::new(AllowAllRepositoryAuthorizer),
+                immutable_store.clone(),
+                RacedNameWriteStore::binding(mutable_store.clone(), other),
+                &None,
+            )
+            .await
+            .expect_err("the name maps to another repository");
+            assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
+            assert_eq!(
+                bound_id(immutable_store, mutable_store, "repo").await,
+                other
+            );
+        }))
+        .await;
+    }
+
+    /// Another repository binds the name before the lookup by name removes the mapping it found
+    /// stale. The lookup keeps that binding.
+    #[tokio::test]
+    async fn a_lookup_by_name_keeps_a_mapping_that_changed_since() {
+        let id = random::<RepositoryId>();
+        let other = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository = seed_metadata(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                id,
+                "renamed",
+            )
+            .await;
+            repository::store_name_to_id(repository.clone(), "repo", id)
+                .await
+                .expect("Failed to store the stale mapping");
+            let err = handler(
+                get_by_name("repo"),
+                Arc::new(AllowAllRepositoryAuthorizer),
+                immutable_store.clone(),
+                RacedNameWriteStore::binding(mutable_store.clone(), other),
+                &None,
+            )
+            .await
+            .expect_err("the mapping is stale");
+            assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
+            assert_eq!(
+                bound_id(immutable_store, mutable_store, "repo").await,
+                other
+            );
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_lookup_by_id_binds_a_missing_name() {
+        let id = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            seed_metadata(immutable_store.clone(), mutable_store.clone(), id, "repo").await;
+            handler(
+                get_by_id(id),
+                Arc::new(AllowAllRepositoryAuthorizer),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                &None,
+            )
+            .await
+            .expect("the lookup by ID resolves");
+            assert_eq!(bound_id(immutable_store, mutable_store, "repo").await, id);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_lookup_by_name_removes_a_stale_mapping() {
+        let id = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository = seed_metadata(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                id,
+                "renamed",
+            )
+            .await;
+            repository::store_name_to_id(repository, "repo", id)
+                .await
+                .expect("Failed to store the stale mapping");
+            let err = handler(
+                get_by_name("repo"),
+                Arc::new(AllowAllRepositoryAuthorizer),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                &None,
+            )
+            .await
+            .expect_err("the mapping is stale");
+            assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
+            assert!(unbound(immutable_store, mutable_store, "repo").await);
+        }))
+        .await;
+    }
+
+    /// A lookup by name finds the name mapped to a repository that has no metadata, as a delete
+    /// that raced a lookup by ID can leave it. The lookup removes the mapping.
+    #[tokio::test]
+    async fn a_lookup_by_name_removes_a_mapping_to_a_repository_without_metadata() {
+        let id = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            bind_without_metadata(immutable_store.clone(), mutable_store.clone(), "repo", id).await;
+            let err = handler(
+                get_by_name("repo"),
+                Arc::new(AllowAllRepositoryAuthorizer),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                &None,
+            )
+            .await
+            .expect_err("the repository has no metadata");
+            assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
+            assert!(unbound(immutable_store, mutable_store, "repo").await);
+        }))
+        .await;
+    }
+
+    /// A lookup by name finds the name mapped to a repository that has no metadata, and another
+    /// repository binds the name before the lookup removes the mapping. The lookup keeps that
+    /// binding.
+    #[tokio::test]
+    async fn a_lookup_by_name_keeps_a_mapping_to_a_repository_without_metadata_that_changed_since()
+    {
+        let id = random::<RepositoryId>();
+        let other = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            bind_without_metadata(immutable_store.clone(), mutable_store.clone(), "repo", id).await;
+            let err = handler(
+                get_by_name("repo"),
+                Arc::new(AllowAllRepositoryAuthorizer),
+                immutable_store.clone(),
+                RacedNameWriteStore::binding(mutable_store.clone(), other),
+                &None,
+            )
+            .await
+            .expect_err("the repository has no metadata");
+            assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
+            assert_eq!(
+                bound_id(immutable_store, mutable_store, "repo").await,
+                other
+            );
+        }))
+        .await;
+    }
+}

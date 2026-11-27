@@ -5,7 +5,7 @@ authors:
   - Hannes Muurinen
 status: Accepted
 created: 2026-11-19
-updated: 2026-11-26
+updated: 2026-11-27
 ---
 
 # Repository rename
@@ -47,14 +47,14 @@ A rename also concerns two parties besides the Lore server:
 
 - **Meaning in names.** Lore treats a name as one string. A name can contain `/` separators (`is_valid_name` in `lore-revision/src/repository.rs`), but Lore assigns no meaning to the parts, and a rename applies no rules to them.
 - **Redirects from old names.** After a rename the old name is free, as it is after a delete. See [Old names](#old-names).
-- **Races between operations on one name.** Two operations that take the same name at the same time can both succeed locally. Two concurrent creates have this exposure today, and rename does not remove it. See Risks.
+- **Races between operations on one name.** Two operations that take the same name at the same time don't both bind it, since the name index is written with conditional writes, but the one that loses can have stored state already. Two concurrent creates have this exposure today, and rename does not remove it. See Risks.
 - **Forwarded requests.** A server can forward `RepositoryCreate` and `RepositoryGet` to another server (`ForwardedRepositoryService`). It does not forward `RepositoryDelete`, and it does not forward `RepositoryRename`.
 
 ## Proposed Design
 
 ### The names handled by Lore server
 
-A server keeps a repository's name in two places. The repository metadata contains the name, and is the primary source of truth. `RepositoryGet` by ID returns name directly from the metadata. There's also a name index in the mutable store that maps each name to an ID, and is used in lookups by name. Lookups already repair the index from the metadata: a lookup by ID writes a missing index entry, and a lookup by name removes an entry whose repository holds a different name (`lore-server/src/grpc/repository/v1/repository_get.rs`). A `RepositoryRegistryService`, when the server has one configured, can keep a third copy outside the server.
+A server keeps a repository's name in two places. The repository metadata contains the name, and is the primary source of truth. `RepositoryGet` by ID returns name directly from the metadata. There's also a name index in the mutable store that maps each name to an ID, and is used in lookups by name. Lookups already repair the index from the metadata, with conditional writes (`bind_name_to_id` and `unbind_name_to_id` in `lore-revision/src/repository.rs`): a lookup by ID binds a missing index entry while the name is unbound, and answers `NOT_FOUND` where another repository holds the name. A lookup by name removes an entry whose repository holds a different name or has no metadata, while the entry still maps to that repository (`lore-server/src/grpc/repository/v1/repository_get.rs`). A `RepositoryRegistryService`, when the server has one configured, can keep a third copy outside the server.
 
 A rename changes all three. The design orders the changes so that a failure in any state is recoverable through a retry or a lookup.
 
@@ -266,7 +266,9 @@ The rename also does not delete the previous metadata blob, which holds the old 
 
 - **Risk:** A rename stops after the registry accepted and nobody runs it again, so the registry and the server hold different names. — *mitigation:* the CLI reports the rename as incomplete and suggests a retry. A repeated rename to the new name makes them agree, and so does a rename back to the old one that the registry accepts.
 - **Risk:** Two renames of one repository to different names run at the same time. One completes and the other answers `ABORTED`, but the registry can hold the name of the call that answered `ABORTED`. — *mitigation:* accepted. A repeated rename of either makes the registry and the server agree.
-- **Risk:** A repository create takes a name between a rename's check and its bind of that name. Create binds names with unconditional writes, so one of the two repositories can end up holding a name that the index maps to the other, and a lookup of that repository by ID then answers `NOT_FOUND`. — *mitigation:* accepted. Two concurrent creates have the same exposure today. A registry that enforces unique names atomically prevents it. `RepositoryRename` still reaches the affected repository by ID, so a caller who may rename it repairs it with `lore repository rename --name <new-name> <id>`.
+- **Risk:** A repository create takes a name between a rename's check and its bind of that name. Both bind the name with a conditional write (`bind_name_to_id`), so the name keeps the first binding, and the other call answers `ALREADY_EXISTS` for a create or `ABORTED` for a rename. A create that loses has already stored the repository's metadata, and a lookup of that repository by ID then answers `NOT_FOUND`, since its name maps to the other repository. — *mitigation:* accepted. Two concurrent creates have the same exposure today. A registry that enforces unique names atomically prevents it. `RepositoryRename` still reaches the affected repository by ID, so a caller who may rename it repairs it with `lore repository rename --name <new-name> <id>`.
+- **Risk:** A lookup by name reads the new name's binding before a rename changes the metadata, finds the binding stale, and removes it after the rename has finished. A rename's removal of its old name that runs after a later rename back to that name removes the later binding in the same way. A lookup by name that finds the name mapped to a repository with no metadata, and removes the mapping after a create of that repository's ID has bound the name again, removes the create's binding in the same way. The repository then holds a name that maps to nothing, and lookups by that name answer `NOT_FOUND`. — *mitigation:* accepted. A lookup or a rename removes a binding only while it maps to the repository (`unbind_name_to_id`), so no other repository's binding is lost. A registry that enforces unique names keeps other repositories from taking the name meanwhile, and the next lookup of the repository by ID binds the name again, as the same rename run again does. Without such a registry, another repository can take the name first, and the repository is then repaired as in the previous risk.
+- **Risk:** During a rolling upgrade, servers built before the name index's conditional writes still create, delete and repair names with unconditional writes, and can overwrite or remove the binding of another repository. — *mitigation:* accepted. Those servers have this exposure today, and it ends once every server that shares the mutable store is upgraded.
 - **Risk:** A dependent system misses the notification, because it was not subscribed when the server published it. — *mitigation:* the event is a hint, as the existing notifications are. The repository record queried by ID is the source of truth, and the dependent system must be built to reconcile the differences it detects, if missing a notification.
 - **Risk:** A repository that the registry does not know, for example one created before the server had a registry, cannot be renamed. — *mitigation:* the operator registers the repository first when taking a registry service into use.
 
