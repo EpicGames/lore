@@ -15,7 +15,6 @@ use lore_error_set::prelude::*;
 use serde::Serialize;
 
 use crate::errors::*;
-use crate::event::EventError;
 use crate::immutable;
 use crate::interface::LoreArray;
 use crate::interface::LoreString;
@@ -100,20 +99,6 @@ pub enum DependencyError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
-}
-
-impl EventError for DependencyError {
-    fn translated(&self) -> crate::interface::LoreError {
-        match self {
-            DependencyError::FileNotFound(_) => crate::interface::LoreError::NotFound,
-            DependencyError::Disconnected(_) => crate::interface::LoreError::Connection,
-            _ => crate::interface::LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 // --- Event data structs ---

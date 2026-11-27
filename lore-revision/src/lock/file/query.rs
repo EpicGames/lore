@@ -9,8 +9,6 @@ use crate::auth;
 use crate::branch;
 use crate::errors::*;
 use crate::event;
-use crate::event::EventError;
-use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lock::util::lock_path_node;
 use crate::lock::util::lock_tree;
@@ -42,16 +40,6 @@ pub enum QueryError {
     NotSupported,
     InvalidPath,
     Oversized,
-}
-
-impl EventError for QueryError {
-    fn translated(&self) -> LoreError {
-        LoreError::Internal
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Data for an event that marks the start of a lock query result.

@@ -23,9 +23,10 @@ header = '''// LORE C API
 //
 // Return values
 //
-// An operation function returns 0 on success and a non-zero value on error.
-// For a function that takes a callback, the error event passed to the callback
-// gives more information.
+// An operation function returns 0 on success and the error's code, a
+// lore_error_code_t value, on failure. For a function that takes a callback, the
+// Complete event carries the same code in status, and the error's message and
+// trace in error.
 //
 // Strings
 //
@@ -277,7 +278,6 @@ include = [
 "LoreEndEventData" = "lore_end_event_data_t"
 "LoreErrorCode" = "lore_error_code_t"
 "LoreErrorDetail" = "lore_error_detail_t"
-"LoreErrorEventData" = "lore_error_event_data_t"
 "LoreEvent" = "lore_event_t"
 "LoreEventCallbackConfig" = "lore_event_callback_config_t"
 "LoreEvent_Tag" = "lore_event_tag_t"

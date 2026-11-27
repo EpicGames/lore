@@ -12,9 +12,7 @@ use tokio::task::JoinSet;
 use crate::branch;
 use crate::errors::*;
 use crate::event;
-use crate::event::EventError;
 use crate::interface::LoreArray;
-use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lock;
 use crate::lock::file::release::ReleaseOptions;
@@ -86,16 +84,6 @@ pub enum AcquireError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
-}
-
-impl EventError for AcquireError {
-    fn translated(&self) -> LoreError {
-        LoreError::Internal
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Data for an event that marks the start of a lock acquire report.

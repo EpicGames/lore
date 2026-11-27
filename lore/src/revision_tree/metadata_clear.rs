@@ -12,13 +12,11 @@ use lore_base::error::InvalidArguments;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
-use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_tree::LoreRevisionTreeBatchCompleteEventData;
 use lore_revision::event::revision_tree::LoreRevisionTreeMetadataClearCompleteEventData;
 use lore_revision::interface::LoreArray;
-use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreString;
 
 use crate::call_delegation::dispatch_call;
@@ -84,19 +82,6 @@ impl MetadataClearError {
     }
 }
 
-impl EventError for MetadataClearError {
-    fn translated(&self) -> LoreError {
-        match self {
-            MetadataClearError::InvalidArguments(_) => LoreError::InvalidArguments,
-            MetadataClearError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
-}
-
 fn emit_clear_complete(entry_id: u64, removed: bool, error_code: LoreErrorCode) {
     LoreEvent::RevisionTreeMetadataClearComplete(LoreRevisionTreeMetadataClearCompleteEventData {
         entry_id,
@@ -113,15 +98,6 @@ fn emit_batch_complete(batch_id: u64, error_code: LoreErrorCode) {
         error_code,
     })
     .send();
-}
-
-/// The code the batch terminal reports for a finished call.
-fn batch_error_code(result: &Result<(), MetadataClearError>) -> LoreErrorCode {
-    match result {
-        Ok(()) => LoreErrorCode::None,
-        Err(MetadataClearError::InvalidArguments(_)) => LoreErrorCode::InvalidArguments,
-        Err(MetadataClearError::Internal(_)) => LoreErrorCode::Internal,
-    }
 }
 
 /// Reject the whole batch as a bad argument, attributing it to `entry_id`.
@@ -258,7 +234,7 @@ async fn metadata_clear_impl(
             let batch_id = args.batch_id;
             let _access = internal.access_shared().await;
             let result = metadata_clear_batch(&internal, &args);
-            emit_batch_complete(batch_id, batch_error_code(&result));
+            emit_batch_complete(batch_id, LoreErrorCode::of(&result));
             result
         },
     )

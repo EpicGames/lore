@@ -6,9 +6,7 @@ use lore_error_set::prelude::*;
 use serde::Serialize;
 
 use crate::errors::*;
-use crate::event::EventError;
 use crate::event::LoreEvent;
-use crate::interface::LoreError;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::repository::RepositoryContext;
@@ -85,23 +83,6 @@ pub enum BisectError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
-}
-
-impl EventError for BisectError {
-    fn translated(&self) -> LoreError {
-        match self {
-            BisectError::Disconnected(_) => LoreError::Connection,
-            BisectError::SlowDown(_) => LoreError::SlowDown,
-            BisectError::Oversized(_) => LoreError::Oversized,
-            BisectError::NotFound(_) => LoreError::NotFound,
-            BisectError::AddressNotFound(_) => LoreError::AddressNotFound,
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 #[derive(Clone, Debug, Default)]

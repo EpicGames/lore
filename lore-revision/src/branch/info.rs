@@ -7,11 +7,9 @@ use serde::Serialize;
 
 use crate::branch;
 use crate::errors::*;
-use crate::event::EventError;
 use crate::event::LoreEvent;
 use crate::interface::LoreArray;
 use crate::interface::LoreBranchPoint;
-use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lore::BranchId;
 use crate::lore::Hash;
@@ -68,19 +66,6 @@ pub enum InfoError {
     TokenNotFound,
     WriteRequired,
     MissingIdentity,
-}
-
-impl EventError for InfoError {
-    fn translated(&self) -> LoreError {
-        match self {
-            InfoError::NotFound(_) => LoreError::NotFound,
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Event data reported with information about a single branch.

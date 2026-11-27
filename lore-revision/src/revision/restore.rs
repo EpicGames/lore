@@ -15,10 +15,8 @@ use crate::branch::push::refusal_as_internal;
 use crate::change;
 use crate::commit;
 use crate::errors::*;
-use crate::event::EventError;
 use crate::filter::FilterMode;
 use crate::find;
-use crate::interface::LoreError;
 use crate::interface::LoreEvent;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
@@ -197,30 +195,6 @@ pub enum RestoreError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
-}
-
-impl EventError for RestoreError {
-    fn translated(&self) -> LoreError {
-        match self {
-            RestoreError::Disconnected(_) => LoreError::Connection,
-            RestoreError::SlowDown(_) => LoreError::SlowDown,
-            RestoreError::Oversized(_) => LoreError::Oversized,
-            RestoreError::FileNotFound(_) => LoreError::FileNotFound,
-            RestoreError::NotFound(_)
-            | RestoreError::LayerNotFound(_)
-            | RestoreError::RevisionNotFound(_) => LoreError::NotFound,
-            RestoreError::AddressNotFound(_) => LoreError::AddressNotFound,
-            RestoreError::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            RestoreError::InvalidPath(_) | RestoreError::InvalidArguments(_) => {
-                LoreError::InvalidArguments
-            }
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 #[derive(Clone, Debug)]

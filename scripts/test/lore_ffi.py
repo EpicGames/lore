@@ -387,10 +387,10 @@ def header_struct_fields(struct_name: str) -> list[str]:
 def header_enum_value(enum_name: str, enumerator: str) -> int:
     """The value of `enumerator` in `enum_name` as `lore.h` declares it.
 
-    The event tags are not exported as constants and carry no explicit values,
-    so a tag's value is its position in the enum — which moves whenever a tag is
-    added ahead of it. Reading it from the header is what keeps a driver reading
-    the member the library actually wrote.
+    The event tags are not exported as constants, and most carry no explicit
+    value, so a tag's value follows from its position in the enum. Reading it
+    from the header is what keeps a driver reading the member the library
+    actually wrote.
     """
     header = HEADER_PATH.read_text()
     body = re.search(rf"enum {enum_name} \{{(.*?)\n\}}", header, re.S)

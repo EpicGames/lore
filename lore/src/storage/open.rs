@@ -176,8 +176,8 @@ fn build_create_options(
 ///
 /// On success the caller receives `LORE_EVENT_STORAGE_OPENED` carrying
 /// `{handle}` before `Complete` with `status` `0`. On failure, no
-/// `STORAGE_OPENED` and no `LORE_EVENT_ERROR` fire; `Complete` carries the
-/// error code in `status` and the full detail in its `error` field.
+/// `STORAGE_OPENED` fires; `Complete` carries the error code in `status` and
+/// the full detail in its `error` field.
 pub fn open(
     globals: LoreGlobalArgs,
     args: LoreStorageOpenArgs,

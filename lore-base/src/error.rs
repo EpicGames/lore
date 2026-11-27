@@ -31,7 +31,7 @@
 //! | 56–63 | Already exists | Creating a resource that is already there. |
 //! | 64–78 | *reserved* | The BSD `sysexits.h` codes (`EX_USAGE` through `EX_CONFIG`). |
 //! | 79–99 | Not found | A named resource does not exist. |
-//! | 100–109 | *reserved* | The legacy `LoreError` categories (101, 102, 103). |
+//! | 100–109 | *reserved* | Not allocated: older Lore releases report 101, 102 and 103 as categories of error. |
 //! | 110–117 | Configuration | Something the operation needs was never configured. |
 //! | 118–125 | Resource limits | A size, depth, or efficiency bound was hit. |
 //! | 126–128 | *reserved* | The shell's "found but not executable", "not found", and "bad argument to exit". |
@@ -52,6 +52,11 @@
 //! also belongs to a subsystem that has its own errors elsewhere —
 //! `PluginNotFound` sits with the other not-found codes, not with the other
 //! plugin codes.
+//!
+//! Each type has the variant of [`LoreErrorCode`] named after it, equal to its code, and an arm
+//! in [`LoreErrorCode::from_ffi_code`], which `#[derive(FfiError)]` checks at compile time.
+//! A type's name is its enumerator's name in `lore.h`, so a type keeps its name as it keeps
+//! its code.
 
 use std::convert::Infallible;
 use std::fmt;
@@ -501,8 +506,7 @@ fn format_available_plugins(plugins: &[String]) -> String {
 // Configuration (110–117)
 //
 // Something the operation needs was never configured, or was configured in a
-// way that will not load. The block starts at 110 because 100–109 is reserved
-// for the legacy `LoreError` categories, which share this numeric space.
+// way that will not load.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Error, FfiError)]
@@ -568,3 +572,220 @@ pub struct InefficientCompression;
 #[error("Lore has been shut down")]
 #[ffi_code(193)]
 pub struct ShutDown;
+
+// ---------------------------------------------------------------------------
+// The C names of the codes
+// ---------------------------------------------------------------------------
+
+/// The error codes Lore reports, each named after the error that carries it: the values of a
+/// `Complete` event's `status`, of a synchronous call's return value and of
+/// `lore_error_detail_t.error_code`.
+///
+/// cbindgen:prefix-with-name
+/// cbindgen:rename-all=ScreamingSnakeCase
+#[repr(C)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Eq,
+    PartialEq,
+    serde::Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
+pub enum LoreErrorCode {
+    /// No error; the operation succeeded.
+    #[default]
+    None = 0,
+    /// The arguments supplied to the operation were invalid.
+    InvalidArguments = 3,
+    /// A path is not valid.
+    InvalidPath = 4,
+    /// An address is not valid.
+    InvalidAddress = 5,
+    /// A path does not name a link.
+    NotALink = 6,
+    /// A path does not name a layer.
+    NotALayer = 7,
+    /// A node was reached as the child of a node that is not its parent.
+    InvalidNodeHierarchy = 8,
+    /// The operation is not supported.
+    NotSupported = 9,
+    /// The caller is not authenticated.
+    NotAuthenticated = 16,
+    /// The caller is not authorized to access the repository.
+    NotAuthorized = 17,
+    /// No token is stored.
+    TokenNotFound = 18,
+    /// The operation requires write access.
+    WriteRequired = 19,
+    /// The connection to the server was lost.
+    Disconnected = 28,
+    /// The remote could not be reached.
+    NotConnected = 29,
+    /// The server is in maintenance mode.
+    Maintenance = 30,
+    /// The backing store is overloaded; the caller should retry later.
+    SlowDown = 31,
+    /// No Lore service could be reached or started, so the operation did not run.
+    ServiceUnavailable = 32,
+    /// The caller left or timed out, so the operation stopped.
+    Cancelled = 33,
+    /// Nothing is staged for commit.
+    NothingStaged = 40,
+    /// The branch's latest revision has moved on; sync to bring in its new revisions.
+    BranchAdvanced = 41,
+    /// The branch history is divergent.
+    Divergent = 42,
+    /// A path is still in conflict.
+    Conflict = 43,
+    /// Local modifications prevent the operation.
+    LocalModifications = 44,
+    /// The resource is locked by someone else.
+    LockNotOwned = 45,
+    /// The new metadata is identical to the original.
+    IdenticalMetadata = 46,
+    /// A protected branch can't be archived.
+    DeleteProtected = 47,
+    /// The current branch can't be archived.
+    DeleteCurrent = 48,
+    /// The repository's default branch can't be archived.
+    DeleteDefault = 49,
+    /// A mount the operation must change is busy.
+    MountsBusy = 51,
+    /// The remote branch of a link has revisions the local branch does not.
+    LinkDivergent = 52,
+    /// The mounts of a linked repository disagree on their revision, branch or flags.
+    LinkPinsDiverge = 53,
+    /// The target repository is already used in a layer.
+    AlreadyLinked = 56,
+    /// The branch already exists.
+    BranchAlreadyExists = 57,
+    /// A repository already exists at the path.
+    RepositoryAlreadyExists = 58,
+    /// A requested item was not found.
+    NotFound = 79,
+    /// A content-addressable object could not be found in any store.
+    AddressNotFound = 80,
+    /// A payload could not be found with its hash.
+    PayloadNotFound = 81,
+    /// A file path could not be resolved to a tracked node or found in the file system.
+    FileNotFound = 82,
+    /// A node was not found.
+    NodeNotFound = 83,
+    /// A link was not found.
+    LinkNotFound = 84,
+    /// No link is mounted at the path.
+    LinkPathNotFound = 85,
+    /// A layer was not found.
+    LayerNotFound = 86,
+    /// A branch was not found.
+    BranchNotFound = 87,
+    /// A revision was not found.
+    RevisionNotFound = 88,
+    /// A repository was not found.
+    RepositoryNotFound = 89,
+    /// No shared store exists at the path.
+    SharedStoreNotFound = 90,
+    /// A lock does not exist.
+    LockNotFound = 91,
+    /// A plugin was not found.
+    PluginNotFound = 92,
+    /// No commit identity is configured.
+    MissingIdentity = 110,
+    /// No remote is configured.
+    NoRemote = 111,
+    /// A plugin's configuration is not valid.
+    PluginConfigError = 112,
+    /// A plugin failed to initialize.
+    PluginInitError = 113,
+    /// A size bound refused the operation, such as a name over its length bound.
+    Oversized = 118,
+    /// A history search reached its maximum depth.
+    MaxHistorySearchDepth = 119,
+    /// Compression would be inefficient.
+    InefficientCompression = 120,
+    /// Lore has been shut down.
+    ShutDown = 193,
+    /// An internal error occurred.
+    Internal = -1,
+}
+
+const _: () = assert!(LoreErrorCode::Internal as i32 == lore_error_set::Internal::FFI_CODE);
+
+impl LoreErrorCode {
+    /// The code `code` names: [`Self::None`] for `0`, and [`Self::Internal`] for a code no error
+    /// type carries.
+    pub const fn from_ffi_code(code: i32) -> Self {
+        match code {
+            0 => Self::None,
+            InvalidArguments::FFI_CODE => Self::InvalidArguments,
+            InvalidPath::FFI_CODE => Self::InvalidPath,
+            InvalidAddress::FFI_CODE => Self::InvalidAddress,
+            NotALink::FFI_CODE => Self::NotALink,
+            NotALayer::FFI_CODE => Self::NotALayer,
+            InvalidNodeHierarchy::FFI_CODE => Self::InvalidNodeHierarchy,
+            NotSupported::FFI_CODE => Self::NotSupported,
+            NotAuthenticated::FFI_CODE => Self::NotAuthenticated,
+            NotAuthorized::FFI_CODE => Self::NotAuthorized,
+            TokenNotFound::FFI_CODE => Self::TokenNotFound,
+            WriteRequired::FFI_CODE => Self::WriteRequired,
+            Disconnected::FFI_CODE => Self::Disconnected,
+            NotConnected::FFI_CODE => Self::NotConnected,
+            Maintenance::FFI_CODE => Self::Maintenance,
+            SlowDown::FFI_CODE => Self::SlowDown,
+            ServiceUnavailable::FFI_CODE => Self::ServiceUnavailable,
+            Cancelled::FFI_CODE => Self::Cancelled,
+            NothingStaged::FFI_CODE => Self::NothingStaged,
+            BranchAdvanced::FFI_CODE => Self::BranchAdvanced,
+            Divergent::FFI_CODE => Self::Divergent,
+            Conflict::FFI_CODE => Self::Conflict,
+            LocalModifications::FFI_CODE => Self::LocalModifications,
+            LockNotOwned::FFI_CODE => Self::LockNotOwned,
+            IdenticalMetadata::FFI_CODE => Self::IdenticalMetadata,
+            DeleteProtected::FFI_CODE => Self::DeleteProtected,
+            DeleteCurrent::FFI_CODE => Self::DeleteCurrent,
+            DeleteDefault::FFI_CODE => Self::DeleteDefault,
+            MountsBusy::FFI_CODE => Self::MountsBusy,
+            LinkDivergent::FFI_CODE => Self::LinkDivergent,
+            LinkPinsDiverge::FFI_CODE => Self::LinkPinsDiverge,
+            AlreadyLinked::FFI_CODE => Self::AlreadyLinked,
+            BranchAlreadyExists::FFI_CODE => Self::BranchAlreadyExists,
+            RepositoryAlreadyExists::FFI_CODE => Self::RepositoryAlreadyExists,
+            NotFound::FFI_CODE => Self::NotFound,
+            AddressNotFound::FFI_CODE => Self::AddressNotFound,
+            PayloadNotFound::FFI_CODE => Self::PayloadNotFound,
+            FileNotFound::FFI_CODE => Self::FileNotFound,
+            NodeNotFound::FFI_CODE => Self::NodeNotFound,
+            LinkNotFound::FFI_CODE => Self::LinkNotFound,
+            LinkPathNotFound::FFI_CODE => Self::LinkPathNotFound,
+            LayerNotFound::FFI_CODE => Self::LayerNotFound,
+            BranchNotFound::FFI_CODE => Self::BranchNotFound,
+            RevisionNotFound::FFI_CODE => Self::RevisionNotFound,
+            RepositoryNotFound::FFI_CODE => Self::RepositoryNotFound,
+            SharedStoreNotFound::FFI_CODE => Self::SharedStoreNotFound,
+            LockNotFound::FFI_CODE => Self::LockNotFound,
+            PluginNotFound::FFI_CODE => Self::PluginNotFound,
+            MissingIdentity::FFI_CODE => Self::MissingIdentity,
+            NoRemote::FFI_CODE => Self::NoRemote,
+            PluginConfigError::FFI_CODE => Self::PluginConfigError,
+            PluginInitError::FFI_CODE => Self::PluginInitError,
+            Oversized::FFI_CODE => Self::Oversized,
+            MaxHistorySearchDepth::FFI_CODE => Self::MaxHistorySearchDepth,
+            InefficientCompression::FFI_CODE => Self::InefficientCompression,
+            ShutDown::FFI_CODE => Self::ShutDown,
+            _ => Self::Internal,
+        }
+    }
+
+    /// The code of `result`: [`Self::None`] on success, and the error's own code on failure.
+    pub fn of<T, E: FfiError>(result: &Result<T, E>) -> Self {
+        match result {
+            Ok(_) => Self::None,
+            Err(error) => Self::from_ffi_code(error.ffi_code()),
+        }
+    }
+}

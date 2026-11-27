@@ -10,8 +10,6 @@ use zerocopy::IntoBytes;
 
 use crate::errors::InvalidArguments;
 use crate::errors::WriteRequired;
-use crate::event::EventError;
-use crate::interface::LoreError;
 use crate::lore::BranchId;
 use crate::lore::Hash;
 
@@ -19,19 +17,6 @@ use crate::lore::Hash;
 pub enum AnchorError {
     InvalidArguments,
     WriteRequired,
-}
-
-impl EventError for AnchorError {
-    fn translated(&self) -> LoreError {
-        match self {
-            AnchorError::InvalidArguments(_) => LoreError::InvalidArguments,
-            AnchorError::WriteRequired(_) | AnchorError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 pub const CURRENT: &str = "current";

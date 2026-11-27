@@ -11,12 +11,10 @@ use lore_base::types::Hash;
 use lore_base::types::RepositoryId;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
-use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_tree::LoreRevisionTreeChildEventData;
 use lore_revision::event::revision_tree::LoreRevisionTreeListChildrenBeginEventData;
-use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreNodeType;
 use lore_revision::interface::LoreString;
 use lore_revision::node::Node;
@@ -30,7 +28,6 @@ use lore_revision::state::StateNodeChildrenWithNameIterator;
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
-use crate::revision_tree::call::EntryFailure;
 use crate::revision_tree::call::revision_tree_call;
 use crate::revision_tree::call::state_failure;
 use crate::revision_tree::handle::LoreRevisionTree;
@@ -62,20 +59,6 @@ pub struct LoreRevisionTreeListChildrenArgs {
 enum ListChildrenError {
     InvalidArguments,
     SlowDown,
-}
-
-impl EventError for ListChildrenError {
-    fn translated(&self) -> LoreError {
-        match self {
-            ListChildrenError::InvalidArguments(_) => LoreError::InvalidArguments,
-            ListChildrenError::SlowDown(_) => LoreError::SlowDown,
-            ListChildrenError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Emit one child entry. `kind` is derived from the node's flags.
@@ -186,9 +169,10 @@ async fn resolve_listing_target(
 /// as an empty directory rather than `INVALID_ARGUMENTS`; only ids resolving to
 /// a non-existent block or the reserved invalid sentinel are rejected.
 ///
-/// A failure of the tree's reads reports `INTERNAL`, and a walk the tree gave up
-/// on under load, heavy changes beside it or a store asking it to slow down,
-/// reports `SLOW_DOWN`, which a caller can retry. The header is the only
+/// A failure of the tree's reads completes with `INTERNAL`; one before the header
+/// fires reports the read's own code on the header. A walk the tree gave up on
+/// under load, heavy changes beside it or a store asking it to slow down, reports
+/// `SLOW_DOWN`, which a caller can retry. The header is the only
 /// id-carrying terminal: a failure that surfaces after a successful header has
 /// fired — a tree-block read error, or a walk given up, mid-iteration — is
 /// reported on the trailing `Complete`, which carries no `id`. Such a mid-stream
@@ -256,12 +240,12 @@ async fn list_children_impl(
                     return Err(invalid("parent node id is unknown or not a directory"));
                 }
                 Err(error) => {
-                    let error_code = match error {
-                        ListChildrenError::InvalidArguments(_) => LoreErrorCode::InvalidArguments,
-                        ListChildrenError::SlowDown(_) => LoreErrorCode::SlowDown,
-                        ListChildrenError::Internal(_) => LoreErrorCode::Internal,
-                    };
-                    emit_begin(id, RepositoryId::default(), Hash::default(), error_code);
+                    emit_begin(
+                        id,
+                        RepositoryId::default(),
+                        Hash::default(),
+                        LoreErrorCode::from_ffi_code(error.ffi_code()),
+                    );
                     return Err(error);
                 }
             };
@@ -286,7 +270,7 @@ async fn list_children_impl(
                         id,
                         RepositoryId::default(),
                         Hash::default(),
-                        EntryFailure::of(&error).code(),
+                        LoreErrorCode::from_ffi_code(error.ffi_code()),
                     );
                     return Err(state_failure(
                         error,

@@ -40,7 +40,6 @@ use crate::errors::Oversized;
 use crate::errors::PayloadNotFound;
 use crate::errors::SlowDown;
 use crate::errors::WriteRequired;
-use crate::event::EventError;
 use crate::fs::filesystem_provider::CloneAnswer;
 use crate::fs::filesystem_provider::FilesystemProvider;
 use crate::fs::filesystem_provider::InstanceCloneError;
@@ -55,7 +54,6 @@ use crate::global::external_dir::resolve::RootState;
 use crate::global::external_dir::resolve::resolve;
 use crate::hash;
 use crate::immutable::ImmutableError;
-use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lore::BranchId;
 use crate::lore_debug;
@@ -1308,20 +1306,6 @@ pub enum InstanceError {
     NotAuthorized,
     NotSupported,
     MountsBusy,
-}
-
-impl EventError for InstanceError {
-    fn translated(&self) -> LoreError {
-        match self {
-            InstanceError::Disconnected(_) => LoreError::Connection,
-            InstanceError::InvalidArguments(_) => LoreError::InvalidArguments,
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Whether a registered instance still describes a live checkout. [`Lost`](Self::Lost) marks a

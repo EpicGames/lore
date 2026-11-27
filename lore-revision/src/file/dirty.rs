@@ -122,8 +122,6 @@ pub enum DirtyError {
     MissingIdentity,
 }
 
-impl crate::event::EventError for DirtyError {}
-
 #[derive(Default)]
 pub struct DirtyStats {
     pub modify_count: std::sync::atomic::AtomicU64,

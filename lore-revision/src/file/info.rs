@@ -15,7 +15,6 @@ use zerocopy::FromZeros;
 use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::errors::*;
 use crate::event;
-use crate::event::EventError;
 use crate::filter::Filter;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
@@ -24,7 +23,6 @@ use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::immutable;
-use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lore::Context;
 use crate::lore::Hash;
@@ -96,23 +94,6 @@ pub enum InfoError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
-}
-
-impl EventError for InfoError {
-    fn translated(&self) -> LoreError {
-        match self {
-            InfoError::InvalidArguments(_) | InfoError::InvalidPath(_) => {
-                LoreError::InvalidArguments
-            }
-            InfoError::RevisionNotFound(_) | InfoError::NotFound(_) => LoreError::NotFound,
-            InfoError::FileNotFound(_) => LoreError::FileNotFound,
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Data for the event reporting information about a single file or directory.

@@ -5,13 +5,13 @@ use std::sync::Arc;
 use bytes::Bytes;
 use lore_base::error::AddressNotFound;
 use lore_base::error::Disconnected;
+use lore_base::error::LoreErrorCode;
 use lore_base::types::Address;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
+use lore_error_set::FfiError;
 use lore_error_set::ForwardStrict;
 use lore_revision::branch::push::*;
-use lore_revision::event::EventError;
-use lore_revision::interface::LoreError;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::allow_all_repositories;
 use lore_transport::BranchPushError;
@@ -79,7 +79,6 @@ fn a_fragment_the_peer_is_missing_keeps_its_address_on_the_way_out() {
         .expect_err("an error was forwarded");
 
     assert!(error.is_address_not_found(), "{error:?}");
-    assert!(error.translated() == LoreError::AddressNotFound);
 }
 
 /// An offer the peer refuses onto a branch holding revisions the local history does not is a
@@ -480,14 +479,14 @@ mod offer {
                 vec![missing(), missing()],
                 0,
                 1,
-                Some(LoreError::AddressNotFound),
+                Some(LoreErrorCode::AddressNotFound),
             ),
             (
                 "deleted, deleted",
                 vec![deleted(), deleted()],
                 1,
                 0,
-                Some(LoreError::NotFound),
+                Some(LoreErrorCode::NotFound),
             ),
         ];
         for (name, answers, created, recovered, error) in cases {
@@ -514,7 +513,10 @@ mod offer {
             .await;
 
             assert!(
-                result.err().map(|error| error.translated()) == error,
+                result
+                    .err()
+                    .map(|error| LoreErrorCode::from_ffi_code(error.ffi_code()))
+                    == error,
                 "{name}: the result"
             );
             assert_eq!(
@@ -694,7 +696,6 @@ mod query_batches {
             .expect_err("the back-off is spent");
 
         assert!(error.is_slow_down(), "{error:?}");
-        assert!(error.translated() == LoreError::SlowDown);
         assert_eq!(
             peer.asks(address(0)).len(),
             4,

@@ -21,6 +21,27 @@ use lore_error_set::FfiError;
 /// their own marker rather than joining the registry.
 fn __ffi_code_registry_marker() {}
 
+/// The fixtures' codes by name, which the derive checks each fixture against as it checks the
+/// registry's types against `lore_base::error::LoreErrorCode`.
+#[repr(i32)]
+enum LoreErrorCode {
+    Unknown = 0,
+    NotFound = 1,
+    PermissionDenied = 2,
+    Conflict = 3,
+}
+
+impl LoreErrorCode {
+    const fn from_ffi_code(code: i32) -> Self {
+        match code {
+            1 => Self::NotFound,
+            2 => Self::PermissionDenied,
+            3 => Self::Conflict,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Discrete error types with FfiError derive
 // ---------------------------------------------------------------------------

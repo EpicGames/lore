@@ -16,13 +16,11 @@ use lore_base::types::Address;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
-use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_tree::LoreRevisionTreeBatchCompleteEventData;
 use lore_revision::event::revision_tree::LoreRevisionTreeModifyCompleteEventData;
 use lore_revision::interface::LoreArray;
-use lore_revision::interface::LoreError;
 use lore_revision::node::INVALID_NODE;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
@@ -106,20 +104,6 @@ impl ModifyError {
     }
 }
 
-impl EventError for ModifyError {
-    fn translated(&self) -> LoreError {
-        match self {
-            ModifyError::InvalidArguments(_) => LoreError::InvalidArguments,
-            ModifyError::SlowDown(_) => LoreError::SlowDown,
-            ModifyError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
-}
-
 fn emit_modify_complete(entry_id: u64, node_id: NodeID, error_code: LoreErrorCode) {
     LoreEvent::RevisionTreeModifyComplete(LoreRevisionTreeModifyCompleteEventData {
         entry_id,
@@ -142,17 +126,6 @@ fn emit_batch_complete(batch_id: u64, error_code: LoreErrorCode) {
         error_code,
     })
     .send();
-}
-
-/// The code the batch terminal reports for a finished call.
-#[lore_macro::test_pub]
-fn batch_error_code(result: &Result<(), ModifyError>) -> LoreErrorCode {
-    match result {
-        Ok(()) => LoreErrorCode::None,
-        Err(ModifyError::InvalidArguments(_)) => LoreErrorCode::InvalidArguments,
-        Err(ModifyError::SlowDown(_)) => LoreErrorCode::SlowDown,
-        Err(ModifyError::Internal(_)) => LoreErrorCode::Internal,
-    }
 }
 
 /// Reject the whole batch as a bad argument, attributing it to `entry_id`.
@@ -284,7 +257,7 @@ async fn apply_plan(
                 // Read from the claim's cell once, not at each entry.
                 let state: &State = claim.state();
                 let mut applied = 0;
-                let mut strongest = EntryFailure::None;
+                let mut strongest = EntryFailure::NONE;
                 for item in &planned[start..end] {
                     let outcome = state
                         .node_modify_staged(&context, item.node_id, &item.content)
@@ -307,14 +280,14 @@ async fn apply_plan(
     }
 
     let mut applied = 0usize;
-    let mut strongest = EntryFailure::None;
+    let mut strongest = EntryFailure::NONE;
     while let Some(result) = tasks.join_next().await {
         match result {
             Ok((count, failure)) => {
                 applied += count;
                 strongest.merge(failure);
             }
-            Err(_) => strongest.merge(EntryFailure::Internal),
+            Err(_) => strongest.merge(EntryFailure::INTERNAL),
         }
     }
     let state: &State = claim.state();
@@ -370,14 +343,14 @@ async fn apply_plan(
 /// unallocated slot both read back as an ordinary directory, so each is refused
 /// under its own reason rather than as the wrong kind.
 ///
-/// Atomicity covers the rules checked here, which is every rule a caller can
-/// break through the arguments. A failure after the checks pass — a block that
-/// cannot be read, or a target deleted between its check and its write — reports
-/// `INTERNAL`. An entry the tree gave up on under load, a store asking it to slow
-/// down, reports `SLOW_DOWN`, which a caller can retry, and so does the batch
-/// where nothing failed otherwise. Either may leave part of the batch
-/// rewritten: nothing is rolled back, the handle stays usable, and no revision
-/// is published until `commit`.
+/// Atomicity covers the rules checked here, which is every rule a caller can break
+/// through the arguments. A failure after the checks pass — a block that cannot be
+/// read, or a target deleted between its check and its write — fails its entry with
+/// the State's own code and the call with `INTERNAL`. An entry the tree gave up on
+/// under load, a store asking it to slow down, reports `SLOW_DOWN`, which a caller
+/// can retry, and so does the batch where nothing failed otherwise. Either may
+/// leave part of the batch rewritten: nothing is rolled back, the handle stays
+/// usable, and no revision is published until `commit`.
 ///
 /// Entries are independent, since a rewrite touches no parent or sibling chain,
 /// so the batch is split into contiguous ranges over at most one task per
@@ -432,7 +405,7 @@ async fn modify_impl(
         async move |internal: Arc<RevisionTreeInternal>, args: LoreRevisionTreeModifyArgs| {
             let call_id = args.batch_id;
             let result = modify_batch(internal, args).await;
-            emit_batch_complete(call_id, batch_error_code(&result));
+            emit_batch_complete(call_id, LoreErrorCode::of(&result));
             result
         },
     )

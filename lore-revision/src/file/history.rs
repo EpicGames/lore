@@ -9,8 +9,6 @@ use crate::branch;
 use crate::change::FileAction;
 use crate::errors::*;
 use crate::event;
-use crate::event::EventError;
-use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
 use crate::link::LinkedState;
@@ -142,25 +140,6 @@ pub enum FileHistoryError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
-}
-
-impl EventError for FileHistoryError {
-    fn translated(&self) -> LoreError {
-        match self {
-            FileHistoryError::InvalidArguments(_) | FileHistoryError::InvalidPath(_) => {
-                LoreError::InvalidArguments
-            }
-            FileHistoryError::FileNotFound(_) => LoreError::FileNotFound,
-            FileHistoryError::RevisionNotFound(_)
-            | FileHistoryError::BranchNotFound(_)
-            | FileHistoryError::NotFound(_) => LoreError::NotFound,
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 #[derive(Clone, Debug)]

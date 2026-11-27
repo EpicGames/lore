@@ -194,15 +194,12 @@ pub type EventCallbackFn = Box<dyn Fn(&LoreEvent) + Send + Sync>;
 
 pub trait EventCallbackExt {
     /// Wraps the callback with default handling for `LoreEvent::Log`.
-    /// `LoreEvent::Error` is swallowed — a failing completion routes its
-    /// message through `LoreEvent::Log(level=Error)`.
     fn with_defaults(self) -> Self;
 }
 
 impl EventCallbackExt for EventCallbackFn {
     fn with_defaults(self) -> Self {
         Box::new(move |event: &LoreEvent| match event {
-            LoreEvent::Error(_) => {}
             LoreEvent::Log(data) => {
                 crate::logging::handle_log_event(data);
             }

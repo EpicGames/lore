@@ -23,7 +23,6 @@ use crate::event;
 use crate::immutable;
 use crate::immutable::ImmutableError;
 use crate::immutable::ReadFromImmutable;
-use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lore::Address;
 use crate::lore::BranchId;
@@ -44,15 +43,6 @@ pub const DEFAULT_SEARCH_LIMIT: usize = 1000;
 pub enum FindError {
     Cancelled,
     SlowDown,
-}
-
-impl event::EventError for FindError {
-    fn translated(&self) -> LoreError {
-        match self {
-            FindError::SlowDown(_) => LoreError::SlowDown,
-            FindError::Cancelled(_) | FindError::Internal(_) => LoreError::Internal,
-        }
-    }
 }
 
 pub enum FindMatchResult {

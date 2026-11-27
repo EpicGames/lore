@@ -32,7 +32,6 @@ use crate::change;
 use crate::change::FileAction;
 use crate::errors::*;
 use crate::event;
-use crate::event::EventError;
 use crate::file::dirty::MovedNode;
 use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::CaseLookup;
@@ -45,7 +44,6 @@ use crate::fs::hold;
 use crate::immutable;
 use crate::infer::ConflictMarkers;
 use crate::interface::LoreArray;
-use crate::interface::LoreError;
 use crate::interface::LoreMetadataType;
 use crate::interface::LoreString;
 use crate::layer;
@@ -333,16 +331,6 @@ pub enum CommitError {
     RepositoryNotFound,
     SharedStoreNotFound,
     TokenNotFound,
-}
-
-impl EventError for CommitError {
-    fn translated(&self) -> LoreError {
-        LoreError::Internal
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 #[lore_macro::test_pub]

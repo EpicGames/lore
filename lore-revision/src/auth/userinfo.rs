@@ -14,10 +14,8 @@ use lore_transport::UserService;
 use serde::Serialize;
 
 use crate::errors::*;
-use crate::event::EventError;
 use crate::event::LoreEvent;
 use crate::interface::LoreArray;
-use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lore::RepositoryId;
 use crate::lore::execution_context;
@@ -37,16 +35,6 @@ pub enum UserInfoError {
     NotSupported,
     Oversized,
     SlowDown,
-}
-
-impl EventError for UserInfoError {
-    fn translated(&self) -> LoreError {
-        LoreError::Internal
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Event data resolving a user identity to a display name.

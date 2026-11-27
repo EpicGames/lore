@@ -1289,49 +1289,6 @@ fn install_crypto_provider() -> Result<(), String> {
         })
 }
 
-/// Error codes returned across the FFI boundary.
-///
-/// Every discriminant except the legacy categories and `Internal` matches the
-/// `#[ffi_code(..)]` of the same-named struct in [`lore_base::error`], so a
-/// caller comparing a `status` against one of these names gets the same answer
-/// as a caller comparing it against the discrete type's code. The grouped
-/// allocation those codes come from is documented on that module.
-///
-/// cbindgen:prefix-with-name
-/// cbindgen:rename-all=ScreamingSnakeCase
-#[repr(i32)]
-#[derive(Eq, PartialEq)]
-pub enum LoreError {
-    /// The arguments supplied to the operation were invalid.
-    InvalidArguments = 3,
-    /// The backing store is overloaded; the caller should retry later.
-    SlowDown = 31,
-    /// No Lore service could be reached, and none could be started, so the
-    /// operation did not run.
-    ServiceUnavailable = 32,
-    /// A content-addressable object could not be found in any store.
-    AddressNotFound = 80,
-    /// A payload blob could not be found with the associated hash.
-    PayloadNotFound = 81,
-    /// A file path could not be resolved to a tracked node or found in the file system.
-    FileNotFound = 82,
-    /// A blob exceeded a size limit enforced by the caller or the protocol.
-    Oversized = 118,
-
-    // Legacy error categories (transitional, will be removed). They sit in the
-    // 100–109 range that `lore_base::error` reserves for them, so no discrete
-    // error type is ever allocated a code that collides with one of these.
-    /// A requested item was not found.
-    NotFound = 101,
-    /// An item that was being created already exists.
-    AlreadyExists = 102,
-    /// A connection could not be established or was lost.
-    Connection = 103,
-
-    /// An internal error occurred.
-    Internal = -1,
-}
-
 /// A metadata value, tagged by the kind of value it holds.
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase

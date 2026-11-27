@@ -39,7 +39,6 @@ use crate::branch;
 use crate::dependency;
 use crate::errors::*;
 use crate::event;
-use crate::event::EventError;
 use crate::filter;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
@@ -52,7 +51,6 @@ use crate::fs::hold;
 use crate::hash::hash_string_bytes;
 use crate::instance::InstanceId;
 use crate::interface::LoreArray;
-use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::layer;
 use crate::lore::Hash;
@@ -145,33 +143,6 @@ pub enum CloneError {
     TokenNotFound,
     NotConnected,
     MissingIdentity,
-}
-
-impl EventError for CloneError {
-    fn translated(&self) -> LoreError {
-        match self {
-            CloneError::Disconnected(_) => LoreError::Connection,
-            CloneError::SlowDown(_) => LoreError::SlowDown,
-            CloneError::Oversized(_) => LoreError::Oversized,
-            CloneError::FileNotFound(_) => LoreError::FileNotFound,
-            CloneError::NotFound(_)
-            | CloneError::BranchNotFound(_)
-            | CloneError::RevisionNotFound(_)
-            | CloneError::LayerNotFound(_)
-            | CloneError::LinkNotFound(_)
-            | CloneError::NodeNotFound(_) => LoreError::NotFound,
-            CloneError::AddressNotFound(_) => LoreError::AddressNotFound,
-            CloneError::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            CloneError::InvalidPath(_) | CloneError::InvalidArguments(_) => {
-                LoreError::InvalidArguments
-            }
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 #[lore_macro::test_pub]

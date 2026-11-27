@@ -112,8 +112,6 @@ pub enum DiffError {
     MissingIdentity,
 }
 
-impl crate::event::EventError for DiffError {}
-
 /// A request scoped *inside* a link asks for that subtree, so the link's own
 /// entry is left out.
 #[lore_macro::test_pub]

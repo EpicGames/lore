@@ -12,14 +12,12 @@ use crate::change::NodeChange;
 use crate::diff;
 use crate::errors::*;
 use crate::event;
-use crate::event::EventError;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::immutable;
 use crate::immutable::read_options_from_repository;
 use crate::infer::infer_is_diffable_by_slice;
-use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
 use crate::lore::execution_context;
@@ -89,23 +87,6 @@ pub enum DiffError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
-}
-
-impl EventError for DiffError {
-    fn translated(&self) -> LoreError {
-        match self {
-            DiffError::InvalidArguments(_) | DiffError::InvalidPath(_) => {
-                LoreError::InvalidArguments
-            }
-            DiffError::RevisionNotFound(_) | DiffError::NotFound(_) => LoreError::NotFound,
-            DiffError::FileNotFound(_) => LoreError::FileNotFound,
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Data for the event carrying the diff of a single file.

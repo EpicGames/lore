@@ -274,7 +274,6 @@ mod tests {
     /// An event a C callback received, reduced to what a caller reads from it.
     #[derive(Debug, PartialEq)]
     enum Delivered {
-        Error,
         Complete {
             status: i32,
             error_code: i32,
@@ -290,7 +289,6 @@ mod tests {
 
     unsafe extern "C" fn record(event: &LoreEvent, _user_context: u64) {
         let delivered = match event {
-            LoreEvent::Error(_) => Delivered::Error,
             LoreEvent::Complete(data) => Delivered::Complete {
                 status: data.status,
                 error_code: data.error.error_code,
@@ -1327,7 +1325,7 @@ mod tests {
 
     /// A relayed call that reaches no service reports as a failing command does:
     /// the code on the return value and on one `Complete` carrying the detail,
-    /// then `End`, with no legacy `Error` event.
+    /// then `End`.
     #[test]
     #[serial]
     fn a_relayed_call_that_reaches_no_service_completes_with_the_failure() {

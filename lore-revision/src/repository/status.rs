@@ -23,7 +23,6 @@ use crate::change::FileAction;
 use crate::change::NodeChange;
 use crate::errors::*;
 use crate::event;
-use crate::event::EventError;
 use crate::file::stage::LayerRoute;
 use crate::file::stage::classify_stage_path;
 use crate::filter::FilterMode;
@@ -34,7 +33,6 @@ use crate::fs::filesystem_provider::FilesystemDiffTree;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation_if;
-use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreNodeType;
 use crate::interface::LoreString;
@@ -410,30 +408,6 @@ pub enum StatusError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
-}
-
-impl EventError for StatusError {
-    fn translated(&self) -> LoreError {
-        match self {
-            StatusError::Disconnected(_) => LoreError::Connection,
-            StatusError::SlowDown(_) => LoreError::SlowDown,
-            StatusError::Oversized(_) => LoreError::Oversized,
-            StatusError::FileNotFound(_) => LoreError::FileNotFound,
-            StatusError::NotFound(_)
-            | StatusError::LayerNotFound(_)
-            | StatusError::RevisionNotFound(_) => LoreError::NotFound,
-            StatusError::AddressNotFound(_) => LoreError::AddressNotFound,
-            StatusError::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            StatusError::InvalidArguments(_) | StatusError::InvalidPath(_) => {
-                LoreError::InvalidArguments
-            }
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 #[derive(Clone, Debug)]

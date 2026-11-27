@@ -10,7 +10,6 @@
 
 use lore::revision_tree::handle::LoreRevisionTree;
 use lore_revision::event::LoreErrorCode;
-use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreNodeType;
 use lore_revision::node::NodeID;
 use lore_revision::state::node::hooks;
@@ -26,7 +25,7 @@ use crate::park::Parks;
 use crate::park::until_parked;
 
 /// The status a call that gave up under concurrent changes completes with.
-const SLOW_DOWN: i32 = LoreError::SlowDown as i32;
+const SLOW_DOWN: i32 = LoreErrorCode::SlowDown as i32;
 
 /// The codes a call reported on its entries and on its batch, and the status it completed with.
 fn outcome(events: &Events) -> (Vec<LoreErrorCode>, Vec<LoreErrorCode>, i32) {

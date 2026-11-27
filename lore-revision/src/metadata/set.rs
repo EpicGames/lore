@@ -63,20 +63,6 @@ pub enum SetError {
     FileNotFound,
 }
 
-impl event::EventError for SetError {
-    fn translated(&self) -> crate::interface::LoreError {
-        match self {
-            SetError::InvalidArguments(_) => crate::interface::LoreError::InvalidArguments,
-            SetError::Disconnected(_) => crate::interface::LoreError::Connection,
-            _ => crate::interface::LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
-}
-
 pub(crate) async fn set_revision(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,

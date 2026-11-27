@@ -31,7 +31,6 @@ use crate::commit;
 use crate::commit::CommitOptions;
 use crate::errors::*;
 use crate::event;
-use crate::event::EventError;
 use crate::filter::Filter;
 use crate::filter::FilterMode;
 use crate::find;
@@ -42,7 +41,6 @@ use crate::fs::realize;
 use crate::immutable;
 use crate::infer::ConflictMarkers;
 use crate::interface::LoreArray;
-use crate::interface::LoreError;
 use crate::interface::LoreEvent;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
@@ -469,31 +467,6 @@ pub enum MergeError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
-}
-
-impl EventError for MergeError {
-    fn translated(&self) -> LoreError {
-        match self {
-            MergeError::Disconnected(_) => LoreError::Connection,
-            MergeError::SlowDown(_) => LoreError::SlowDown,
-            MergeError::Oversized(_) => LoreError::Oversized,
-            MergeError::FileNotFound(_) => LoreError::FileNotFound,
-            MergeError::NotFound(_)
-            | MergeError::BranchNotFound(_)
-            | MergeError::LayerNotFound(_)
-            | MergeError::RevisionNotFound(_) => LoreError::NotFound,
-            MergeError::AddressNotFound(_) => LoreError::AddressNotFound,
-            MergeError::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            MergeError::InvalidPath(_) | MergeError::InvalidArguments(_) => {
-                LoreError::InvalidArguments
-            }
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Controls which repositories participate in a merge operation.

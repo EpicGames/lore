@@ -54,8 +54,6 @@ mod tests {
     struct CapturedComplete {
         // Number of `Complete` events seen, to assert exactly one arrives.
         complete_count: u32,
-        // Set if any mid-stream `Error` event arrives.
-        error_event_seen: bool,
         status: i32,
         error_code: i32,
         message: String,
@@ -83,9 +81,6 @@ mod tests {
     unsafe extern "C" fn record_event(event: &LoreEvent, user_context: u64) {
         let sink = *registry().lock().unwrap().get(&user_context).unwrap();
         match event {
-            LoreEvent::Error(_) => {
-                sink.captured.lock().unwrap().error_event_seen = true;
-            }
             LoreEvent::Complete(data) => {
                 let mut captured = sink.captured.lock().unwrap();
                 captured.complete_count += 1;
@@ -218,10 +213,6 @@ mod tests {
 
         let captured = sink.captured.lock().unwrap();
 
-        assert!(
-            !captured.error_event_seen,
-            "a failing op must not emit an Error event"
-        );
         // Exactly one error-bearing event reaches the consumer.
         assert_eq!(captured.complete_count, 1, "exactly one Complete event");
 
@@ -363,10 +354,6 @@ mod tests {
 
         let captured = sink.captured.lock().unwrap();
         assert_eq!(captured.complete_count, 1, "exactly one Complete event");
-        assert!(
-            !captured.error_event_seen,
-            "a failing async op must not emit an Error event"
-        );
 
         let expected_code = repository_not_found_code(&path);
         assert_eq!(

@@ -16,9 +16,22 @@ from error_types import (
     NotFound,
     ZeroRevisionError,
 )
-from lore_parsers import parse_branch_list_json, parse_jsonl, parse_status_json
+from lore_parsers import (
+    parse_branch_list_json,
+    parse_complete_json,
+    parse_jsonl,
+    parse_status_json,
+)
 
 from lore import Lore, verify_signatures
+
+
+#: The error code of `DeleteProtected`: the branch to archive is protected.
+DELETE_PROTECTED = 47
+#: The error code of `DeleteCurrent`: the branch to archive is the current branch.
+DELETE_CURRENT = 48
+#: The error code of `DeleteDefault`: the branch to archive is the default branch.
+DELETE_DEFAULT = 49
 
 
 def generate_branch_id() -> str:
@@ -93,15 +106,17 @@ def test_branch(new_lore_repo):
     with pytest.raises(DeleteCurrentError):
         repo.branch_archive("test-branch")
     # Verify we cannot delete default branch
-    with pytest.raises(DeleteDefaultError):
+    with pytest.raises(DeleteDefaultError) as failure:
         repo.branch_archive("main")
+    assert failure.value.returncode == DELETE_DEFAULT
 
     # Verify protected branches can't be deleted
     repo.branch_switch("main")
     repo.repository_verify()
     repo.branch_protect("test-branch")
-    with pytest.raises(DeleteProtectedError):
+    with pytest.raises(DeleteProtectedError) as failure:
         repo.branch_archive("test-branch")
+    assert failure.value.returncode == DELETE_PROTECTED
 
     # Unprotect and verify we can delete the branch
     repo.branch_unprotect("test-branch")
@@ -383,6 +398,24 @@ def test_branch(new_lore_repo):
         assert repo.file_exists(file), (
             "Branch switch with --force --reset deleted an untracked file"
         )
+
+
+@pytest.mark.smoke
+def test_branch_archive_current_fails_with_delete_current(new_lore_repo):
+    """Archiving the current branch fails with `DeleteCurrent`'s code and leaves it live."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push(None, {"file.txt": b"content"})
+    repo.branch_create("feature")
+
+    with pytest.raises(DeleteCurrentError) as failure:
+        repo.branch_archive("feature", json=True)
+
+    assert failure.value.returncode == DELETE_CURRENT
+    complete = parse_complete_json(str(failure.value))
+    assert complete is not None, f"Expected a complete event, got: {failure.value}"
+    assert complete["status"] == DELETE_CURRENT
+    assert complete["error"]["errorCode"] == DELETE_CURRENT
+    assert repo.has_branch("feature")
 
 
 @pytest.mark.smoke

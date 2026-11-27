@@ -64,7 +64,7 @@ const RESERVED: &[(RangeInclusive<i32>, &str)] = &[
         "the CLI's usage exit, and the shell's misuse-of-a-builtin",
     ),
     (64..=78, "the BSD sysexits.h codes"),
-    (100..=109, "the legacy LoreError categories"),
+    (100..=109, "the error categories older Lore releases report"),
     (
         126..=128,
         "the shell's not-executable, not-found, and bad-exit-argument statuses",

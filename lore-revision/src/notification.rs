@@ -30,8 +30,6 @@ pub enum NotificationError {
     NotAuthorized,
 }
 
-impl crate::event::EventError for NotificationError {}
-
 /// Data for a notification that a branch received a new revision.
 #[repr(C)]
 #[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]

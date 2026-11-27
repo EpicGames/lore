@@ -94,17 +94,13 @@ mod tests {
         let keys_received_ = Arc::clone(&keys_received);
         let values_received_ = Arc::clone(&values_received);
 
-        let callback = Some(Box::new(move |event: &LoreEvent| match event {
-            LoreEvent::Metadata(data) => {
-                if let LoreMetadata::String(value) = &data.value {
-                    keys_received_.lock().push(data.key.as_str().to_string());
-                    values_received_.lock().push(value.as_str().to_string());
-                }
+        let callback = Some(Box::new(move |event: &LoreEvent| {
+            if let LoreEvent::Metadata(data) = event
+                && let LoreMetadata::String(value) = &data.value
+            {
+                keys_received_.lock().push(data.key.as_str().to_string());
+                values_received_.lock().push(value.as_str().to_string());
             }
-            LoreEvent::Error(data) => {
-                eprintln!("Error {}: {}", data.error_type, data.error_inner.as_str());
-            }
-            _ => (),
         }) as Box<_>);
 
         let args = LoreRevisionMetadataListArgs {
@@ -139,17 +135,13 @@ mod tests {
         let key_received_ = Arc::clone(&key_received);
         let value_received_ = Arc::clone(&value_received);
 
-        let callback = Some(Box::new(move |event: &LoreEvent| match event {
-            LoreEvent::Metadata(data) => {
-                if let LoreMetadata::String(value) = &data.value {
-                    *key_received_.lock() = data.key.to_string();
-                    *value_received_.lock() = value.to_string();
-                }
+        let callback = Some(Box::new(move |event: &LoreEvent| {
+            if let LoreEvent::Metadata(data) = event
+                && let LoreMetadata::String(value) = &data.value
+            {
+                *key_received_.lock() = data.key.to_string();
+                *value_received_.lock() = value.to_string();
             }
-            LoreEvent::Error(data) => {
-                eprintln!("Error {}: {}", data.error_type, data.error_inner.as_str());
-            }
-            _ => (),
         }) as Box<_>);
 
         let args = LoreRevisionMetadataGetArgs {
@@ -273,17 +265,13 @@ mod tests {
         let keys_received_ = Arc::clone(&keys_received);
         let values_received_ = Arc::clone(&values_received);
 
-        let callback = Some(Box::new(move |event: &LoreEvent| match event {
-            LoreEvent::Metadata(data) => {
-                if let LoreMetadata::String(value) = &data.value {
-                    keys_received_.lock().push(data.key.as_str().to_string());
-                    values_received_.lock().push(value.as_str().to_string());
-                }
+        let callback = Some(Box::new(move |event: &LoreEvent| {
+            if let LoreEvent::Metadata(data) = event
+                && let LoreMetadata::String(value) = &data.value
+            {
+                keys_received_.lock().push(data.key.as_str().to_string());
+                values_received_.lock().push(value.as_str().to_string());
             }
-            LoreEvent::Error(data) => {
-                eprintln!("Error {}: {}", data.error_type, data.error_inner.as_str());
-            }
-            _ => (),
         }) as Box<_>);
 
         let args = LoreFileMetadataListArgs {
@@ -319,17 +307,13 @@ mod tests {
         let key_received_ = Arc::clone(&key_received);
         let value_received_ = Arc::clone(&value_received);
 
-        let callback = Some(Box::new(move |event: &LoreEvent| match event {
-            LoreEvent::Metadata(data) => {
-                if let LoreMetadata::String(value) = &data.value {
-                    *key_received_.lock() = data.key.as_str().to_string();
-                    *value_received_.lock() = value.as_str().to_string();
-                }
+        let callback = Some(Box::new(move |event: &LoreEvent| {
+            if let LoreEvent::Metadata(data) = event
+                && let LoreMetadata::String(value) = &data.value
+            {
+                *key_received_.lock() = data.key.as_str().to_string();
+                *value_received_.lock() = value.as_str().to_string();
             }
-            LoreEvent::Error(data) => {
-                eprintln!("Error {}: {}", data.error_type, data.error_inner.as_str());
-            }
-            _ => (),
         }) as Box<_>);
 
         let args = LoreFileMetadataGetArgs {
@@ -384,17 +368,13 @@ mod tests {
         let key_received_ = Arc::clone(&key_received);
         let value_received_ = Arc::clone(&value_received);
 
-        let callback = Some(Box::new(move |event: &LoreEvent| match event {
-            LoreEvent::Metadata(data) => {
-                if let LoreMetadata::Address(value) = data.value {
-                    *key_received_.lock() = data.key.as_str().to_string();
-                    *value_received_.lock() = value.to_string();
-                }
+        let callback = Some(Box::new(move |event: &LoreEvent| {
+            if let LoreEvent::Metadata(data) = event
+                && let LoreMetadata::Address(value) = data.value
+            {
+                *key_received_.lock() = data.key.as_str().to_string();
+                *value_received_.lock() = value.to_string();
             }
-            LoreEvent::Error(data) => {
-                eprintln!("Error {}: {}", data.error_type, data.error_inner.as_str());
-            }
-            _ => (),
         }) as Box<_>);
 
         let args = LoreFileMetadataGetArgs {

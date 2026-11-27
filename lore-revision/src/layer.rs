@@ -14,13 +14,11 @@ use crate::branch;
 use crate::change;
 use crate::errors::*;
 use crate::event;
-use crate::event::EventError;
 use crate::find;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
-use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::link;
 use crate::lore::BranchId;
@@ -98,16 +96,6 @@ pub enum LayerError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
-}
-
-impl EventError for LayerError {
-    fn translated(&self) -> LoreError {
-        LoreError::Internal
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Data for the event emitted when a layer is added.

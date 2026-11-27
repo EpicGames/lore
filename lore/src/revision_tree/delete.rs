@@ -15,13 +15,11 @@ use lore_base::runtime::processor_count;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
-use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_tree::LoreRevisionTreeBatchCompleteEventData;
 use lore_revision::event::revision_tree::LoreRevisionTreeDeleteCompleteEventData;
 use lore_revision::interface::LoreArray;
-use lore_revision::interface::LoreError;
 use lore_revision::node::Node;
 use lore_revision::node::NodeBlock;
 use lore_revision::node::NodeID;
@@ -104,20 +102,6 @@ impl DeleteError {
     }
 }
 
-impl EventError for DeleteError {
-    fn translated(&self) -> LoreError {
-        match self {
-            DeleteError::InvalidArguments(_) => LoreError::InvalidArguments,
-            DeleteError::SlowDown(_) => LoreError::SlowDown,
-            DeleteError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
-}
-
 fn emit_delete_complete(entry_id: u64, node_count: u64, error_code: LoreErrorCode) {
     LoreEvent::RevisionTreeDeleteComplete(LoreRevisionTreeDeleteCompleteEventData {
         entry_id,
@@ -141,17 +125,6 @@ fn emit_batch_complete(batch_id: u64, error_code: LoreErrorCode) {
         error_code,
     })
     .send();
-}
-
-/// The code the batch terminal reports for a finished call.
-#[lore_macro::test_pub]
-fn batch_error_code(result: &Result<(), DeleteError>) -> LoreErrorCode {
-    match result {
-        Ok(()) => LoreErrorCode::None,
-        Err(DeleteError::InvalidArguments(_)) => LoreErrorCode::InvalidArguments,
-        Err(DeleteError::SlowDown(_)) => LoreErrorCode::SlowDown,
-        Err(DeleteError::Internal(_)) => LoreErrorCode::Internal,
-    }
 }
 
 /// An entry the planning refused: the whole batch is rejected as a bad argument, attributed to
@@ -384,7 +357,7 @@ impl Tally for Runs {
             _ => self.0.push(Run {
                 entry,
                 count: by,
-                failure: EntryFailure::None,
+                failure: EntryFailure::NONE,
             }),
         }
     }
@@ -406,7 +379,7 @@ impl Applied {
     fn new(entry_count: usize) -> Self {
         Self {
             counts: vec![0u64; entry_count],
-            failed: vec![EntryFailure::None; entry_count],
+            failed: vec![EntryFailure::NONE; entry_count],
         }
     }
 
@@ -423,7 +396,7 @@ impl Applied {
     /// that failed slowed, `INTERNAL` otherwise.
     fn emit(self, planned: &[Planned]) -> Result<(), DeleteError> {
         let mut failures = 0usize;
-        let mut strongest = EntryFailure::None;
+        let mut strongest = EntryFailure::NONE;
         for (index, item) in planned.iter().enumerate() {
             let failure = self.failed[index];
             if failure.failed() {
@@ -557,7 +530,7 @@ impl Found for LevelFound<Applied> {
     }
 
     fn fail_item(&mut self, item: &Tracked) {
-        self.tally.fail(item.entry_index, EntryFailure::Internal);
+        self.tally.fail(item.entry_index, EntryFailure::INTERNAL);
     }
 }
 
@@ -579,7 +552,7 @@ impl Found for Applied {
     }
 
     fn fail_item(&mut self, root: &AddedRoot) {
-        self.fail(root.entry_index, EntryFailure::Internal);
+        self.fail(root.entry_index, EntryFailure::INTERNAL);
     }
 }
 
@@ -602,7 +575,7 @@ async fn mark_group<T: Tally>(
                 }
             }
             Ok(LevelMark::Staged) => {}
-            Ok(LevelMark::Other) => found.tally.fail(item.entry_index, EntryFailure::Internal),
+            Ok(LevelMark::Other) => found.tally.fail(item.entry_index, EntryFailure::INTERNAL),
             Err(error) => found.tally.fail(item.entry_index, EntryFailure::of(&error)),
         }
     }
@@ -761,7 +734,7 @@ async fn detach_group<T: Tally>(
             .await
         {
             Ok(Some(count)) => tally.count(root.entry_index, count),
-            Ok(None) => tally.fail(root.entry_index, EntryFailure::Internal),
+            Ok(None) => tally.fail(root.entry_index, EntryFailure::INTERNAL),
             Err(error) => tally.fail(root.entry_index, EntryFailure::of(&error)),
         }
     }
@@ -840,8 +813,8 @@ async fn check_entries(
     for (entry_index, item) in planned.iter().enumerate() {
         if tracked_below_added {
             let failure = match mixed(state, context, item, &mut pending).await {
-                Ok(false) => EntryFailure::None,
-                Ok(true) => EntryFailure::Internal,
+                Ok(false) => EntryFailure::NONE,
+                Ok(true) => EntryFailure::INTERNAL,
                 Err(error) => EntryFailure::of(&error),
             };
             if failure.failed() {
@@ -916,7 +889,8 @@ async fn check_entries(
 /// Atomicity covers the rules checked here, which is every rule a caller can
 /// break through the arguments. A failure after the checks pass — a block that
 /// cannot be read, or a tree changing under the walk — belongs to the entry
-/// whose subtree hit it: that entry reports `INTERNAL` with nothing removed,
+/// whose subtree hit it: that entry reports the State's own code, or `INTERNAL`
+/// for a tree that changed under the walk, with nothing removed,
 /// every other entry reports its own outcome, and the call reports `INTERNAL`
 /// for the batch. An entry the tree gave up on under load, heavy concurrent
 /// change or a store asking it to slow down, reports `SLOW_DOWN` instead, which a
@@ -1052,7 +1026,7 @@ async fn delete_impl(
         async move |internal: Arc<RevisionTreeInternal>, args: LoreRevisionTreeDeleteArgs| {
             let call_id = args.batch_id;
             let result = delete_batch(internal, args).await;
-            emit_batch_complete(call_id, batch_error_code(&result));
+            emit_batch_complete(call_id, LoreErrorCode::of(&result));
             result
         },
     )

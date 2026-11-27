@@ -14,7 +14,7 @@ use lore::file;
 use lore::interface::LoreArray;
 use lore::interface::LoreBranchCreateArgs;
 use lore::interface::LoreBranchMergeStartArgs;
-use lore::interface::LoreErrorEventData;
+use lore::interface::LoreCompleteEventData;
 use lore::interface::LoreEvent;
 use lore::interface::LoreFileStageArgs;
 use lore::interface::LoreGlobalArgs;
@@ -53,14 +53,14 @@ impl LoreInterface {
         }
     }
 
-    fn handle_lore_error(error: &LoreErrorEventData) {
+    fn handle_lore_failure(complete: &LoreCompleteEventData) {
         // Cannot use `self` because this needs to be called from task callbacks.
         error!(
-            error.error_type,
-            error_inner = error.error_inner.to_string(),
+            complete.status,
+            message = complete.error.message.to_string(),
             "Lore Error"
         );
-        panic!("Lore Error: {} {}", error.error_type, error.error_inner);
+        panic!("Lore Error: {} {}", complete.status, complete.error.message);
     }
 
     fn handle_lore_log(data: &LoreLogEventData) {
@@ -79,8 +79,8 @@ macro_rules! error_and_log {
     ($span:ident, $event:ident) => {{
         let _span_guard = $span.clone().entered();
         match $event {
-            LoreEvent::Error(error) => {
-                Self::handle_lore_error(&error);
+            LoreEvent::Complete(complete) if complete.status != 0 => {
+                Self::handle_lore_failure(&complete);
             }
             LoreEvent::Log(data) => {
                 Self::handle_lore_log(&data);
@@ -120,8 +120,8 @@ impl LoreInterface {
                 LoreEvent::BranchMergeConflictFile(data) => {
                     conflicts_clone.lock().push(data.path.clone());
                 }
-                LoreEvent::Error(error) => {
-                    Self::handle_lore_error(error);
+                LoreEvent::Complete(complete) if complete.status != 0 => {
+                    Self::handle_lore_failure(complete);
                 }
                 _ => {}
             })),

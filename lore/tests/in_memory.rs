@@ -95,9 +95,6 @@ mod tests {
             LoreEvent::Complete(data) => {
                 *status_ok_.lock() = data.status == 0;
             }
-            LoreEvent::Error(data) => {
-                eprintln!("Error {}: {}", data.error_type, data.error_inner.as_str());
-            }
             _ => (),
         }) as Box<_>);
 
@@ -193,15 +190,6 @@ mod tests {
 
         // Status after release should fail to open repository (stores are gone,
         // no files on disk to fall back to)
-        let post_release_error: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-        let post_release_error_ = Arc::clone(&post_release_error);
-
-        let callback = Some(Box::new(move |event: &LoreEvent| {
-            if let LoreEvent::Error(_) = event {
-                *post_release_error_.lock() = true;
-            }
-        }) as Box<_>);
-
         let args = LoreRepositoryStatusArgs {
             staged: 1,
             scan: 0,
@@ -212,12 +200,9 @@ mod tests {
             count: 0,
             paths: LoreArray::default(),
         };
-        let result = lore::repository::status(globals.clone(), args, callback).await;
-        // After release, opening the repository with in-memory stores should
-        // give us a fresh (empty) store, so status should either fail or
-        // return with no revision data. Either way the old commit is gone.
-        assert!(
-            result != 0 || *post_release_error.lock(),
+        let result = lore::repository::status(globals.clone(), args, None).await;
+        assert_ne!(
+            result, 0,
             "Status after release should error — old in-memory data should be gone"
         );
     }
@@ -281,15 +266,11 @@ mod tests {
         let directories_ = Arc::clone(&directories);
         let files_ = Arc::clone(&files);
 
-        let callback = Some(Box::new(move |event: &LoreEvent| match event {
-            LoreEvent::RepositoryStatusCount(data) => {
+        let callback = Some(Box::new(move |event: &LoreEvent| {
+            if let LoreEvent::RepositoryStatusCount(data) = event {
                 *directories_.lock() = Some(data.directories);
                 *files_.lock() = Some(data.files);
             }
-            LoreEvent::Error(data) => {
-                eprintln!("Error {}: {}", data.error_type, data.error_inner.as_str());
-            }
-            _ => (),
         }) as Box<_>);
 
         let args = LoreRepositoryStatusArgs {

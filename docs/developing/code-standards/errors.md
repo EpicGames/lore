@@ -8,10 +8,9 @@ Lore uses a layered error handling approach:
 
 1. **Discrete error types** — One `thiserror` struct per FFI code, all declared in `lore-base/src/error.rs`.
 2. **Error sets** — Per-module `#[error_set]` enums naming the discrete types that module can produce.
-3. **Forwarding** — Moving an error between sets with `.forward`, preserving variants and trace (see section 5).
-4. **Public error interface** — The `LoreError` enum and the `EventError` trait (legacy; see section 4).
+3. **Forwarding** — Moving an error between sets with `.forward`, preserving variants and trace (see section 3).
 
-The canonical contract a C API consumer reads on a failure is the FFI error code on `status`, the return value, and the `error` detail on the `Complete` event. See [section 4](#4-ffi-error-reporting-contract). `LoreError` and `EventError` are legacy and kept only for transition.
+A C API consumer reads a failure as the error code on `status`, the return value, and the `error` detail on the `Complete` event. See [section 2](#2-ffi-error-reporting-contract).
 
 ---
 
@@ -60,40 +59,9 @@ The macro adds an `Internal` variant, `is_*()` predicates, `From` impls, and the
 
 ---
 
-## 2. Public error interface (LoreError)
+## 2. FFI error reporting contract
 
-Defined in `lore-revision/src/interface.rs`. `LoreError` is a legacy, coarse-grained category kept for API compatibility; `EventError::translated()` maps each error set to one of its variants. It is not the code a consumer should key logic on — that is `error_code` (see [section 4](#4-ffi-error-reporting-contract)), which comes from the discrete type's own `#[ffi_code(N)]`.
-
-The variants and their values are the `LoreError` enum itself, each documented where it is declared. Every value matches the `#[ffi_code(..)]` of the same-named struct in `lore-base/src/error.rs`, so the two agree for any code a caller reads. See [Error code allocation](#error-code-allocation) for how those codes are assigned.
-
-The `NotFound` (101), `AlreadyExists` (102), and `Connection` (103) variants are legacy categories kept for transition and will be removed. They sit in the 100–109 range that `lore-base` reserves for them, so no discrete error type is allocated a code that collides with one of them.
-
----
-
-## 3. EventError trait
-
-Defined in `lore-revision/src/event.rs`. Domain errors in `lore-revision` that surface to users MUST implement this trait. Both methods have default bodies — `translated()` returns `LoreError::Internal`, `inner()` returns `self.to_string()` — so a set whose variants all surface as internal needs no body at all:
-
-```rust
-impl EventError for ModuleError {}
-```
-
-Override `translated()` for the variants that must surface as something other than `Internal`, matching through the generated `Matched*` view:
-
-```rust
-fn translated(&self) -> LoreError {
-    match self {
-        MatchedModuleError::FileNotFound(_) => LoreError::NotFound,
-        _ => LoreError::Internal,
-    }
-}
-```
-
----
-
-## 4. FFI error reporting contract
-
-This section describes what a consumer of the C API reads on a failure. It is the canonical contract; the older `LoreError` and `EventError` paths above are legacy and kept only for transition.
+This section describes what a consumer of the C API reads on a failure.
 
 ### The code carries on `status` and the return value
 
@@ -118,14 +86,11 @@ Each `LoreTraceLocation` holds a `file`, a `line`, a `column`, and a per-locatio
 
 `status` and `error.error_code` always hold the same value, by construction.
 
-### `error_code` is canonical; `error_type` and `LoreError` are legacy
+### `lore_error_code_t` names every code
 
-- `error_code` (on `LoreErrorDetail`, and the equal `Complete.status`) is the canonical code a consumer reads. It is the error's FFI code.
-- `error_type` on the legacy `LoreErrorEventData`, and the `LoreError` enum, are legacy. They disagree with `error_code` for most errors. Do not use them for new consumers.
+`lore_error_code_t` in `lore.h` is the C name of every error code: one enumerator for each discrete type in `lore-base/src/error.rs`, named after it and equal to its code, beside `LORE_ERROR_CODE_NONE` (`0`) and `LORE_ERROR_CODE_INTERNAL` (`-1`). `status`, the return value and `error_code` are `int32_t` and carry its values. The Rust enum behind it is `LoreErrorCode`, beside the registry. `LoreErrorCode::from_ffi_code` turns an error's code into it, and a code no type carries into `Internal`.
 
-### No mid-stream `Error` event on a terminal failure
-
-The library no longer emits a mid-stream `LORE_EVENT_ERROR` event on a terminal failure. The full error detail arrives on the `Complete` event instead. A failing operation delivers exactly one error-bearing event: the enriched `Complete`.
+The revision-tree API's per-item events carry a `lore_error_code_t`: the code of the failure that ended the item. A failure of the State can report any code of the State's error set there, while `Complete` reports the verb's own code. The storage API's per-item events carry a full `lore_error_detail_t` instead.
 
 ### Error code allocation
 
@@ -145,7 +110,7 @@ Every code is also a process exit status. The CLI returns the failing error's co
 | 56–63 | Already exists | Creating a resource that is already there. |
 | 64–78 | *reserved* | The BSD `sysexits.h` codes (`EX_USAGE` through `EX_CONFIG`). |
 | 79–99 | Not found | A named resource doesn't exist. |
-| 100–109 | *reserved* | The legacy `LoreError` categories (101, 102, 103). |
+| 100–109 | *reserved* | Not allocated: older Lore releases report 101, 102 and 103 as categories of error. |
 | 110–117 | Configuration | Something the operation needs was never configured. |
 | 118–125 | Resource limits | A size, depth, or efficiency bound was hit. |
 | 126–128 | *reserved* | The shell's "found but not executable", "not found", and "bad argument to exit". |
@@ -156,7 +121,7 @@ Every code is also a process exit status. The CLI returns the failing error's co
 
 The trait carries a code as `i32` rather than a `u8` because `Internal` is `-1`, which isn't a code allocated here. A caller reading the library's `int32` return value or `Complete.status` sees `-1`; a caller reading the CLI's exit status sees 255.
 
-**Adding an error type:** put it in the block that matches its group and take the next free code in that block. Never renumber an existing code to close a gap — the gaps are the headroom that keeps a group contiguous, and the tests hold every block clear of the reserved values, so anything taken from that headroom is a usable exit status. New groups come out of 201–254. A type whose name ends in `NotFound` goes in the not-found block even when it belongs to a subsystem with errors elsewhere: `PluginNotFound` sits with the other not-found codes, not with the other plugin codes. The tests at the bottom of `lore-base/src/error.rs` hold these invariants: register the new type in `registry()` there, and they check its code against its group's block, against every other code, and against the reserved ranges.
+**Adding an error type:** put it in the block that matches its group and take the next free code in that block. Never renumber an existing code to close a gap — the gaps are the headroom that keeps a group contiguous, and the tests hold every block clear of the reserved values, so anything taken from that headroom is a usable exit status. New groups come out of 201–254. A type whose name ends in `NotFound` goes in the not-found block even when it belongs to a subsystem with errors elsewhere: `PluginNotFound` sits with the other not-found codes, not with the other plugin codes. The tests in `lore-base/tests/unit/error.rs` hold these invariants: register the new type in `registry()` there, and they check its code against its group's block, against every other code, and against the reserved ranges. Add its variant to `LoreErrorCode`, with its code and its one-line meaning as the doc comment, and its arm to `LoreErrorCode::from_ffi_code`: `#[derive(FfiError)]` fails to compile a type that lacks either, or one with another code. A type's name is its enumerator's name in `lore.h`, so a type keeps its name as it keeps its code.
 
 Codes can only be allocated in that file. `#[derive(FfiError)]` expands to a reference to `__ffi_code_registry_marker`, resolved where the derive is written, and only `lore-base/src/error.rs` declares it — so a `#[ffi_code(N)]` anywhere else fails to compile with `cannot find value __ffi_code_registry_marker in this scope`. An error type that never crosses the FFI boundary should not carry a code at all: use a plain `thiserror` enum rather than an `#[error_set]`, which would demand one for every variant type.
 
@@ -166,16 +131,16 @@ The library owns all error-detail memory. The pointers a consumer reads from `Lo
 
 ---
 
-## 5. Moving an error between types
+## 3. Moving an error between types
 
 Everything here comes from `lore_error_set::prelude`. Always import the prelude
-glob rather than individual traits — see [section 5.4](#54-internal-is-a-compile-error-on-an-error-set).
+glob rather than individual traits — see [section 3.4](#34-internal-is-a-compile-error-on-an-error-set).
 
 `emit_map_err`, `debug_map_err`, `emit()` and `debug()` are **gone**. They logged
 at the mapping site and carried no trace; the replacements carry a trace that
 surfaces in `LoreErrorDetail.trace_locations` and log nothing.
 
-### 5.1 Choosing
+### 3.1 Choosing
 
 | Situation | Use |
 | --- | --- |
@@ -188,7 +153,7 @@ surfaces in `LoreErrorDetail.trace_locations` and log nothing.
 The context string is mandatory and lands on the trace, so write what was being
 attempted, not what failed.
 
-### 5.2 `forward` and `forward_any`
+### 3.2 `forward` and `forward_any`
 
 `forward` is the default. It requires at compile time that the target declares
 every variant of the source, so nothing is lost silently:
@@ -220,7 +185,7 @@ state::State::deserialize(repository.clone(), revision)
 Prefer narrowing the source where that is affordable — then `forward` applies
 again and the guarantee is back.
 
-### 5.3 Don't discard the originating trace
+### 3.3 Don't discard the originating trace
 
 When you deliberately translate to a different discrete type, chain rather than
 construct from nothing:
@@ -239,7 +204,7 @@ branch::resolve(repository.clone(), branch.as_str())
 To collapse an error set to `Internal` on purpose, say so explicitly with
 `Target::internal_with_context(err, "context")`, which keeps the source.
 
-### 5.4 `.internal()` is a compile error on an error set
+### 3.4 `.internal()` is a compile error on an error set
 
 `.internal()` is for **foreign** errors only (`io::Error`, `ParseIntError`, and
 the like). Calling it on an error set would silently collapse every handleable
@@ -276,7 +241,7 @@ let magic = u32::from_le_bytes(<[u8; 4]>::try_from(&buffer[0..4]).internal("shor
 
 ---
 
-## 6. Panics and unwrap
+## 4. Panics and unwrap
 
 **Never use `unwrap()`, `expect()`, or code that can panic in production code.** This is especially critical in `lore-server` where a panic can crash the entire server process.
 
@@ -304,14 +269,11 @@ static RE: Lazy<Regex> = Lazy::new(|| {
 
 ---
 
-## 7. Crate-specific patterns
+## 5. Crate-specific patterns
 
-### Error sets + EventError
+### Error sets
 
-- **lore-revision**, **lore** — errors reach the FFI boundary, so they also implement `EventError`.
-
-### Error sets only
-
+- **lore-revision**, **lore** — errors reach the FFI boundary as their codes.
 - **lore-server** — Uses `tracing`; errors become gRPC/HTTP status codes.
 - **lore-aws** — AWS-specific errors with a generic type parameter.
 - **lore-client**, **lore-credential**, **lore-storage**, **lore-telemetry**, **lore-transport**.
@@ -341,7 +303,7 @@ Libraries must expose typed errors so callers can match on specific error varian
 
 ---
 
-## 8. Lore server errors
+## 6. Lore server errors
 
 In lore-server gRPC handlers, use `warn_map_err`, `warn_error_to_status`, or `warn_mapped_error_status` when converting internal errors into a gRPC `Status`. All three log the original error at WARN level with additional structured fields, ensuring the cause and response are visible in our observability for investigation.
 
@@ -355,13 +317,12 @@ Don't use them for expected, user-caused errors (for example, `NotFound`, `Inval
 
 ---
 
-## 9. Best practices
+## 7. Best practices
 
 1. **Never panic in production code** — Avoid `unwrap()`, `expect()`, and panic-inducing code.
 2. **Use `#[error_set]`** for error types in libraries; `thiserror` remains only for the discrete types in `lore-base/src/error.rs`.
 3. **Use anyhow only in binaries** — Libraries must have typed errors.
-4. **Implement EventError** for errors reaching the public API (`lore-revision` and `lore`).
-5. **Use `.forward`** to move an error between sets; it is checked at compile time.
-6. **Use `.forward_any`** only when the source over-declares, and `.internal` only for foreign errors.
-7. **Use tracing** in server code, Lore macros in library code.
-8. **Don't discard originating error traces** — When constructing a new discrete error from a caught one, use `chain_err_from` (or `chain_err` if you've already destructured the variant) to carry the originating trace forward. Using `internal_with_context` is correct when collapsing to `Internal`; using `internal()` without context silently drops the source. Prefer `chain_err_from(source_err, "context")` over `Err(NewError { ... }.into())`.
+4. **Use `.forward`** to move an error between sets; it is checked at compile time.
+5. **Use `.forward_any`** only when the source over-declares, and `.internal` only for foreign errors.
+6. **Use tracing** in server code, Lore macros in library code.
+7. **Don't discard originating error traces** — When constructing a new discrete error from a caught one, use `chain_err_from` (or `chain_err` if you've already destructured the variant) to carry the originating trace forward. Using `internal_with_context` is correct when collapsing to `Internal`; using `internal()` without context silently drops the source. Prefer `chain_err_from(source_err, "context")` over `Err(NewError { ... }.into())`.

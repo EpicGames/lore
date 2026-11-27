@@ -1,0 +1,8 @@
+---
+type: breaking
+---
+
+- `lore`: The C API no longer has the `LORE_EVENT_ERROR` event or its `lore_error_event_data_t` data. A failure arrives as the error code on a call's return value and on `Complete.status`, with its message and trace in `Complete.error`, a `lore_error_detail_t`. A C caller that read the Error event reads `Complete` instead; one that matched `LORE_EVENT_ERROR` drops that case. Every other `LORE_EVENT_*` tag keeps its value, and the value 1 is unused.
+- `lore`: `lore_error_code_t` names every error code Lore reports, one `LORE_ERROR_CODE_*` per error, beside `LORE_ERROR_CODE_NONE` (0) and `LORE_ERROR_CODE_INTERNAL` (-1), so a C caller can name any code it reads from `status`, a return value or `error_code`. Those fields stay `int32_t`.
+- `lore`: The revision-tree API's per-item and per-call events (`lore_revision_tree_add`, `_delete`, `_modify`, `_move`, `_resolve_path`, `_node_info`, `_info`, `_metadata_set` and the `_list_children` header) report the code of the failure that ended the item, such as `LORE_ERROR_CODE_NODE_NOT_FOUND` or `LORE_ERROR_CODE_ADDRESS_NOT_FOUND`, where they reported `LORE_ERROR_CODE_INTERNAL`. `Complete` still reports the verb's own code, `LORE_ERROR_CODE_SLOW_DOWN` or `LORE_ERROR_CODE_INTERNAL` for these failures. A caller that compared a per-item code against `LORE_ERROR_CODE_INTERNAL` to detect a failure checks for any code other than `LORE_ERROR_CODE_NONE`.
+- `lore`: `lore branch archive` (`lore_branch_archive`) logs a layer or link that fails to archive the branch as a warning naming its repository, where it sent an Error event, and logs one whose remote it can't reach the same way, where it skipped it without a word. The call still succeeds.

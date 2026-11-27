@@ -20,7 +20,6 @@ use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::branch;
 use crate::errors::*;
 use crate::event;
-use crate::event::EventError;
 use crate::file::stage::route_layer_paths;
 use crate::file::unstage;
 use crate::file::unstage::UnstageOptions;
@@ -37,7 +36,6 @@ use crate::fs::realize::keeps_entry;
 use crate::hash::hash_string;
 use crate::hash::hash_string_bytes;
 use crate::interface::LoreArray;
-use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
 use crate::layer;
@@ -177,24 +175,6 @@ pub enum ResetError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
-}
-
-impl EventError for ResetError {
-    fn translated(&self) -> LoreError {
-        match self {
-            ResetError::InvalidArguments(_) | ResetError::InvalidPath(_) => {
-                LoreError::InvalidArguments
-            }
-            ResetError::RevisionNotFound(_)
-            | ResetError::BranchNotFound(_)
-            | ResetError::NotFound(_) => LoreError::NotFound,
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 const RESET_DIRECTORY_MAX: usize = 10_000;
@@ -679,7 +659,6 @@ struct ResetFileWorkItem {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
@@ -918,7 +897,6 @@ async fn store_staged_tree(
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///

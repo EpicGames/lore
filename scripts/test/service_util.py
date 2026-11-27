@@ -15,10 +15,10 @@ logger = logging.getLogger(__name__)
 
 LORE_SERVICE_ENVIRONMENT = {"LORE_USE_SERVICE": "1"}
 
-# `LoreError::ServiceUnavailable`: what a command carried out by the service
+# `ServiceUnavailable`'s code: what a command carried out by the service
 # reports when none could be reached or started, so it is distinct from the
 # command itself having run and failed. Paired with the value in
-# `lore-revision/src/interface.rs` and has to change with it.
+# `lore-base/src/error.rs` and has to change with it.
 SERVICE_UNAVAILABLE = 32
 
 

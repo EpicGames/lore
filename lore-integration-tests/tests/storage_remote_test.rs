@@ -487,7 +487,6 @@ mod storage_remote_tests {
     #[derive(Debug, Clone, PartialEq)]
     enum Captured {
         Opened { handle_id: u64 },
-        Error,
         Complete(i32),
         Other,
     }
@@ -500,7 +499,6 @@ mod storage_remote_tests {
                 LoreEvent::StorageOpened(data) => Captured::Opened {
                     handle_id: data.handle_id,
                 },
-                LoreEvent::Error(_) => Captured::Error,
                 LoreEvent::Complete(data) => Captured::Complete(data.status),
                 _ => Captured::Other,
             };

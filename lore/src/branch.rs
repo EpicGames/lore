@@ -22,6 +22,7 @@ use lore_revision::link;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::execution_context;
 use lore_revision::lore_debug;
+use lore_revision::lore_warn;
 use lore_revision::metadata::MetadataInherit;
 use lore_revision::metadata::branch::BranchMetadataError;
 use lore_revision::repository;
@@ -62,7 +63,6 @@ pub struct LoreBranchCreateArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
@@ -138,7 +138,6 @@ pub struct LoreBranchInfoArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
@@ -206,7 +205,6 @@ pub struct LoreBranchDiffArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
@@ -269,7 +267,6 @@ pub struct LoreBranchListArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
@@ -340,7 +337,6 @@ pub struct LoreBranchMergeStartArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
@@ -437,7 +433,6 @@ pub struct LoreBranchMergeAbortArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
@@ -513,7 +508,6 @@ pub struct LoreBranchMergeConflictsListArgs {}
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
@@ -567,7 +561,6 @@ pub struct LoreBranchMergeUnresolveArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
@@ -635,7 +628,6 @@ pub struct LoreBranchMergeIntoArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
@@ -726,7 +718,6 @@ pub struct LoreBranchMergeRestartArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
@@ -783,7 +774,6 @@ pub struct LoreBranchMergeResolveArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
@@ -839,7 +829,6 @@ pub struct LoreBranchMergeResolveMineArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
@@ -895,7 +884,6 @@ pub struct LoreBranchMergeResolveTheirsArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
@@ -953,7 +941,6 @@ pub struct LoreBranchPushArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
@@ -1044,7 +1031,6 @@ pub struct LoreBranchSwitchArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
@@ -1118,7 +1104,6 @@ pub struct LoreBranchProtectArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
@@ -1175,7 +1160,6 @@ pub struct LoreBranchUnprotectArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
@@ -1235,6 +1219,9 @@ pub struct LoreBranchArchiveArgs {
 /// archived is not an error. Any other remote failure, such as a missing
 /// authorization, fails the call.
 ///
+/// The current branch is refused with `DeleteCurrent`. A layer or link that fails to archive
+/// the branch is logged as a warning naming its repository, and the call does not fail for it.
+///
 /// # Events
 ///
 /// ## Standard Events
@@ -1244,7 +1231,6 @@ pub struct LoreBranchArchiveArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
@@ -1298,31 +1284,13 @@ async fn archive_impl(
     }
 
     lore_debug!("Attempt archive of local branch");
-    // The local failure takes precedence over the remote's, and both over the cascade's.
-    let mut failure = branch::delete(repository.clone(), branch.id).await.err();
+    let local_archive = branch::delete(repository.clone(), branch.id).await;
 
-    if !execution_context().globals().local() {
-        // Archive remote branch
-        lore_debug!("Attempt archive of remote branch");
-        let remote_archive = match repository
-            .remote()
-            .await
-            .forward::<BranchError>("Failed to connect to remote")
-        {
-            Ok(remote) => branch::delete_remote(remote, repository.id, branch.id).await,
-            Err(err) => Err(err),
-        };
-
-        match remote_archive {
-            Ok(()) => (),
-            Err(err) if err.is_no_remote() || err.is_branch_not_found() => {
-                lore_debug!("No remote branch to archive: {err}");
-            }
-            Err(err) => {
-                failure.get_or_insert(err);
-            }
-        }
-    }
+    let remote_archive = if execution_context().globals().local() {
+        Ok(())
+    } else {
+        archive_on_remote(&repository, branch.id).await
+    };
 
     // Runs even when the outer archive failed, so that a repeat of a partially
     // applied archive still converges on the layers and links.
@@ -1331,12 +1299,37 @@ async fn archive_impl(
         Err(err) => Err(err),
     };
 
-    if let Some(err) = failure {
-        return Err(err);
-    }
-    cascade?;
+    // The local failure takes precedence over the remote's, and both over the cascade's.
+    local_archive?;
+    remote_archive?;
+    cascade
+}
 
-    Ok(())
+/// Archives `branch` on the remote of `repository`. A repository with no remote, or whose remote
+/// does not have the branch, has nothing to archive there.
+async fn archive_on_remote(
+    repository: &RepositoryContext,
+    branch: BranchId,
+) -> Result<(), BranchError> {
+    lore_debug!(
+        "Attempt archive of branch {branch} on the remote of {}",
+        repository.id
+    );
+    let archive = match repository
+        .remote()
+        .await
+        .forward::<BranchError>("Failed to connect to remote")
+    {
+        Ok(remote) => branch::delete_remote(remote, repository.id, branch).await,
+        Err(err) => Err(err),
+    };
+    match archive {
+        Err(err) if err.is_no_remote() || err.is_branch_not_found() => {
+            lore_debug!("No remote branch to archive: {err}");
+            Ok(())
+        }
+        archive => archive,
+    }
 }
 
 /// A layer or link is a separate repository owning its own branch lifecycle, and
@@ -1397,7 +1390,8 @@ async fn archive_layers(
         }
     };
 
-    archive_in_repositories(layers, branch).await
+    archive_in_repositories(layers, branch).await;
+    Ok(())
 }
 
 async fn archive_links(
@@ -1421,36 +1415,34 @@ async fn archive_links(
         ],
     };
 
-    archive_in_repositories(links, branch).await
+    archive_in_repositories(links, branch).await;
+    Ok(())
 }
 
-/// A repository that never had the branch answers `NOT_FOUND`, which is the
-/// cascade converging rather than a failure, so it is not reported.
-async fn archive_in_repositories(
-    repositories: Vec<Arc<RepositoryContext>>,
-    branch: BranchId,
-) -> Result<(), BranchError> {
-    let execution = execution_context();
-    let archive_remote = !execution.globals().local();
+/// A repository that never had the branch, or has no remote, has nothing to archive, which is the
+/// cascade converging rather than a failure, so it is not reported. Any other failure is a
+/// warning naming the repository: the outer archive stands.
+async fn archive_in_repositories(repositories: Vec<Arc<RepositoryContext>>, branch: BranchId) {
+    let archive_remote = !execution_context().globals().local();
 
     for repository in repositories {
         lore_debug!("Attempt archive of branch in {}", repository.id);
         if let Err(err) = branch::delete(repository.clone(), branch).await
             && !err.is_branch_not_found()
         {
-            execution.dispatcher.send_error(err);
+            lore_warn!(
+                "Failed to archive branch {branch} in repository {}: {err}",
+                repository.id
+            );
         }
 
-        if archive_remote
-            && let Ok(remote) = repository.remote().await
-            && let Err(err) = branch::delete_remote(remote, repository.id, branch).await
-            && !err.is_branch_not_found()
-        {
-            execution.dispatcher.send_error(err);
+        if archive_remote && let Err(err) = archive_on_remote(&repository, branch).await {
+            lore_warn!(
+                "Failed to archive branch {branch} on the remote of repository {}: {err}",
+                repository.id
+            );
         }
     }
-
-    Ok(())
 }
 
 #[repr(C)]
@@ -1477,7 +1469,6 @@ pub struct LoreBranchResetArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
@@ -1546,7 +1537,6 @@ pub struct LoreBranchLatestListArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///

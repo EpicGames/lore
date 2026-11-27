@@ -569,7 +569,7 @@ async fn an_entry_that_vanishes_after_validation_fails_the_batch_as_internal() {
                 &permit,
             )
             .await;
-            emit_batch_complete(args.batch_id, batch_error_code(&result));
+            emit_batch_complete(args.batch_id, LoreErrorCode::of(&result));
             result
         },
     )
@@ -582,8 +582,8 @@ async fn an_entry_that_vanishes_after_validation_fails_the_batch_as_internal() {
     let events = take_recorded(&sink);
     assert_eq!(
         move_outcomes(&events),
-        vec![(10, INVALID_NODE, LoreErrorCode::Internal)],
-        "the entry must report internal rather than land"
+        vec![(10, INVALID_NODE, LoreErrorCode::InvalidArguments)],
+        "the entry must report the State's own code rather than land"
     );
     assert_eq!(
         batch_outcomes(&events),
@@ -653,7 +653,7 @@ async fn a_move_after_a_failed_entry_walks_its_destination_again() {
                 &permit,
             )
             .await;
-            emit_batch_complete(args.batch_id, batch_error_code(&result));
+            emit_batch_complete(args.batch_id, LoreErrorCode::of(&result));
             result
         },
     )
@@ -664,8 +664,8 @@ async fn a_move_after_a_failed_entry_walks_its_destination_again() {
     assert_eq!(
         move_outcomes(&events),
         vec![
-            (10, INVALID_NODE, LoreErrorCode::Internal),
-            (11, INVALID_NODE, LoreErrorCode::Internal),
+            (10, INVALID_NODE, LoreErrorCode::Oversized),
+            (11, INVALID_NODE, LoreErrorCode::InvalidArguments),
         ],
         "the rename finds no room, and the move under `b` is refused"
     );

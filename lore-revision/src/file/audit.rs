@@ -9,7 +9,6 @@ use serde::Serialize;
 use crate::change::FileAction;
 use crate::errors::*;
 use crate::event;
-use crate::event::EventError;
 use crate::file::diff::DiffContent;
 use crate::file::diff::PatchEntry;
 use crate::file::diff::normalise_text;
@@ -17,7 +16,6 @@ use crate::file::diff::read_node_content;
 use crate::file::diff::read_working_content;
 use crate::file::diff::walk_patch;
 use crate::file::history;
-use crate::interface::LoreError;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
 use crate::lore_debug;
@@ -83,25 +81,6 @@ pub enum AuditError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
-}
-
-impl EventError for AuditError {
-    fn translated(&self) -> LoreError {
-        match self {
-            AuditError::InvalidArguments(_) | AuditError::InvalidPath(_) => {
-                LoreError::InvalidArguments
-            }
-            AuditError::FileNotFound(_) => LoreError::FileNotFound,
-            AuditError::RevisionNotFound(_)
-            | AuditError::BranchNotFound(_)
-            | AuditError::NotFound(_) => LoreError::NotFound,
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// What a range of lines resolved to, or why it did not resolve.

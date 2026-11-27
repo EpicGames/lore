@@ -9,9 +9,7 @@ use serde::Serialize;
 use crate::branch;
 use crate::branch::BranchLatestStatus;
 use crate::errors::*;
-use crate::event::EventError;
 use crate::event::LoreEvent;
-use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lore::BranchId;
 use crate::lore::Context;
@@ -71,30 +69,6 @@ pub enum ResetError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
-}
-
-impl EventError for ResetError {
-    fn translated(&self) -> LoreError {
-        match self {
-            ResetError::Disconnected(_) => LoreError::Connection,
-            ResetError::SlowDown(_) => LoreError::SlowDown,
-            ResetError::Oversized(_) => LoreError::Oversized,
-            ResetError::FileNotFound(_) => LoreError::FileNotFound,
-            ResetError::NotFound(_)
-            | ResetError::BranchNotFound(_)
-            | ResetError::RevisionNotFound(_) => LoreError::NotFound,
-            ResetError::AddressNotFound(_) => LoreError::AddressNotFound,
-            ResetError::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            ResetError::InvalidPath(_) | ResetError::InvalidArguments(_) => {
-                LoreError::InvalidArguments
-            }
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Event data reported when a branch is reset to a revision.

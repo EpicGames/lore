@@ -53,13 +53,6 @@ pub(crate) fn completes(events: &[LoreEvent]) -> Vec<&LoreCompleteEventData> {
         .collect()
 }
 
-/// Whether `events` holds an `Error` event.
-pub(crate) fn has_error_event(events: &[LoreEvent]) -> bool {
-    events
-        .iter()
-        .any(|event| matches!(event, LoreEvent::Error(_)))
-}
-
 /// The `status` of every `Complete` event in `events`, in order.
 pub(crate) fn complete_statuses(events: &[LoreEvent]) -> Vec<i32> {
     completes(events).iter().map(|data| data.status).collect()

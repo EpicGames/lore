@@ -141,8 +141,8 @@ async fn info_with_unreadable_metadata_returns_internal() {
     assert_eq!(data.id, 3);
     assert_eq!(
         data.error_code,
-        LoreErrorCode::Internal,
-        "a present-but-unreadable metadata fragment must report Internal, got {events:?}"
+        LoreErrorCode::AddressNotFound,
+        "an unreadable metadata fragment must report the read's own code, got {events:?}"
     );
     assert!(
         complete_statuses(&events).contains(&status),

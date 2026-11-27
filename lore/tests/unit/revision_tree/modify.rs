@@ -581,7 +581,7 @@ async fn a_target_deleted_after_validation_fails_the_batch_as_internal() {
                 planned,
             )
             .await;
-            emit_batch_complete(call_id, batch_error_code(&result));
+            emit_batch_complete(call_id, LoreErrorCode::of(&result));
             result
         },
     )
@@ -594,8 +594,8 @@ async fn a_target_deleted_after_validation_fails_the_batch_as_internal() {
     let events = take_recorded(&sink);
     assert_eq!(
         modify_outcomes(&events),
-        vec![(10, INVALID_NODE, LoreErrorCode::Internal)],
-        "the entry must report internal rather than land"
+        vec![(10, INVALID_NODE, LoreErrorCode::InvalidArguments)],
+        "the entry must report the State's own code rather than land"
     );
     assert_eq!(
         batch_outcomes(&events),
@@ -606,7 +606,7 @@ async fn a_target_deleted_after_validation_fails_the_batch_as_internal() {
 }
 
 /// A target staged for deletion after validation is refused when the batch reaches it, under
-/// the lock its rewrite takes: the entry reports internal and the node stays staged for deletion,
+/// the lock its rewrite takes: the entry reports the State's refusal and the node stays staged for deletion,
 /// where a rewrite and its forced staged mark would have taken the deletion off it.
 #[tokio::test]
 async fn a_target_staged_for_deletion_after_validation_fails_the_batch_as_internal() {
@@ -660,7 +660,7 @@ async fn a_target_staged_for_deletion_after_validation_fails_the_batch_as_intern
                 node.is_staged_delete(),
                 std::sync::atomic::Ordering::Relaxed,
             );
-            emit_batch_complete(call_id, batch_error_code(&result));
+            emit_batch_complete(call_id, LoreErrorCode::of(&result));
             result
         },
     )
@@ -670,8 +670,8 @@ async fn a_target_staged_for_deletion_after_validation_fails_the_batch_as_intern
     let events = take_recorded(&sink);
     assert_eq!(
         modify_outcomes(&events),
-        vec![(10, INVALID_NODE, LoreErrorCode::Internal)],
-        "the entry must report internal rather than land"
+        vec![(10, INVALID_NODE, LoreErrorCode::InvalidArguments)],
+        "the entry must report the State's own code rather than land"
     );
     assert!(
         still_deleted.load(std::sync::atomic::Ordering::Relaxed),

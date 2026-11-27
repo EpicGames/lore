@@ -21,10 +21,8 @@ use lore_error_set::FfiError;
 use lore_error_set::HasTrace;
 use lore_error_set::internal::SupportsInternalError;
 use lore_error_set::prelude::*;
-use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreErrorDetail;
-use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::lore::execution_context;
 use lore_revision::state::StateError;
@@ -42,19 +40,6 @@ use crate::util::log_command_info;
 #[error_set]
 enum DispatchError {
     InvalidArguments,
-}
-
-impl EventError for DispatchError {
-    fn translated(&self) -> LoreError {
-        match self {
-            DispatchError::InvalidArguments(_) => LoreError::InvalidArguments,
-            DispatchError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Run a revision-tree verb behind the in-flight counter protocol.
@@ -109,7 +94,7 @@ pub(crate) async fn revision_tree_call<Arg, T, F, Fut, ResT, ErrT, M>(
     command: F,
 ) -> i32
 where
-    ErrT: EventError + FfiError + HasTrace,
+    ErrT: FfiError + HasTrace + std::fmt::Display,
     Arg: std::fmt::Debug,
     M: FnOnce(&Arg),
     F: FnOnce(Arc<RevisionTreeInternal>, Arg) -> Fut,
@@ -144,53 +129,71 @@ where
         .await
 }
 
-/// How an entry of a revision-tree verb failed, weakest first: a failure of ours outranks the
-/// State giving up under load, which a caller can retry, so an entry that failed both ways reports
-/// `Internal`. One byte, so a verb keeping one per entry keeps a byte per entry.
+/// How an entry of a revision-tree verb failed: the code of its strongest failure, kept as the
+/// `u8` exit status the CLI reports it as, `Internal` as 255. Failures rank weakest first: none,
+/// the State answering `SlowDown`, which a caller can retry, then any other; of two of one rank the
+/// first is kept. One byte, so a verb keeping one per entry keeps a byte per entry.
 #[lore_macro::test_pub]
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum EntryFailure {
-    /// The entry has not failed.
-    None,
-    /// The State answered `SlowDown`: it gave up under concurrent changes, or its store asked it
-    /// to slow down.
-    SlowedDown,
-    /// Any other failure.
-    Internal,
-}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EntryFailure(u8);
 
 impl EntryFailure {
+    /// The entry has not failed.
+    #[lore_macro::test_pub]
+    pub(crate) const NONE: Self = Self::from_code(0);
+    /// The State answered `SlowDown`: it gave up under concurrent changes, or its store asked it
+    /// to slow down.
+    #[lore_macro::test_pub]
+    pub(crate) const SLOWED_DOWN: Self = Self::from_code(SlowDown::FFI_CODE);
+    /// A failure whose error is not known, such as that of a task that died.
+    #[lore_macro::test_pub]
+    pub(crate) const INTERNAL: Self = Self::from_code(lore_error_set::Internal::FFI_CODE);
+
+    /// The failure with the code `code`, which every code fits as its exit status.
+    const fn from_code(code: i32) -> Self {
+        Self(code as u8)
+    }
+
     /// How `error`, a State failure, fails the entry it met.
     #[lore_macro::test_pub]
     pub(crate) fn of(error: &StateError) -> Self {
-        if error.is_slow_down() {
-            Self::SlowedDown
-        } else {
-            Self::Internal
+        Self::from_code(error.ffi_code())
+    }
+
+    /// The failure's rank: 0 for none, 1 for a `SlowDown` and 2 for any other.
+    const fn rank(self) -> u8 {
+        match self {
+            Self::NONE => 0,
+            Self::SLOWED_DOWN => 1,
+            _ => 2,
         }
+    }
+
+    /// Whether this failure ranks above `other`.
+    #[lore_macro::test_pub]
+    pub(crate) fn outranks(self, other: Self) -> bool {
+        self.rank() > other.rank()
     }
 
     /// Takes in another failure of the same entry, keeping the stronger.
     #[lore_macro::test_pub]
     pub(crate) fn merge(&mut self, other: Self) {
-        *self = (*self).max(other);
+        if other.outranks(*self) {
+            *self = other;
+        }
     }
 
     /// Whether the entry failed.
     #[lore_macro::test_pub]
     pub(crate) fn failed(self) -> bool {
-        self != Self::None
+        self != Self::NONE
     }
 
-    /// The code the entry's terminal event reports.
+    /// The code the entry's terminal event reports. No type has the code 255, so
+    /// [`Self::INTERNAL`] reports `Internal`.
     #[lore_macro::test_pub]
     pub(crate) fn code(self) -> LoreErrorCode {
-        match self {
-            Self::None => LoreErrorCode::None,
-            Self::SlowedDown => LoreErrorCode::SlowDown,
-            Self::Internal => LoreErrorCode::Internal,
-        }
+        LoreErrorCode::from_ffi_code(i32::from(self.0))
     }
 
     /// The error of a call whose entries failed, the strongest of their failures `self`, with
@@ -198,10 +201,10 @@ impl EntryFailure {
     #[lore_macro::test_pub]
     #[track_caller]
     pub(crate) fn call_error<E: ErrorSet + SupportsInternalError>(self, context: &str) -> E {
-        match self {
-            Self::SlowedDown => state_failure(StateError::from(SlowDown), context),
-            Self::None | Self::Internal => E::internal(context),
+        if self == Self::SLOWED_DOWN {
+            return state_failure(StateError::from(SlowDown), context);
         }
+        E::internal(context)
     }
 }
 

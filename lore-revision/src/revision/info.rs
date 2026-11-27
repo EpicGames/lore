@@ -175,8 +175,6 @@ pub enum InfoError {
     MissingIdentity,
 }
 
-impl crate::event::EventError for InfoError {}
-
 #[derive(Clone, Debug)]
 pub struct InfoOptions {
     /// Optional revision signature

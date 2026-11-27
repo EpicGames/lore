@@ -20,11 +20,9 @@ use lore_revision::commit::CommitError;
 use lore_revision::commit::LoreRevisionCommitRevisionEventData;
 use lore_revision::commit::commit_in_memory_revision;
 use lore_revision::commit::resolve_commit_branch;
-use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_tree::LoreRevisionTreeCommitCompleteEventData;
-use lore_revision::interface::LoreError;
 use lore_revision::metadata::Metadata;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
@@ -88,38 +86,13 @@ pub struct LoreRevisionTreeCommitArgs {
 
 /// Two variants on purpose: every one a caller can act on through the arguments is
 /// `InvalidArguments`, and everything else is `Internal` with the reason in the
-/// error detail — which is what `CommitError::translated()` does for the
-/// file-system commit, so the same failure reports the same code on both surfaces.
+/// error detail.
 ///
-/// Nothing finer is worth adding. `LoreErrorCode` has five values and neither a tip
-/// collision nor an empty commit is among them, so a third variant here would make
-/// the completion status and the terminal's `error_code` disagree about one failure
-/// while telling a caller nothing new.
+/// Nothing finer is worth adding: a tip collision and an empty commit report `Internal` with
+/// the reason in the detail, and a collision also carries `new_tip_hash`.
 #[error_set]
 enum CommitVerbError {
     InvalidArguments,
-}
-
-impl EventError for CommitVerbError {
-    fn translated(&self) -> LoreError {
-        match self {
-            CommitVerbError::InvalidArguments(_) => LoreError::InvalidArguments,
-            CommitVerbError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
-}
-
-/// The code the terminal reports for a finished call, matching what the completion
-/// status carries.
-fn commit_error_code(error: &CommitVerbError) -> LoreErrorCode {
-    match error {
-        CommitVerbError::InvalidArguments(_) => LoreErrorCode::InvalidArguments,
-        CommitVerbError::Internal(_) => LoreErrorCode::Internal,
-    }
 }
 
 fn emit_commit_complete(
@@ -364,7 +337,12 @@ async fn commit_revision(
             {
                 error = restore_failure;
             }
-            emit_commit_complete(id, Hash::default(), new_tip_hash, commit_error_code(&error));
+            emit_commit_complete(
+                id,
+                Hash::default(),
+                new_tip_hash,
+                LoreErrorCode::from_ffi_code(error.ffi_code()),
+            );
             Err(error)
         }
     }

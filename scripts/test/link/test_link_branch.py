@@ -31,7 +31,8 @@ from link_helpers import (
     remote_branch_entries,
     remount,
 )
-from lore_parsers import parse_jsonl, parse_status_json
+from lore_parsers import parse_complete_json, parse_jsonl, parse_status_json
+from lore_server import allocate_free_port, generate_server_config, lore_local_server
 from test_utils import view_file, working_tree_files
 
 from lore import Lore
@@ -1417,6 +1418,84 @@ def test_link_branch_archive_include_links(new_lore_repo):
         sorted(link_repo.branch_list(remote=True).remote_branches) == branches_before
     ), (
         f"Expected link branches {branches_before}, got: {link_repo.branch_list(remote=True)}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_warns_of_refusing_link(new_lore_repo):
+    """A link refusing the archive is a warning naming its repository: the archive succeeds."""
+    repo, link_repo = make_parent_with_link(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    link_repo.branch_protect("feature")
+
+    output = repo.branch_archive("feature", include_links=True, json=True)
+
+    complete = parse_complete_json(output)
+    assert complete is not None and complete["status"] == 0, (
+        f"Expected the archive to succeed, got: {output}"
+    )
+    warnings = [
+        log["message"] for log in parse_jsonl(output, "log") if log["level"] == "warn"
+    ]
+    assert any(link_repo.get_id() in message for message in warnings), (
+        f"Expected a warning naming the linked repository, got: {output}"
+    )
+    assert link_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the protected link branch to survive, got: {link_repo.branch_list(remote=True)}"
+    )
+
+
+@pytest.fixture
+def stoppable_remote_url(request, tmp_path_factory, lore_server_executable_path):
+    """The URL of a server of the test's own, and a function that stops it."""
+    shared_port = allocate_free_port()
+    ports = {
+        "quic": shared_port,
+        "grpc": shared_port,
+        "http": allocate_free_port(),
+        "internal": allocate_free_port(),
+    }
+    server_root, server_env = generate_server_config(request, tmp_path_factory, ports)
+    server = lore_local_server(server_root, server_env, lore_server_executable_path)
+    next(server)
+    yield f"lore://127.0.0.1:{ports['quic']}/", lambda: next(server, None)
+    next(server, None)
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_warns_of_unreachable_link_remote(
+    new_lore_repo, stoppable_remote_url
+):
+    """A link whose remote can't be reached is a warning naming its repository, beside the
+    failure of the outer remote archive."""
+    remote_url, stop_remote = stoppable_remote_url
+    repo = new_lore_repo(remote_url=remote_url)
+    repo.write_commit_push("Baseline", {DEFAULT_PARENT_FILE: "baseline\n"})
+    link_repo = new_lore_repo(remote_url=remote_url)
+    link_repo.write_commit_push("Initial linked content", {"linked.txt": "linked\n"})
+    repo.link_add(DEFAULT_LINK_MOUNT, link_repo.get_id(), "/")
+    repo.commit("Add link")
+    repo.push()
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    stop_remote()
+    output = repo.branch_archive("feature", include_links=True, json=True, check=False)
+
+    complete = parse_complete_json(output)
+    assert complete is not None and complete["status"] != 0, (
+        f"Expected the outer remote archive to fail, got: {output}"
+    )
+    warnings = [
+        log["message"] for log in parse_jsonl(output, "log") if log["level"] == "warn"
+    ]
+    assert any(link_repo.get_id() in message for message in warnings), (
+        f"Expected a warning naming the linked repository, got: {output}"
     )
 
 

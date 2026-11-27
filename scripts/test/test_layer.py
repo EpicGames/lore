@@ -533,6 +533,34 @@ def test_layer_branch_archive_continues_past_refusing_layer(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_layer_branch_archive_warns_of_refusing_layer(new_lore_repo):
+    """A layer refusing the archive is a warning naming its repository: the archive succeeds."""
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    layer_repo.branch_protect("feature")
+
+    output = repo.branch_archive("feature", include_layers=True, json=True)
+
+    complete = parse_complete_json(output)
+    assert complete is not None and complete["status"] == 0, (
+        f"Expected the archive to succeed, got: {output}"
+    )
+    warnings = [
+        log["message"] for log in parse_jsonl(output, "log") if log["level"] == "warn"
+    ]
+    assert any(layer_repo.get_id() in message for message in warnings), (
+        f"Expected a warning naming the layer's repository, got: {output}"
+    )
+    assert not repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the outer branch to be archived, got: {repo.branch_list(remote=True)}"
+    )
+
+
+@pytest.mark.smoke
 def test_layer_branch_archive_current_leaves_layers(new_lore_repo):
     """Refusing to archive the current branch leaves the layers alone."""
     repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
@@ -2151,7 +2179,7 @@ def test_layer_remove_modified_file_errors(new_lore_repo):
     layers = parse_layer_list_json(repo.layer_list(json=True))
     assert len(layers) == 1 and layers[0].get("targetPath") == "lay"
 
-    # Same again via JSON also produces an error event and non-zero complete
+    # Same again via JSON completes with a non-zero status
     output = repo.layer_remove("lay", layer_repo, json=True, check=False)
     complete = parse_complete_json(output)
     assert complete is not None and complete.get("status") != 0, (

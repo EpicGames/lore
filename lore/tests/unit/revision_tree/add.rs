@@ -796,28 +796,28 @@ fn an_entry_below_a_failed_entry_fails_as_its_parent_did() {
     );
     assert_eq!(
         failures.of(0),
-        EntryFailure::Internal,
+        EntryFailure::INTERNAL,
         "an entry that reported nothing"
     );
 
-    failures.note(1, EntryFailure::SlowedDown);
-    assert_eq!(failures.of(1), EntryFailure::SlowedDown);
-    assert_eq!(failures.of(2), EntryFailure::Internal);
-    assert_eq!(failures.strongest, EntryFailure::SlowedDown);
+    failures.note(1, EntryFailure::SLOWED_DOWN);
+    assert_eq!(failures.of(1), EntryFailure::SLOWED_DOWN);
+    assert_eq!(failures.of(2), EntryFailure::INTERNAL);
+    assert_eq!(failures.strongest, EntryFailure::SLOWED_DOWN);
 
     failures.note(2, failures.of(1));
     assert_eq!(
         failures.of(2),
-        EntryFailure::SlowedDown,
+        EntryFailure::SLOWED_DOWN,
         "a child of a slowed entry"
     );
-    assert_eq!(failures.strongest, EntryFailure::SlowedDown);
+    assert_eq!(failures.strongest, EntryFailure::SLOWED_DOWN);
 
-    failures.note(3, EntryFailure::Internal);
-    assert_eq!(failures.strongest, EntryFailure::Internal);
+    failures.note(3, EntryFailure::INTERNAL);
+    assert_eq!(failures.strongest, EntryFailure::INTERNAL);
 
     let mut lost = Failures::new(2);
-    lost.note(0, EntryFailure::SlowedDown);
+    lost.note(0, EntryFailure::SLOWED_DOWN);
     lost.lost();
-    assert_eq!(lost.strongest, EntryFailure::Internal, "a task that died");
+    assert_eq!(lost.strongest, EntryFailure::INTERNAL, "a task that died");
 }

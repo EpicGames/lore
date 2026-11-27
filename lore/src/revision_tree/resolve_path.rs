@@ -10,11 +10,9 @@ use lore_base::types::RepositoryId;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_revision::errors::StateErrors;
-use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_tree::LoreRevisionTreeResolvePathCompleteEventData;
-use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreString;
 use lore_revision::node::INVALID_NODE;
 use lore_revision::node::NodeID;
@@ -51,19 +49,6 @@ pub struct LoreRevisionTreeResolvePathArgs {
 #[error_set]
 enum ResolvePathError {
     InvalidArguments,
-}
-
-impl EventError for ResolvePathError {
-    fn translated(&self) -> LoreError {
-        match self {
-            ResolvePathError::InvalidArguments(_) => LoreError::InvalidArguments,
-            ResolvePathError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 fn emit_resolve_complete(
@@ -180,7 +165,7 @@ async fn resolve_path_impl(
                             INVALID_NODE,
                             RepositoryId::default(),
                             Hash::default(),
-                            LoreErrorCode::Internal,
+                            LoreErrorCode::from_ffi_code(error.ffi_code()),
                         );
                         Err(ResolvePathError::internal_with_context(
                             error,

@@ -11,7 +11,6 @@ use lore_base::error::ServiceUnavailable;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_error_set::FfiError;
 use lore_error_set::HasTrace;
-use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorDetail;
 use lore_revision::interface::ExecutionContext;
 use lore_revision::interface::LoreGlobalArgs;
@@ -107,7 +106,7 @@ pub async fn repository_call_read<Arg, T, F, Fut, ResT, ErrT>(
     command: F,
 ) -> i32
 where
-    ErrT: EventError + FfiError + HasTrace,
+    ErrT: FfiError + HasTrace + std::fmt::Display,
     Arg: std::fmt::Debug,
     F: FnOnce(Arc<RepositoryContext>, Arg) -> Fut,
     Fut: Future<Output = Result<ResT, ErrT>> + 'static,
@@ -161,7 +160,7 @@ pub async fn repository_call_write<Arg, T, F, Fut, ResT, ErrT>(
     command: F,
 ) -> i32
 where
-    ErrT: EventError + FfiError + HasTrace,
+    ErrT: FfiError + HasTrace + std::fmt::Display,
     Arg: std::fmt::Debug,
     F: FnOnce(Arc<RepositoryContext>, RepositoryWriteToken, Arg) -> Fut,
     Fut: Future<Output = Result<ResT, ErrT>> + 'static,
@@ -232,7 +231,7 @@ pub async fn repository_call_exclusive_planned<Arg, T, P, FutP, FutF, ResT, ErrT
     finish: impl FnOnce(P) -> FutF,
 ) -> i32
 where
-    ErrT: EventError + FfiError + HasTrace,
+    ErrT: FfiError + HasTrace + std::fmt::Display,
     Arg: std::fmt::Debug,
     FutP: Future<Output = Result<Option<P>, ErrT>> + 'static,
     FutF: Future<Output = ()> + 'static,
@@ -321,7 +320,7 @@ pub async fn repository_call_no_store<Arg, T, F, Fut, ResT, ErrT>(
     command: F,
 ) -> i32
 where
-    ErrT: EventError + FfiError + HasTrace,
+    ErrT: FfiError + HasTrace + std::fmt::Display,
     Arg: std::fmt::Debug,
     F: FnOnce(Arc<RepositoryContext>, Arg) -> Fut,
     Fut: Future<Output = Result<ResT, ErrT>> + 'static,

@@ -248,8 +248,6 @@ pub enum StageError {
     MissingIdentity,
 }
 
-impl crate::event::EventError for StageError {}
-
 #[derive(Default)]
 pub struct StageStats {
     pub directory_modify_count: AtomicU64,

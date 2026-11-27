@@ -15,9 +15,7 @@ use std::time::Duration;
 
 use lore_base::error::ServiceUnavailable;
 use lore_error_set::prelude::*;
-use lore_revision::event::EventError;
 use lore_revision::global::GlobalConfig;
-use lore_revision::interface::LoreError;
 use lore_revision::lore_debug;
 use lore_revision::lore_warn;
 use lore_revision::util::config::SaveableConfig;
@@ -34,21 +32,6 @@ use crate::remote::service_socket_name;
 #[error_set]
 pub enum ServiceProcessError {
     ServiceUnavailable,
-}
-
-impl EventError for ServiceProcessError {
-    fn translated(&self) -> LoreError {
-        match self {
-            // The one failure here that means the call did not run, which is
-            // what a caller deciding whether to run it itself has to tell apart.
-            Self::ServiceUnavailable(_) => LoreError::ServiceUnavailable,
-            Self::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Reports that no service could be reached, with `reason` saying why.

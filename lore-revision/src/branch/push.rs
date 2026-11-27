@@ -36,12 +36,10 @@ use crate::branch;
 use crate::branch::BranchLatestStatus;
 use crate::errors::*;
 use crate::event;
-use crate::event::EventError;
 use crate::find;
 use crate::fragment;
 use crate::history;
 use crate::immutable;
-use crate::interface::LoreError;
 use crate::interface::LoreGlobalArgs;
 use crate::interface::LoreString;
 use crate::layer;
@@ -439,30 +437,6 @@ fn push_run_from(globals: &LoreGlobalArgs, options: &PushOptions) -> PushRun {
         fast_forward_merge: options.fast_forward_merge,
         mounts: MountPolicy::Push,
         expected_local_latest: None,
-    }
-}
-
-impl EventError for PushError {
-    fn translated(&self) -> LoreError {
-        match self {
-            PushError::Disconnected(_) => LoreError::Connection,
-            PushError::SlowDown(_) => LoreError::SlowDown,
-            PushError::Oversized(_) => LoreError::Oversized,
-            PushError::FileNotFound(_) => LoreError::FileNotFound,
-            PushError::NotFound(_)
-            | PushError::LayerNotFound(_)
-            | PushError::RevisionNotFound(_) => LoreError::NotFound,
-            PushError::AddressNotFound(_) => LoreError::AddressNotFound,
-            PushError::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            PushError::InvalidPath(_) | PushError::InvalidArguments(_) => {
-                LoreError::InvalidArguments
-            }
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
     }
 }
 

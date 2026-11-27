@@ -20,7 +20,6 @@ use lore_base::error::NotFound;
 use lore_base::text::ValidateText;
 use lore_error_set::FfiError;
 use lore_error_set::prelude::*;
-use lore_revision::event::EventError;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreEventCallbackConfig;
 use lore_revision::interface::LoreGlobalArgs;
@@ -33,8 +32,6 @@ use crate::service_unavailable;
 enum SampleError {
     NotFound,
 }
-
-impl EventError for SampleError {}
 
 // The async entry point returns `void`, so the only channel for the code is
 // the callback. The callback is a real `extern "C"` function pointer (the

@@ -49,7 +49,6 @@ use crate::branch;
 use crate::branch::BranchLatestStatus;
 use crate::errors::*;
 use crate::event;
-use crate::event::EventError;
 use crate::filter;
 use crate::filter::Filter;
 use crate::find;
@@ -64,7 +63,6 @@ use crate::global::external_dir::resolve::resolve;
 use crate::hash;
 use crate::instance::InstanceId;
 use crate::interface::LoreBranchLocation;
-use crate::interface::LoreError;
 use crate::interface::LoreGlobalArgs;
 use crate::interface::LoreString;
 use crate::layer;
@@ -1988,36 +1986,6 @@ pub enum RepositoryError {
     MaxHistorySearchDepth,
     NotConnected,
     MissingIdentity,
-}
-
-impl EventError for RepositoryError {
-    fn translated(&self) -> LoreError {
-        match self {
-            RepositoryError::Disconnected(_) => LoreError::Connection,
-            RepositoryError::SlowDown(_) => LoreError::SlowDown,
-            RepositoryError::Oversized(_) => LoreError::Oversized,
-            RepositoryError::FileNotFound(_) => LoreError::FileNotFound,
-            RepositoryError::NotFound(_)
-            | RepositoryError::RepositoryNotFound(_)
-            | RepositoryError::BranchNotFound(_)
-            | RepositoryError::RevisionNotFound(_)
-            | RepositoryError::LayerNotFound(_)
-            | RepositoryError::LinkNotFound(_)
-            | RepositoryError::NodeNotFound(_) => LoreError::NotFound,
-            RepositoryError::AddressNotFound(_) => LoreError::AddressNotFound,
-            RepositoryError::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            RepositoryError::InvalidPath(_) | RepositoryError::InvalidArguments(_) => {
-                LoreError::InvalidArguments
-            }
-            RepositoryError::RepositoryAlreadyExists(_)
-            | RepositoryError::BranchAlreadyExists(_) => LoreError::AlreadyExists,
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

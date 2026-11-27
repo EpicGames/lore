@@ -35,9 +35,6 @@ mod tests {
         LazyLock::new(|| Arc::new(Mutex::new(false)));
     static REPOSITORY_CREATE_C_COMPLETE: LazyLock<Arc<Mutex<bool>>> =
         LazyLock::new(|| Arc::new(Mutex::new(false)));
-    // Set if any `Error` event is seen on the failing create.
-    static REPOSITORY_CREATE_FAIL_ERROR_EVENT_SEEN: LazyLock<Arc<Mutex<bool>>> =
-        LazyLock::new(|| Arc::new(Mutex::new(false)));
     // Set when the failing create reports its failure through the enriched
     // `Complete` event (non-zero status with a populated detail).
     static REPOSITORY_CREATE_FAIL_COMPLETE_IS_FAILURE: LazyLock<Arc<Mutex<bool>>> =
@@ -116,43 +113,21 @@ mod tests {
     }
 
     fn repository_create_callback(event: &LoreEvent) {
-        match event {
-            LoreEvent::Error(error) => {
-                println!(
-                    "Received ErrorEvent! (error_type: {} | error_inner: {})",
-                    error.error_type,
-                    error.error_inner.as_str()
-                );
-            }
-            LoreEvent::Complete(complete) => {
-                println!("Received CompleteEvent! (status: {})", complete.status);
-                *REPOSITORY_CREATE_COMPLETE.lock() = true;
-            }
-            _ => (),
+        if let LoreEvent::Complete(complete) = event {
+            println!("Received CompleteEvent! (status: {})", complete.status);
+            *REPOSITORY_CREATE_COMPLETE.lock() = true;
         }
     }
 
     fn repository_create_fail_callback(event: &LoreEvent) {
-        match event {
-            LoreEvent::Error(error) => {
-                println!(
-                    "Received ErrorEvent! (error_type: {} | error_inner: {})",
-                    error.error_type,
-                    error.error_inner.as_str()
-                );
-                // Record that an `Error` event arrived on the failing create.
-                *REPOSITORY_CREATE_FAIL_ERROR_EVENT_SEEN.lock() = true;
+        if let LoreEvent::Complete(complete) = event {
+            println!("Received CompleteEvent! (status: {})", complete.status);
+            *REPOSITORY_CREATE_FAIL_COMPLETE.lock() = true;
+            // A failing create reports its failure through the enriched
+            // `Complete`: non-zero status that matches the carried detail.
+            if complete.status != 0 && complete.status == complete.error.error_code {
+                *REPOSITORY_CREATE_FAIL_COMPLETE_IS_FAILURE.lock() = true;
             }
-            LoreEvent::Complete(complete) => {
-                println!("Received CompleteEvent! (status: {})", complete.status);
-                *REPOSITORY_CREATE_FAIL_COMPLETE.lock() = true;
-                // A failing create now reports failure through the enriched
-                // `Complete`: non-zero status that matches the carried detail.
-                if complete.status != 0 && complete.status == complete.error.error_code {
-                    *REPOSITORY_CREATE_FAIL_COMPLETE_IS_FAILURE.lock() = true;
-                }
-            }
-            _ => (),
         }
     }
 
@@ -191,10 +166,6 @@ mod tests {
             *REPOSITORY_CREATE_FAIL_COMPLETE_IS_FAILURE.lock(),
             "failing create's Complete must carry a non-zero status matching its detail"
         );
-        assert!(
-            !*REPOSITORY_CREATE_FAIL_ERROR_EVENT_SEEN.lock(),
-            "failing create must not emit an Error event; the failure is carried by Complete"
-        );
     }
 
     #[serial]
@@ -208,19 +179,9 @@ mod tests {
     }
 
     fn repository_status_callback(event: &LoreEvent) {
-        match event {
-            LoreEvent::Error(error) => {
-                println!(
-                    "Received ErrorEvent! (error_type: {} | error_inner: {})",
-                    error.error_type,
-                    error.error_inner.as_str()
-                );
-            }
-            LoreEvent::Complete(complete) => {
-                println!("Received CompleteEvent! (status: {})", complete.status);
-                *REPOSITORY_STATUS_COMPLETE.lock() = true;
-            }
-            _ => (),
+        if let LoreEvent::Complete(complete) = event {
+            println!("Received CompleteEvent! (status: {})", complete.status);
+            *REPOSITORY_STATUS_COMPLETE.lock() = true;
         }
     }
 
@@ -246,19 +207,9 @@ mod tests {
 
     #[unsafe(no_mangle)]
     extern "C" fn repository_create_c_callback(event: &LoreEvent, _user_context: u64) {
-        match event {
-            LoreEvent::Error(error) => {
-                println!(
-                    "Received ErrorEvent! (error_type: {} | error_inner: {})",
-                    error.error_type,
-                    error.error_inner.as_str()
-                );
-            }
-            LoreEvent::Complete(complete) => {
-                println!("Received CompleteEvent! (status: {})", complete.status);
-                *REPOSITORY_CREATE_C_COMPLETE.lock() = true;
-            }
-            _ => (),
+        if let LoreEvent::Complete(complete) = event {
+            println!("Received CompleteEvent! (status: {})", complete.status);
+            *REPOSITORY_CREATE_C_COMPLETE.lock() = true;
         }
     }
 

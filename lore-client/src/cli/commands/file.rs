@@ -1553,7 +1553,7 @@ pub fn handle_file_history(globals: LoreGlobalArgs, args: &FileHistoryArgs) -> u
                     print_metadata(data, None, None);
                 }
             }
-            LoreEvent::Complete(_) | LoreEvent::Error(_) if oneline => {
+            LoreEvent::Complete(_) if oneline => {
                 oneline_state.flush();
             }
             LoreEvent::Maintenance(data) => {
@@ -1855,13 +1855,6 @@ pub fn handle_file_write(globals: LoreGlobalArgs, args: &FileWriteArgs) -> u8 {
                 );
             }
             LoreEvent::Complete(_) => {}
-            LoreEvent::Error(_data) => {
-                println!(
-                    "{}Failed to write file{}",
-                    CommonStyles::FAILURE,
-                    anstyle::Reset
-                );
-            }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
             }
@@ -1905,13 +1898,6 @@ pub fn handle_file_obliterate(globals: LoreGlobalArgs, args: &FileObliterateArgs
                 }
             }
             LoreEvent::Complete(_) => {}
-            LoreEvent::Error(_data) => {
-                println!(
-                    "{}Failed to obliterate file{}",
-                    CommonStyles::FAILURE,
-                    anstyle::Reset
-                );
-            }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
             }
@@ -1973,13 +1959,6 @@ pub fn handle_file_dump(globals: LoreGlobalArgs, args: &FileDumpArgs) -> u8 {
                 );
             }
             LoreEvent::Complete(_) => {}
-            LoreEvent::Error(_data) => {
-                println!(
-                    "{}Failed to dump file{}",
-                    CommonStyles::FAILURE,
-                    anstyle::Reset
-                );
-            }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
             }

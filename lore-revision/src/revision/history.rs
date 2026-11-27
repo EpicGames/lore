@@ -109,8 +109,6 @@ pub enum RevisionHistoryError {
     MissingIdentity,
 }
 
-impl crate::event::EventError for RevisionHistoryError {}
-
 #[derive(Clone, Debug)]
 pub struct HistoryOptions {
     // Show specific revision list only

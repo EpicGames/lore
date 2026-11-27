@@ -17,9 +17,7 @@ use super::get_dot_lore_path;
 use crate::branch;
 use crate::errors::*;
 use crate::event;
-use crate::event::EventError;
 use crate::hash;
-use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lore::Context;
 use crate::lore::RepositoryId;
@@ -90,24 +88,6 @@ pub enum CreateError {
     TokenNotFound,
     WriteRequired,
     MissingIdentity,
-}
-
-impl EventError for CreateError {
-    fn translated(&self) -> LoreError {
-        match self {
-            CreateError::Disconnected(_) => LoreError::Connection,
-            CreateError::SlowDown(_) => LoreError::SlowDown,
-            CreateError::Oversized(_) => LoreError::Oversized,
-            CreateError::NotFound(_) => LoreError::NotFound,
-            CreateError::RepositoryAlreadyExists(_) => LoreError::AlreadyExists,
-            CreateError::InvalidPath(_) => LoreError::InvalidArguments,
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 #[derive(Clone, Debug)]

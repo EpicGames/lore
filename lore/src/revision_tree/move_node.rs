@@ -22,13 +22,11 @@ use lore_base::error::SlowDown;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
-use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_tree::LoreRevisionTreeBatchCompleteEventData;
 use lore_revision::event::revision_tree::LoreRevisionTreeMoveCompleteEventData;
 use lore_revision::interface::LoreArray;
-use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreString;
 use lore_revision::node::INVALID_NODE;
 use lore_revision::node::NodeID;
@@ -116,21 +114,6 @@ impl MoveError {
     }
 }
 
-impl EventError for MoveError {
-    fn translated(&self) -> LoreError {
-        match self {
-            MoveError::InvalidArguments(_) => LoreError::InvalidArguments,
-            MoveError::Oversized(_) => LoreError::Oversized,
-            MoveError::SlowDown(_) => LoreError::SlowDown,
-            MoveError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
-}
-
 fn emit_move_complete(entry_id: u64, node_id: NodeID, error_code: LoreErrorCode) {
     LoreEvent::RevisionTreeMoveComplete(LoreRevisionTreeMoveCompleteEventData {
         entry_id,
@@ -154,18 +137,6 @@ fn emit_batch_complete(batch_id: u64, error_code: LoreErrorCode) {
         error_code,
     })
     .send();
-}
-
-/// The code the batch terminal reports for a finished call.
-#[lore_macro::test_pub]
-fn batch_error_code(result: &Result<(), MoveError>) -> LoreErrorCode {
-    match result {
-        Ok(()) => LoreErrorCode::None,
-        Err(MoveError::InvalidArguments(_)) => LoreErrorCode::InvalidArguments,
-        Err(MoveError::Oversized(_)) => LoreErrorCode::Oversized,
-        Err(MoveError::SlowDown(_)) => LoreErrorCode::SlowDown,
-        Err(MoveError::Internal(_)) => LoreErrorCode::Internal,
-    }
 }
 
 /// Reject the whole batch as a bad argument, attributing it to `entry_id`.
@@ -195,15 +166,15 @@ fn reject_name(entry_id: u64, entry_index: usize, error: NodeNameError) -> MoveE
 }
 
 /// Reject the whole batch because the tree could not be read, keeping the underlying
-/// failure as context. Not the caller's fault, so it reports `SLOW_DOWN` for a `SlowDown` of
-/// the State, `INTERNAL` otherwise.
+/// failure as context. Not the caller's fault, so the entry reports the failure's own code,
+/// and the call `SLOW_DOWN` for a `SlowDown` of the State, `INTERNAL` otherwise.
 fn reject_internal(
     entry_id: u64,
     entry_index: usize,
     error: StateError,
     context: &str,
 ) -> MoveError {
-    emit_move_error(entry_id, EntryFailure::of(&error).code());
+    emit_move_error(entry_id, LoreErrorCode::from_ffi_code(error.ffi_code()));
     state_failure(error, &format!("entry {entry_index}: {context}"))
 }
 
@@ -639,7 +610,7 @@ async fn apply_plan(
                 emit_move_error(item.entry_id, kind.code());
                 if failure
                     .as_deref()
-                    .is_none_or(|kept| kind > EntryFailure::of(kept))
+                    .is_none_or(|kept| kind.outranks(EntryFailure::of(kept)))
                 {
                     failure = Some(Box::new(error));
                 }
@@ -720,10 +691,10 @@ async fn apply_plan(
 /// string the call carries and rejects the call before dispatching it, so no per-entry
 /// terminal fires for it.
 ///
-/// Atomicity covers the rules checked here, which is every rule a caller can break
-/// through the arguments. A failure after the checks pass — a block that cannot be
-/// read, or a tree changing under the call — reports `INTERNAL` for that entry and for
-/// the batch. An entry the tree gave up on under load, heavy concurrent change or a store
+/// Atomicity covers the rules checked here, which is every rule a caller can break through
+/// the arguments. A failure after the checks pass — a block that cannot be read, or a tree
+/// changing under the call — fails that entry with the State's own code and the batch with
+/// `INTERNAL`. An entry the tree gave up on under load, heavy concurrent change or a store
 /// asking it to slow down, reports `SLOW_DOWN`, in its checks or after, which a caller can
 /// retry, and so does the batch where nothing failed otherwise. Either may leave earlier
 /// entries applied: nothing is rolled back, the handle stays usable, and no revision is
@@ -790,7 +761,7 @@ async fn move_node_impl(
         async move |internal: Arc<RevisionTreeInternal>, args: LoreRevisionTreeMoveArgs| {
             let call_id = args.batch_id;
             let result = move_batch(internal, args).await;
-            emit_batch_complete(call_id, batch_error_code(&result));
+            emit_batch_complete(call_id, LoreErrorCode::of(&result));
             result
         },
     )

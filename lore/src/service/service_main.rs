@@ -9,7 +9,6 @@ use lore_base::lore_spawn;
 use lore_base::lore_spawn_blocking;
 use lore_error_set::ForwardStrict;
 use lore_error_set::error_set;
-use lore_revision::event::EventError;
 use lore_revision::fs::mount_manager_state::MountManagerState;
 use lore_revision::global::DEFAULT_IDLE_CONNECTION_TIMEOUT;
 use lore_revision::global::GlobalConfig;
@@ -39,8 +38,6 @@ use crate::service::initialization::initialize_service;
 pub enum ServiceMainError {
     InvalidPath,
 }
-
-impl EventError for ServiceMainError {}
 
 /// Bounds how long shutdown waits for the accept loop to unwind, so that a
 /// wake-up connection that never lands cannot keep the process alive. Anything

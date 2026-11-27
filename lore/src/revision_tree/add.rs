@@ -17,13 +17,11 @@ use lore_base::types::Address;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
-use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_tree::LoreRevisionTreeAddCompleteEventData;
 use lore_revision::event::revision_tree::LoreRevisionTreeBatchCompleteEventData;
 use lore_revision::interface::LoreArray;
-use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreNodeType;
 use lore_revision::interface::LoreString;
 use lore_revision::node::INVALID_NODE;
@@ -124,21 +122,6 @@ impl AddError {
     }
 }
 
-impl EventError for AddError {
-    fn translated(&self) -> LoreError {
-        match self {
-            AddError::InvalidArguments(_) => LoreError::InvalidArguments,
-            AddError::Oversized(_) => LoreError::Oversized,
-            AddError::SlowDown(_) => LoreError::SlowDown,
-            AddError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
-}
-
 fn emit_add_complete(entry_id: u64, node_id: NodeID, error_code: LoreErrorCode) {
     LoreEvent::RevisionTreeAddComplete(LoreRevisionTreeAddCompleteEventData {
         entry_id,
@@ -160,17 +143,6 @@ fn emit_batch_complete(batch_id: u64, error_code: LoreErrorCode) {
         error_code,
     })
     .send();
-}
-
-/// The code the batch terminal reports for a finished call.
-fn batch_error_code(result: &Result<(), AddError>) -> LoreErrorCode {
-    match result {
-        Ok(()) => LoreErrorCode::None,
-        Err(AddError::InvalidArguments(_)) => LoreErrorCode::InvalidArguments,
-        Err(AddError::Oversized(_)) => LoreErrorCode::Oversized,
-        Err(AddError::SlowDown(_)) => LoreErrorCode::SlowDown,
-        Err(AddError::Internal(_)) => LoreErrorCode::Internal,
-    }
 }
 
 /// Zero the fields a kind does not carry.
@@ -279,15 +251,15 @@ fn reject_name(entry_id: u64, entry_index: usize, error: NodeNameError) -> AddEr
 }
 
 /// Reject the whole batch because the tree could not be read, keeping the
-/// underlying failure as context: `SLOW_DOWN` for a `SlowDown` of the State,
-/// `INTERNAL` otherwise.
+/// underlying failure as context: the entry reports the failure's own code, and the
+/// call `SLOW_DOWN` for a `SlowDown` of the State, `INTERNAL` otherwise.
 fn reject_internal(
     entry_id: u64,
     entry_index: usize,
     error: StateError,
     context: &str,
 ) -> AddError {
-    emit_add_error(entry_id, EntryFailure::of(&error).code());
+    emit_add_error(entry_id, LoreErrorCode::from_ffi_code(error.ffi_code()));
     state_failure(error, &format!("entry {entry_index}: {context}"))
 }
 
@@ -681,7 +653,7 @@ impl Failures {
         Self {
             total,
             entries: Vec::new(),
-            strongest: EntryFailure::None,
+            strongest: EntryFailure::NONE,
         }
     }
 
@@ -689,7 +661,7 @@ impl Failures {
     #[lore_macro::test_pub]
     fn note(&mut self, index: usize, failure: EntryFailure) {
         if self.entries.is_empty() {
-            self.entries.resize(self.total, EntryFailure::None);
+            self.entries.resize(self.total, EntryFailure::NONE);
         }
         self.entries[index] = failure;
         self.strongest.merge(failure);
@@ -698,7 +670,7 @@ impl Failures {
     /// Notes that an apply task died without reporting the entries it held.
     #[lore_macro::test_pub]
     fn lost(&mut self) {
-        self.strongest.merge(EntryFailure::Internal);
+        self.strongest.merge(EntryFailure::INTERNAL);
     }
 
     /// How entry `index`, which created no node, failed: `Internal` where it
@@ -707,7 +679,7 @@ impl Failures {
     fn of(&self, index: usize) -> EntryFailure {
         match self.entries.get(index) {
             Some(&failure) if failure.failed() => failure,
-            _ => EntryFailure::Internal,
+            _ => EntryFailure::INTERNAL,
         }
     }
 }
@@ -729,7 +701,7 @@ fn take_wave(
         if parent == INVALID_NODE {
             let failure = match planned[index].parent {
                 ParentRef::Entry(parent_index) => failures.of(parent_index),
-                ParentRef::Existing(_) => EntryFailure::Internal,
+                ParentRef::Existing(_) => EntryFailure::INTERNAL,
             };
             emit_add_error(planned[index].entry_id, failure.code());
             failures.note(index, failure);
@@ -951,16 +923,17 @@ async fn apply_plan(
 /// every string the call carries and rejects the call before dispatching it, so
 /// no per-entry terminal fires for it.
 ///
-/// Atomicity covers the rules checked here, which is every rule a caller can
-/// break through the arguments. A failure after the checks pass — a block that
-/// cannot be read, a tree at its block limit, or a parent, or a node to restore,
-/// that a concurrent `delete` took between its check and its write — reports
-/// `INTERNAL`. An entry the tree gave up on under load, heavy concurrent change or
-/// a store asking it to slow down, reports `SLOW_DOWN`, in its checks or after,
-/// which a caller can retry, and so do the entries parented onto it and the batch
-/// where nothing failed otherwise. Either may leave part of the batch created:
-/// nothing is rolled back, the handle stays usable, and no revision is published
-/// until `commit`.
+/// Atomicity covers the rules checked here, which is every rule a caller can break
+/// through the arguments. A failure after the checks pass — a block that cannot be
+/// read, a tree at its block limit, or a parent, or a node to restore, that a
+/// concurrent `delete` took between its check and its write — fails its entry with
+/// the State's own code and the call with `INTERNAL`. An entry the tree gave up on
+/// under load, heavy concurrent change or a store asking it to slow down, reports
+/// `SLOW_DOWN`, in its checks or after, which a caller can retry, and so does the
+/// batch where nothing failed otherwise. An entry parented onto a failed entry
+/// reports that entry's code. Either may leave part of the batch created: nothing
+/// is rolled back, the handle stays usable, and no revision is published until
+/// `commit`.
 ///
 /// Entries are created a depth level at a time — everything parented onto a node
 /// that already exists, then everything parented onto those, and so on — and
@@ -1017,7 +990,7 @@ async fn add_impl(
         async move |internal: Arc<RevisionTreeInternal>, args: LoreRevisionTreeAddArgs| {
             let call_id = args.batch_id;
             let result = add_batch(internal, args).await;
-            emit_batch_complete(call_id, batch_error_code(&result));
+            emit_batch_complete(call_id, LoreErrorCode::of(&result));
             result
         },
     )

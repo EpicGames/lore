@@ -41,7 +41,6 @@ mod open_tests {
     #[derive(Debug, Clone, PartialEq)]
     enum Captured {
         Opened { handle_id: u64 },
-        Error,
         Complete(i32),
         Other,
     }
@@ -54,7 +53,6 @@ mod open_tests {
                 LoreEvent::StorageOpened(data) => Captured::Opened {
                     handle_id: data.handle_id,
                 },
-                LoreEvent::Error(_) => Captured::Error,
                 LoreEvent::Complete(data) => Captured::Complete(data.status),
                 _ => Captured::Other,
             };
@@ -166,10 +164,6 @@ mod open_tests {
         assert_ne!(status, 0);
         let events = sink.lock().unwrap().clone();
         assert!(
-            !events.contains(&Captured::Error),
-            "no mid-stream Error event on terminal failure, got {events:?}",
-        );
-        assert!(
             events
                 .iter()
                 .any(|e| matches!(e, Captured::Complete(s) if *s != 0)),
@@ -197,10 +191,6 @@ mod open_tests {
         .await;
         assert_ne!(status, 0);
         let events = sink.lock().unwrap().clone();
-        assert!(
-            !events.contains(&Captured::Error),
-            "no mid-stream Error event on terminal failure, got {events:?}",
-        );
         assert!(
             events
                 .iter()
@@ -477,10 +467,6 @@ mod open_tests {
         assert_ne!(status, 0, "second close should fail");
         let events = sink2.lock().unwrap().clone();
         assert!(
-            !events.contains(&Captured::Error),
-            "no mid-stream Error event on terminal failure, got {events:?}",
-        );
-        assert!(
             events
                 .iter()
                 .any(|e| matches!(e, Captured::Complete(s) if *s != 0))
@@ -494,10 +480,6 @@ mod open_tests {
         let status = close_handle(lore::storage::handle::LoreStore::INVALID, cb).await;
         assert_ne!(status, 0);
         let events = sink.lock().unwrap().clone();
-        assert!(
-            !events.contains(&Captured::Error),
-            "no mid-stream Error event on terminal failure, got {events:?}",
-        );
         assert!(
             events
                 .iter()
@@ -899,10 +881,6 @@ mod open_tests {
         assert_ne!(status, 0);
         let events = sink.lock().unwrap().clone();
         assert!(
-            !events.contains(&Captured::Error),
-            "no mid-stream Error event on terminal failure, got {events:?}",
-        );
-        assert!(
             events
                 .iter()
                 .any(|e| matches!(e, Captured::Complete(s) if *s != 0))
@@ -937,7 +915,6 @@ mod open_tests {
             /// that a failing item is diagnosable from its event alone.
             message: String,
         },
-        Error,
         Complete(i32),
         Other,
     }
@@ -974,7 +951,6 @@ mod open_tests {
                     error_code: d.error.error_code,
                     message: d.error.message.as_str().to_string(),
                 },
-                LoreEvent::Error(_) => GetCaptured::Error,
                 LoreEvent::Complete(d) => GetCaptured::Complete(d.status),
                 _ => GetCaptured::Other,
             };
@@ -1276,10 +1252,6 @@ mod open_tests {
         .await;
         assert_ne!(status, 0);
         let events = sink.lock().unwrap().clone();
-        assert!(
-            !events.contains(&GetCaptured::Error),
-            "no Error event must fire on the migrated terminal arm, got {events:?}",
-        );
         assert!(
             events
                 .iter()
@@ -2202,10 +2174,6 @@ mod open_tests {
         assert_ne!(status, 0);
 
         let events = sink.lock().unwrap().clone();
-        assert!(
-            !events.iter().any(|e| matches!(e, LoreEvent::Error(_))),
-            "no Error event must fire on the migrated terminal arm",
-        );
         let complete = events
             .iter()
             .find_map(|e| match e {
@@ -2265,10 +2233,6 @@ mod open_tests {
         assert_eq!(status, lore_base::error::AddressNotFound::FFI_CODE);
 
         let events = sink.lock().unwrap().clone();
-        assert!(
-            !events.iter().any(|e| matches!(e, LoreEvent::Error(_))),
-            "no Error event must fire on the migrated terminal arm",
-        );
         let complete = events
             .iter()
             .find_map(|e| match e {
@@ -2397,7 +2361,6 @@ mod open_tests {
         let (status, events) = flush_handle(handle).await;
         assert_eq!(status, 0);
         assert!(events.contains(&Captured::Complete(0)));
-        assert!(!events.contains(&Captured::Error));
     }
 
     #[tokio::test]
@@ -2478,10 +2441,6 @@ mod open_tests {
         assert_ne!(status, 0);
         let events = sink.lock().unwrap().clone();
         assert!(
-            !events.contains(&Captured::Error),
-            "no Error event must fire on the migrated terminal arm, got {events:?}",
-        );
-        assert!(
             events
                 .iter()
                 .any(|e| matches!(e, Captured::Complete(s) if *s != 0))
@@ -2498,7 +2457,6 @@ mod open_tests {
             fragment: lore_base::types::Fragment,
             error_code: i32,
         },
-        Error,
         CallComplete(i32),
         Other,
     }
@@ -2514,7 +2472,6 @@ mod open_tests {
                     fragment: d.fragment,
                     error_code: d.error.error_code,
                 },
-                LoreEvent::Error(_) => GetMetadataCaptured::Error,
                 LoreEvent::Complete(d) => GetMetadataCaptured::CallComplete(d.status),
                 _ => GetMetadataCaptured::Other,
             };
@@ -2686,7 +2643,6 @@ mod open_tests {
             remote_skipped: u8,
             error_code: i32,
         },
-        Error,
         CallComplete(i32),
         Other,
     }
@@ -2705,7 +2661,6 @@ mod open_tests {
                     remote_skipped: d.remote_skipped,
                     error_code: d.error.error_code,
                 },
-                LoreEvent::Error(_) => ObliterateCaptured::Error,
                 LoreEvent::Complete(d) => ObliterateCaptured::CallComplete(d.status),
                 _ => ObliterateCaptured::Other,
             };
@@ -2940,7 +2895,6 @@ mod open_tests {
             target_context: lore_base::types::Context,
             error_code: i32,
         },
-        Error,
         CallComplete(i32),
         Other,
     }
@@ -2958,7 +2912,6 @@ mod open_tests {
                     target_context: d.target_context,
                     error_code: d.error.error_code,
                 },
-                LoreEvent::Error(_) => CopyCaptured::Error,
                 LoreEvent::Complete(d) => CopyCaptured::CallComplete(d.status),
                 _ => CopyCaptured::Other,
             };
@@ -6312,10 +6265,6 @@ mod open_tests {
         assert_ne!(status, 0, "open with local=1 && remote=1 must fail");
         let events = sink.lock().unwrap().clone();
         assert!(
-            !events.iter().any(|e| matches!(e, Captured::Error)),
-            "no mid-stream Error event on terminal failure, got {events:?}",
-        );
-        assert!(
             events
                 .iter()
                 .any(|e| matches!(e, Captured::Complete(s) if *s != 0)),
@@ -6397,10 +6346,6 @@ mod open_tests {
         .await;
         assert_ne!(status, 0, "open with remote=1 + no remote_config must fail");
         let events = sink.lock().unwrap().clone();
-        assert!(
-            !events.iter().any(|e| matches!(e, Captured::Error)),
-            "no mid-stream Error event on terminal failure, got {events:?}",
-        );
         assert!(
             events
                 .iter()

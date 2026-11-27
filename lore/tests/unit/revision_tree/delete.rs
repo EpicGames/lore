@@ -1128,7 +1128,7 @@ async fn a_target_discarded_after_validation_fails_only_its_own_entry() {
                 planned,
             )
             .await;
-            emit_batch_complete(call_id, batch_error_code(&result));
+            emit_batch_complete(call_id, LoreErrorCode::of(&result));
             result
         },
     )
@@ -1760,7 +1760,7 @@ async fn plan_change_apply(
             let planned = plan_entries(&state, &internal.repository_context, &entries).await?;
             between(state.clone(), internal.repository_context.clone()).await;
             let result = apply_plan(state, internal.repository_context.clone(), planned).await;
-            emit_batch_complete(call_id, batch_error_code(&result));
+            emit_batch_complete(call_id, LoreErrorCode::of(&result));
             result
         },
     )
@@ -2058,10 +2058,10 @@ async fn an_added_root_gone_from_its_place_fails_its_entry_alone() {
     assert_eq!(
         delete_outcomes(&events),
         vec![
-            (10, 0, LoreErrorCode::Internal),
+            (10, 0, LoreErrorCode::NodeNotFound),
             (11, 1, LoreErrorCode::None)
         ],
-        "the entry whose root left fails alone"
+        "the entry whose root left fails alone, with the State's own code"
     );
     release(handle, store_handle_id);
 }

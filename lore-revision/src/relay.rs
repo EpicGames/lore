@@ -11,11 +11,9 @@ use tokio::sync::mpsc::unbounded_channel;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::event::EventError;
 use crate::event::LoreCompleteEventData;
 use crate::event::LoreEndEventData;
 use crate::event::LoreErrorDetail;
-use crate::event::LoreErrorEventData;
 use crate::event::LoreEvent;
 use crate::event::LoreLogEventData;
 use crate::interface::LoreEventCallback;
@@ -149,7 +147,7 @@ impl EventDispatcher {
         Self::default()
     }
 
-    /// This dispatcher, whose `send`, `send_with_bytes` and `send_error` send only the events for
+    /// This dispatcher, whose `send` and `send_with_bytes` send only the events for
     /// which `pass` returns `true`, dropping any other before it reaches the channel. The
     /// `Complete` that [`complete`](Self::complete) sends and the `End` the forwarder sends always
     /// reach the callback.
@@ -221,13 +219,6 @@ impl EventDispatcher {
         if let Some(sender) = self.sender() {
             drop(sender.send((event, keepalive)));
         }
-    }
-
-    pub fn send_error(&self, error: impl EventError) {
-        crate::lore_error!("{}", error.inner());
-        self.send(LoreEvent::Error(LoreErrorEventData::from_inner_error(
-            &error,
-        )));
     }
 
     /// Waits for every event sent so far to have been through the callback, so a

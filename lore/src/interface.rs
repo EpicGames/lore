@@ -19,7 +19,6 @@ pub type LoreLogConfig = crate::log::LoreLogConfig;
 pub type LoreGlobalArgs = lore_revision::interface::LoreGlobalArgs;
 pub type LoreEventCallback = lore_revision::interface::LoreEventCallback;
 pub type LoreEventCallbackConfig = lore_revision::interface::LoreEventCallbackConfig;
-pub type LoreError = lore_revision::interface::LoreError;
 pub type LoreMetadata = lore_revision::interface::LoreMetadata;
 pub type LoreMetadataType = lore_revision::interface::LoreMetadataType;
 pub type LoreNodeType = lore_revision::interface::LoreNodeType;
@@ -55,7 +54,6 @@ use crate::call_delegation::run_command_locally;
 use crate::call_delegation::run_synchronously;
 use crate::log;
 
-pub type LoreErrorEventData = lore_revision::event::LoreErrorEventData;
 pub type LoreLogEventData = lore_revision::event::LoreLogEventData;
 pub type LoreMetadataEventData = lore_revision::event::LoreMetadataEventData;
 
@@ -128,7 +126,6 @@ pub type LoreAuthUserInfoArgs = crate::auth::LoreAuthUserInfoArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -170,7 +167,6 @@ pub type LoreAuthLoginWithTokenArgs = crate::auth::LoreAuthLoginWithTokenArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -213,7 +209,6 @@ pub type LoreAuthListArgs = crate::auth::LoreAuthListArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -260,7 +255,6 @@ pub type LoreAuthLogoutArgs = crate::auth::LoreAuthLogoutArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -297,7 +291,6 @@ pub type LoreAuthClearArgs = crate::auth::LoreAuthClearArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -375,7 +368,6 @@ pub type LoreAuthLocalUserInfoArgs = crate::auth::LoreAuthLocalUserInfoArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -424,7 +416,6 @@ pub type LoreAuthLoginInteractiveArgs = crate::auth::LoreAuthLoginInteractiveArg
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -457,7 +448,6 @@ pub extern "C" fn lore_auth_login_interactive(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -492,7 +482,6 @@ pub type LoreBranchCreateArgs = crate::branch::LoreBranchCreateArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -529,7 +518,6 @@ pub extern "C" fn lore_branch_create(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -568,7 +556,6 @@ pub type LoreBranchInfoArgs = crate::branch::LoreBranchInfoArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -599,7 +586,6 @@ pub extern "C" fn lore_branch_info(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -632,7 +618,6 @@ pub type LoreBranchDiffArgs = crate::branch::LoreBranchDiffArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -670,7 +655,6 @@ pub extern "C" fn lore_branch_diff(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -710,7 +694,6 @@ pub type LoreBranchProtectArgs = crate::branch::LoreBranchProtectArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -741,7 +724,6 @@ pub extern "C" fn lore_branch_protect(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -774,7 +756,6 @@ pub type LoreBranchUnprotectArgs = crate::branch::LoreBranchUnprotectArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -805,7 +786,6 @@ pub extern "C" fn lore_branch_unprotect(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -827,6 +807,10 @@ pub type LoreBranchArchiveArgs = crate::branch::LoreBranchArchiveArgs;
 
 /// Archive a branch in the repository.
 ///
+/// The current branch is refused with `LORE_ERROR_CODE_DELETE_CURRENT`. A layer or link that
+/// fails to archive the branch is logged as a warning naming its repository, and the call does
+/// not fail for it.
+///
 /// # Events
 ///
 /// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
@@ -838,7 +822,6 @@ pub type LoreBranchArchiveArgs = crate::branch::LoreBranchArchiveArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -869,7 +852,6 @@ pub extern "C" fn lore_branch_archive(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -904,7 +886,6 @@ pub type LoreBranchListArgs = crate::branch::LoreBranchListArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -937,7 +918,6 @@ pub extern "C" fn lore_branch_list(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -972,7 +952,6 @@ pub type LoreBranchMergeAbortArgs = crate::branch::LoreBranchMergeAbortArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1005,7 +984,6 @@ pub extern "C" fn lore_branch_merge_abort(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1045,7 +1023,6 @@ pub type LoreLinkPinResolution = lore_revision::branch::merge::LoreLinkPinResolu
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1077,7 +1054,6 @@ pub extern "C" fn lore_branch_merge_conflicts_list(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1111,7 +1087,6 @@ pub type LoreBranchMergeUnresolveArgs = crate::branch::LoreBranchMergeUnresolveA
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1143,7 +1118,6 @@ pub extern "C" fn lore_branch_merge_unresolve(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1177,7 +1151,6 @@ pub type LoreBranchMergeIntoArgs = crate::branch::LoreBranchMergeIntoArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1223,7 +1196,6 @@ pub extern "C" fn lore_branch_merge_into(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1271,7 +1243,6 @@ pub type LoreBranchMergeResolveArgs = crate::branch::LoreBranchMergeResolveArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1304,7 +1275,6 @@ pub extern "C" fn lore_branch_merge_resolve(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1339,7 +1309,6 @@ pub type LoreBranchMergeResolveMineArgs = crate::branch::LoreBranchMergeResolveM
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1372,7 +1341,6 @@ pub extern "C" fn lore_branch_merge_resolve_mine(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1407,7 +1375,6 @@ pub type LoreBranchMergeResolveTheirsArgs = crate::branch::LoreBranchMergeResolv
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1440,7 +1407,6 @@ pub extern "C" fn lore_branch_merge_resolve_theirs(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1475,7 +1441,6 @@ pub type LoreBranchMergeRestartArgs = crate::branch::LoreBranchMergeRestartArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1508,7 +1473,6 @@ pub extern "C" fn lore_branch_merge_restart(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1543,7 +1507,6 @@ pub type LoreBranchMergeStartArgs = crate::branch::LoreBranchMergeStartArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1586,7 +1549,6 @@ pub extern "C" fn lore_branch_merge_start(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1631,7 +1593,6 @@ pub type LoreBranchSwitchArgs = crate::branch::LoreBranchSwitchArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1669,7 +1630,6 @@ pub extern "C" fn lore_branch_switch(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1709,7 +1669,6 @@ pub type LoreBranchResetArgs = crate::branch::LoreBranchResetArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1740,7 +1699,6 @@ pub extern "C" fn lore_branch_reset(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1773,7 +1731,6 @@ pub type LoreBranchLatestListArgs = crate::branch::LoreBranchLatestListArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1804,7 +1761,6 @@ pub extern "C" fn lore_branch_latest_list(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1837,7 +1793,6 @@ pub type LoreBranchPushArgs = crate::branch::LoreBranchPushArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1878,7 +1833,6 @@ pub extern "C" fn lore_branch_push(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -1987,7 +1941,6 @@ pub type LoreFileInfoArgs = crate::file::LoreFileInfoArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2018,7 +1971,6 @@ pub extern "C" fn lore_file_info(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2051,7 +2003,6 @@ pub type LoreFileDiffArgs = crate::file::LoreFileDiffArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2082,7 +2033,6 @@ pub extern "C" fn lore_file_diff(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2115,7 +2065,6 @@ pub type LoreFileHashArgs = crate::file::LoreFileHashArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2146,7 +2095,6 @@ pub extern "C" fn lore_file_hash(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2179,7 +2127,6 @@ pub type LoreFileHistoryArgs = crate::file::LoreFileHistoryArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2210,7 +2157,6 @@ pub extern "C" fn lore_file_history(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2258,7 +2204,6 @@ pub type LoreFileAuditArgs = crate::file::LoreFileAuditArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2289,7 +2234,6 @@ pub extern "C" fn lore_file_audit(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2322,7 +2266,6 @@ pub type LoreFileMetadataClearArgs = crate::file::LoreFileMetadataClearArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2353,7 +2296,6 @@ pub extern "C" fn lore_file_metadata_clear(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2386,7 +2328,6 @@ pub type LoreFileMetadataGetArgs = crate::file::LoreFileMetadataGetArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2417,7 +2358,6 @@ pub extern "C" fn lore_file_metadata_get(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2450,7 +2390,6 @@ pub type LoreFileMetadataListArgs = crate::file::LoreFileMetadataListArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2481,7 +2420,6 @@ pub extern "C" fn lore_file_metadata_list(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2514,7 +2452,6 @@ pub type LoreFileMetadataSetArgs = crate::file::LoreFileMetadataSetArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -2539,7 +2476,6 @@ pub extern "C" fn lore_file_metadata_set(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -2566,7 +2502,6 @@ pub type LoreFileResetArgs = crate::file::LoreFileResetArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2603,7 +2538,6 @@ pub extern "C" fn lore_file_reset(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2642,7 +2576,6 @@ pub type LoreFileResetToLastMergedArgs = crate::file::LoreFileResetToLastMergedA
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2678,7 +2611,6 @@ pub extern "C" fn lore_file_reset_to_last_merged(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2716,7 +2648,6 @@ pub type LoreFileStageArgs = crate::file::LoreFileStageArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2752,7 +2683,6 @@ pub extern "C" fn lore_file_stage(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2790,7 +2720,6 @@ pub type LoreFileStageMergeArgs = crate::file::LoreFileStageMergeArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2824,7 +2753,6 @@ pub extern "C" fn lore_file_stage_merge(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2860,7 +2788,6 @@ pub type LoreFileStageMoveArgs = crate::file::LoreFileStageMoveArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2894,7 +2821,6 @@ pub extern "C" fn lore_file_stage_move(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2933,7 +2859,6 @@ pub type LoreFileDirtyArgs = crate::file::LoreFileDirtyArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -2965,7 +2890,6 @@ pub extern "C" fn lore_file_dirty(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3011,7 +2935,6 @@ pub type LoreFileDirtyMoveArgs = crate::file::LoreFileDirtyMoveArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3046,7 +2969,6 @@ pub extern "C" fn lore_file_dirty_move(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3086,7 +3008,6 @@ pub type LoreFileDirtyCopyArgs = crate::file::LoreFileDirtyCopyArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -3111,7 +3032,6 @@ pub extern "C" fn lore_file_dirty_copy(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -3138,7 +3058,6 @@ pub type LoreFileUnstageArgs = crate::file::LoreFileUnstageArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3173,7 +3092,6 @@ pub extern "C" fn lore_file_unstage(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3210,7 +3128,6 @@ pub type LoreFileWriteArgs = crate::file::LoreFileWriteArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3241,7 +3158,6 @@ pub extern "C" fn lore_file_write(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3274,7 +3190,6 @@ pub type LoreFileObliterateArgs = crate::file::LoreFileObliterateArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3305,7 +3220,6 @@ pub extern "C" fn lore_file_obliterate(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3338,7 +3252,6 @@ pub type LoreFileDumpArgs = crate::file::LoreFileDumpArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3369,7 +3282,6 @@ pub extern "C" fn lore_file_dump(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3400,7 +3312,6 @@ pub type LoreFileDependencyAddArgs = crate::dependency::LoreFileDependencyAddArg
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3429,7 +3340,6 @@ pub extern "C" fn lore_file_dependency_add(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3462,7 +3372,6 @@ pub type LoreFileDependencyRemoveArgs = crate::dependency::LoreFileDependencyRem
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3491,7 +3400,6 @@ pub extern "C" fn lore_file_dependency_remove(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3524,7 +3432,6 @@ pub type LoreFileDependencyListArgs = crate::dependency::LoreFileDependencyListA
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3555,7 +3462,6 @@ pub extern "C" fn lore_file_dependency_list(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3592,7 +3498,6 @@ pub type LoreLockFileAcquireArgs = crate::lock::LoreLockFileAcquireArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3624,7 +3529,6 @@ pub extern "C" fn lore_lock_file_acquire(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3658,7 +3562,6 @@ pub type LoreLockFileStatusArgs = crate::lock::LoreLockFileStatusArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3690,7 +3593,6 @@ pub extern "C" fn lore_lock_file_status(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3728,7 +3630,6 @@ pub type LoreLockFileQueryArgs = crate::lock::LoreLockFileQueryArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3760,7 +3661,6 @@ pub extern "C" fn lore_lock_file_query(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3794,7 +3694,6 @@ pub type LoreLockFileReleaseArgs = crate::lock::LoreLockFileReleaseArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3826,7 +3725,6 @@ pub extern "C" fn lore_lock_file_release(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3860,7 +3758,6 @@ pub type LoreLinkAddArgs = crate::link::LoreLinkAddArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3894,7 +3791,6 @@ pub extern "C" fn lore_link_add(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3930,7 +3826,6 @@ pub type LoreLinkRemoveArgs = crate::link::LoreLinkRemoveArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3961,7 +3856,6 @@ pub extern "C" fn lore_link_remove(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -3994,7 +3888,6 @@ pub type LoreLinkInfoArgs = crate::link::LoreLinkInfoArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4025,7 +3918,6 @@ pub extern "C" fn lore_link_info(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4058,7 +3950,6 @@ pub type LoreLinkListArgs = crate::link::LoreLinkListArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4089,7 +3980,6 @@ pub extern "C" fn lore_link_list(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4122,7 +4012,6 @@ pub type LoreLinkListStagedArgs = crate::link::LoreLinkListStagedArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4153,7 +4042,6 @@ pub extern "C" fn lore_link_list_staged(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4186,7 +4074,6 @@ pub type LoreLinkUpdateArgs = crate::link::LoreLinkUpdateArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4217,7 +4104,6 @@ pub extern "C" fn lore_link_update(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4256,7 +4142,6 @@ pub type LoreRepositoryCloneArgs = crate::repository::LoreRepositoryCloneArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4296,7 +4181,6 @@ pub extern "C" fn lore_repository_clone(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4338,7 +4222,6 @@ pub type LoreRepositoryInfoArgs = crate::repository::LoreRepositoryInfoArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4369,7 +4252,6 @@ pub extern "C" fn lore_repository_info(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4402,7 +4284,6 @@ pub type LoreRepositoryDumpArgs = crate::repository::LoreRepositoryDumpArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4436,7 +4317,6 @@ pub extern "C" fn lore_repository_dump(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4473,7 +4353,6 @@ pub type LoreRepositoryCreateMetadata = crate::repository::LoreRepositoryCreateM
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4504,7 +4383,6 @@ pub extern "C" fn lore_repository_create(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4537,7 +4415,6 @@ pub type LoreRepositoryDeleteArgs = crate::repository::LoreRepositoryDeleteArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -4562,7 +4439,6 @@ pub extern "C" fn lore_repository_delete(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -4589,7 +4465,6 @@ pub type LoreRepositoryFlushArgs = crate::repository::LoreRepositoryFlushArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -4614,7 +4489,6 @@ pub extern "C" fn lore_repository_flush(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -4641,7 +4515,6 @@ pub type LoreRepositoryGcArgs = crate::repository::LoreRepositoryGcArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -4666,7 +4539,6 @@ pub extern "C" fn lore_repository_gc(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -4698,7 +4570,6 @@ pub type LoreRepositoryReleaseArgs = crate::repository::LoreRepositoryReleaseArg
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -4723,7 +4594,6 @@ pub extern "C" fn lore_repository_release(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -4750,7 +4620,6 @@ pub type LoreLayerAddArgs = crate::layer::LoreLayerAddArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4781,7 +4650,6 @@ pub extern "C" fn lore_layer_add(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4814,7 +4682,6 @@ pub type LoreLayerRemoveArgs = crate::layer::LoreLayerRemoveArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -4839,7 +4706,6 @@ pub extern "C" fn lore_layer_remove(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -4866,7 +4732,6 @@ pub type LoreLayerListArgs = crate::layer::LoreLayerListArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4897,7 +4762,6 @@ pub extern "C" fn lore_layer_list(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4930,7 +4794,6 @@ pub type LoreRepositoryListArgs = crate::repository::LoreRepositoryListArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4961,7 +4824,6 @@ pub extern "C" fn lore_repository_list(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -4994,7 +4856,6 @@ pub type LoreRepositoryStatusArgs = crate::repository::LoreRepositoryStatusArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5027,7 +4888,6 @@ pub extern "C" fn lore_repository_status(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5063,7 +4923,6 @@ pub type LoreRepositoryStoreImmutableQueryArgs =
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5094,7 +4953,6 @@ pub extern "C" fn lore_repository_store_immutable_query(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5128,7 +4986,6 @@ pub type LoreRepositoryVerifyFragmentArgs = crate::repository::LoreRepositoryVer
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5162,7 +5019,6 @@ pub extern "C" fn lore_repository_verify_state(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5198,7 +5054,6 @@ pub type LoreRevisionCommitArgs = crate::revision::LoreRevisionCommitArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5234,7 +5089,6 @@ pub extern "C" fn lore_revision_commit(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5272,7 +5126,6 @@ pub type LoreRevisionAmendArgs = crate::revision::LoreRevisionAmendArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5304,7 +5157,6 @@ pub extern "C" fn lore_revision_amend(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5338,7 +5190,6 @@ pub type LoreRevisionInfoArgs = crate::revision::LoreRevisionInfoArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5371,7 +5222,6 @@ pub extern "C" fn lore_revision_info(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5406,7 +5256,6 @@ pub type LoreRevisionDiffArgs = crate::revision::LoreRevisionDiffArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5438,7 +5287,6 @@ pub extern "C" fn lore_revision_diff(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5472,7 +5320,6 @@ pub type LoreRevisionFindArgs = crate::revision::LoreRevisionFindArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5503,7 +5350,6 @@ pub extern "C" fn lore_revision_find(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5536,7 +5382,6 @@ pub type LoreRevisionHistoryArgs = crate::revision::LoreRevisionHistoryArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5568,7 +5413,6 @@ pub extern "C" fn lore_revision_history(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5602,7 +5446,6 @@ pub type LoreRevisionRestoreArgs = crate::revision::LoreRevisionRestoreArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5648,7 +5491,6 @@ pub extern "C" fn lore_revision_restore(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5696,7 +5538,6 @@ pub type LoreRevisionMetadataClearArgs = crate::revision::LoreRevisionMetadataCl
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5727,7 +5568,6 @@ pub extern "C" fn lore_revision_metadata_clear(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5760,7 +5600,6 @@ pub type LoreRevisionMetadataGetArgs = crate::revision::LoreRevisionMetadataGetA
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5791,7 +5630,6 @@ pub extern "C" fn lore_revision_metadata_get(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5824,7 +5662,6 @@ pub type LoreRevisionMetadataListArgs = crate::revision::LoreRevisionMetadataLis
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5855,7 +5692,6 @@ pub extern "C" fn lore_revision_metadata_list(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5888,7 +5724,6 @@ pub type LoreRevisionMetadataSetArgs = crate::revision::LoreRevisionMetadataSetA
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -5913,7 +5748,6 @@ pub extern "C" fn lore_revision_metadata_set(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -5940,7 +5774,6 @@ pub type LoreRevisionSyncArgs = crate::revision::LoreRevisionSyncArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -5986,7 +5819,6 @@ pub extern "C" fn lore_revision_sync(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6035,7 +5867,6 @@ pub type LoreRevisionBisectArgs = crate::revision::LoreRevisionBisectArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6077,7 +5908,6 @@ pub extern "C" fn lore_revision_bisect(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6121,7 +5951,6 @@ pub type LoreRevisionCherryPickArgs = crate::revision::LoreRevisionCherryPickArg
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6163,7 +5992,6 @@ pub extern "C" fn lore_revision_cherry_pick(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6207,7 +6035,6 @@ pub type LoreRevisionRevertArgs = crate::revision::LoreRevisionRevertArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6249,7 +6076,6 @@ pub extern "C" fn lore_revision_revert(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6293,7 +6119,6 @@ pub type LoreRevisionRevertAbortArgs = crate::revision::LoreRevisionRevertAbortA
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6326,7 +6151,6 @@ pub extern "C" fn lore_revision_revert_abort(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6361,7 +6185,6 @@ pub type LoreRevisionRevertUnresolveArgs = crate::revision::LoreRevisionRevertUn
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6393,7 +6216,6 @@ pub extern "C" fn lore_revision_revert_unresolve(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6427,7 +6249,6 @@ pub type LoreRevisionRevertRestartArgs = crate::revision::LoreRevisionRevertRest
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6460,7 +6281,6 @@ pub extern "C" fn lore_revision_revert_restart(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6495,7 +6315,6 @@ pub type LoreRevisionRevertResolveArgs = crate::revision::LoreRevisionRevertReso
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6527,7 +6346,6 @@ pub extern "C" fn lore_revision_revert_resolve(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6561,7 +6379,6 @@ pub type LoreRevisionRevertResolveMineArgs = crate::revision::LoreRevisionRevert
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6593,7 +6410,6 @@ pub extern "C" fn lore_revision_revert_resolve_mine(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6627,7 +6443,6 @@ pub type LoreRevisionRevertResolveTheirsArgs = crate::revision::LoreRevisionReve
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6659,7 +6474,6 @@ pub extern "C" fn lore_revision_revert_resolve_theirs(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6693,7 +6507,6 @@ pub type LoreSharedStoreCreateArgs = crate::shared_store::LoreSharedStoreCreateA
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6724,7 +6537,6 @@ pub extern "C" fn lore_shared_store_create(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6757,7 +6569,6 @@ pub type LoreSharedStoreInfoArgs = crate::shared_store::LoreSharedStoreInfoArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6788,7 +6599,6 @@ pub extern "C" fn lore_shared_store_info(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6821,7 +6631,6 @@ pub type LoreSharedStoreListArgs = crate::shared_store::LoreSharedStoreListArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6852,7 +6661,6 @@ pub extern "C" fn lore_shared_store_list(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -6886,7 +6694,6 @@ pub type LoreSharedStoreSetUseAutomaticallyArgs =
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -6911,7 +6718,6 @@ pub extern "C" fn lore_shared_store_set_use_automatically(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -6937,7 +6743,6 @@ pub type LoreStorageOpenArgs = crate::storage::open::LoreStorageOpenArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_STORAGE_OPENED` | `lore_storage_opened_event_data_t` | Emitted on success carrying the opened handle id |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` on success or the error code on failure |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_storage_open(
@@ -7001,7 +6806,6 @@ pub type LoreStorageGetArgs = crate::storage::get::LoreStorageGetArgs;
 /// | `LORE_EVENT_STORAGE_GET_HEADER` | `lore_storage_get_header_event_data_t` | Size of the item's reassembled content, emitted before any DATA events |
 /// | `LORE_EVENT_STORAGE_GET_DATA` | `lore_storage_get_data_event_data_t` | Payload bytes — valid only during the callback invocation |
 /// | `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE` | `lore_storage_get_item_complete_event_data_t` | Terminal per-item event |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_storage_get(
@@ -7054,7 +6858,6 @@ pub type LoreStorageGetResolvedArgs = crate::storage::get_resolved::LoreStorageG
 /// | `LORE_EVENT_STORAGE_GET_DATA` | `lore_storage_get_data_event_data_t` | Payload bytes — valid only during the callback invocation. One event per item, or one per leaf fragment when `streaming` is set |
 /// | `LORE_EVENT_STORAGE_GET_FRAGMENT` | `lore_storage_get_fragment_event_data_t` | One leaf fragment and its payload, in content order, when `fragments` is set. The payload is valid only during the callback invocation |
 /// | `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE` | `lore_storage_get_item_complete_event_data_t` | Terminal per-item event |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_storage_get_resolved(
@@ -7219,7 +7022,6 @@ pub type LoreStorageGetMetadataArgs = crate::storage::get_metadata::LoreStorageG
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_STORAGE_GET_METADATA_ITEM_COMPLETE` | `lore_storage_get_metadata_item_complete_event_data_t` | Per-item terminal event |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_storage_get_metadata(
@@ -7626,7 +7428,6 @@ pub type LoreStorageGetFileResolvedArgs =
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE` | `lore_storage_get_item_complete_event_data_t` | Terminal per-item event, carrying the resolved address |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_storage_get_file_resolved(
@@ -7707,7 +7508,6 @@ pub type LoreServiceStartArgs = crate::service::LoreServiceStartArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -7732,7 +7532,6 @@ pub extern "C" fn lore_service_start(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -7766,7 +7565,6 @@ pub type LoreServiceStopArgs = crate::service::LoreServiceStopArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -7791,7 +7589,6 @@ pub extern "C" fn lore_service_stop(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -7830,7 +7627,6 @@ pub type LoreServiceStatusArgs = crate::service::LoreServiceStatusArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -7862,7 +7658,6 @@ pub extern "C" fn lore_service_status(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -7901,7 +7696,6 @@ pub type LoreServiceSetExecutableArgs = crate::service::LoreServiceSetExecutable
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -7926,7 +7720,6 @@ pub extern "C" fn lore_service_set_executable(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -7969,7 +7762,6 @@ pub type LoreServiceSetExternalDirectoryArgs = crate::service::LoreServiceSetExt
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -7994,7 +7786,6 @@ pub extern "C" fn lore_service_set_external_directory(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -8025,7 +7816,6 @@ pub type LoreServiceSetUseAutomaticallyArgs = crate::service::LoreServiceSetUseA
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -8050,7 +7840,6 @@ pub extern "C" fn lore_service_set_use_automatically(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 #[unsafe(no_mangle)]
@@ -8077,7 +7866,6 @@ pub type LoreNotificationSubscribeArgs = crate::notification::LoreNotificationSu
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -8113,7 +7901,6 @@ pub extern "C" fn lore_notification_subscribe(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -8151,7 +7938,6 @@ pub type LoreNotificationUnsubscribeArgs = crate::notification::LoreNotification
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -8182,7 +7968,6 @@ pub extern "C" fn lore_notification_unsubscribe(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
-/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 ///
@@ -8853,19 +8638,21 @@ pub extern "C" fn lore_revision_tree_node_path_async(
 
 pub type LoreRevisionTreeAddArgs = crate::revision_tree::add::LoreRevisionTreeAddArgs;
 
-/// Add a batch of nodes to a loaded revision tree. An entry parents onto an
-/// existing node or onto an earlier entry, so one call builds a subtree. Every
-/// entry is checked before any node is created, so one bad entry rejects the
-/// call and creates nothing; the reason names the offending entry's batch index,
-/// which a caller leaving `entry_id` at zero has no other way to identify. The entry
-/// and the call report `LORE_ERROR_CODE_OVERSIZED` for a name longer than a node
-/// name may be, and `LORE_ERROR_CODE_INVALID_ARGUMENTS` for any other bad entry. A failure
-/// after those checks pass reports `LORE_ERROR_CODE_INTERNAL` and may leave part of
-/// the batch created. An entry the tree gave up on under load, in its checks or
-/// after, reports `LORE_ERROR_CODE_SLOW_DOWN` instead, and so do the entries parented
-/// onto it. The load is heavy concurrent change on the handle, or a store asking the
-/// tree to slow down, and a caller can retry. The batch reports
-/// `LORE_ERROR_CODE_SLOW_DOWN` where every failed entry did.
+/// Add a batch of nodes to a loaded revision tree. An entry parents onto an existing
+/// node or onto an earlier entry, so one call builds a subtree. Every entry is
+/// checked before any node is created, so one bad entry rejects the call and creates
+/// nothing; the reason names the offending entry's batch index, which a caller
+/// leaving `entry_id` at zero has no other way to identify. The entry and the call
+/// report `LORE_ERROR_CODE_OVERSIZED` for a name longer than a node name may be, and
+/// `LORE_ERROR_CODE_INVALID_ARGUMENTS` for any other bad entry. A failure after those
+/// checks pass fails its entry with the code of the State's failure, and the call
+/// with `LORE_ERROR_CODE_INTERNAL`, and may leave part of the batch created. An entry
+/// the tree gave up on under load, in its checks or after, reports
+/// `LORE_ERROR_CODE_SLOW_DOWN` instead. An entry parented onto a failed entry reports that
+/// entry's code. The
+/// load is heavy concurrent change on the handle, or a store asking the tree to slow
+/// down, and a caller can retry. The batch reports `LORE_ERROR_CODE_SLOW_DOWN` where
+/// every failed entry did.
 ///
 /// A link entry's target revision is not resolved here, so a link naming a
 /// revision that cannot be read is accepted and fails only when something later
@@ -8903,15 +8690,16 @@ pub extern "C" fn lore_revision_tree_add_async(
 pub type LoreRevisionTreeDeleteArgs = crate::revision_tree::delete::LoreRevisionTreeDeleteArgs;
 
 /// Remove a batch of subtrees from a loaded revision tree. Each entry names a
-/// subtree root and removes it whole, transitive children included. Every entry
-/// is checked before any node is touched, so one bad entry rejects the call and
-/// leaves every subtree in place; the reason names the offending entry's batch
-/// index, which a caller leaving `entry_id` at zero has no other way to
-/// identify. A failure after those checks pass reports `LORE_ERROR_CODE_INTERNAL`
-/// and may leave part of the batch removed. An entry the tree gave up on under
-/// load, heavy concurrent change on the handle or a store asking it to slow down,
-/// reports `LORE_ERROR_CODE_SLOW_DOWN` instead, which a caller can retry. The batch
-/// reports `LORE_ERROR_CODE_SLOW_DOWN` where every failed entry did.
+/// subtree root and removes it whole, transitive children included. Every entry is
+/// checked before any node is touched, so one bad entry rejects the call and leaves
+/// every subtree in place; the reason names the offending entry's batch index,
+/// which a caller leaving `entry_id` at zero has no other way to identify. A
+/// failure after those checks pass fails its entry with the code of the State's
+/// failure, and the call with `LORE_ERROR_CODE_INTERNAL`, and may leave part of the
+/// batch removed. An entry the tree gave up on under load, heavy concurrent change
+/// on the handle or a store asking it to slow down, reports
+/// `LORE_ERROR_CODE_SLOW_DOWN` instead, which a caller can retry. The batch reports
+/// `LORE_ERROR_CODE_SLOW_DOWN` where every failed entry did.
 ///
 /// A node the loaded revision holds is **staged** for deletion and stays in the
 /// tree: it keeps its name and its place among its siblings, still lists through
@@ -8973,15 +8761,16 @@ pub extern "C" fn lore_revision_tree_delete_async(
 
 pub type LoreRevisionTreeModifyArgs = crate::revision_tree::modify::LoreRevisionTreeModifyArgs;
 
-/// Rewrite a batch of file nodes' `mode`, `size` and `address` in a loaded
-/// revision tree. Every entry is checked before any node is rewritten, so one bad
-/// entry rejects the call and leaves every target untouched; the reason names the
+/// Rewrite a batch of file nodes' `mode`, `size` and `address` in a loaded revision
+/// tree. Every entry is checked before any node is rewritten, so one bad entry
+/// rejects the call and leaves every target untouched; the reason names the
 /// offending entry's batch index, which a caller leaving `entry_id` at zero has no
-/// other way to identify. A failure after those checks pass reports
-/// `LORE_ERROR_CODE_INTERNAL` and may leave part of the batch rewritten. An entry
-/// the tree gave up on under load, a store asking it to slow down, reports
-/// `LORE_ERROR_CODE_SLOW_DOWN` instead, which a caller can retry. The batch reports
-/// `LORE_ERROR_CODE_SLOW_DOWN` where every failed entry did.
+/// other way to identify. A failure after those checks pass fails its entry with
+/// the code of the State's failure, and the call with `LORE_ERROR_CODE_INTERNAL`,
+/// and may leave part of the batch rewritten. An entry the tree gave up on under
+/// load, a store asking it to slow down, reports `LORE_ERROR_CODE_SLOW_DOWN`
+/// instead, which a caller can retry. The batch reports `LORE_ERROR_CODE_SLOW_DOWN`
+/// where every failed entry did.
 ///
 /// Only a file is modifiable: a directory's size and address are derived at
 /// commit and a link's address is its target. A zero `address.context` preserves
@@ -9024,16 +8813,17 @@ pub type LoreRevisionTreeMoveArgs = crate::revision_tree::move_node::LoreRevisio
 
 /// Move a batch of nodes to new parents and/or new names in a loaded revision tree. An
 /// entry naming the node's current parent renames it where it is. Every entry is checked
-/// before any node is moved, so one bad entry rejects the call and leaves every node
-/// where it was; the reason names the offending entry's batch index, which a caller
-/// leaving `entry_id` at zero has no other way to identify. The entry and the call report
+/// before any node is moved, so one bad entry rejects the call and leaves every node where
+/// it was; the reason names the offending entry's batch index, which a caller leaving
+/// `entry_id` at zero has no other way to identify. The entry and the call report
 /// `LORE_ERROR_CODE_OVERSIZED` for a name longer than a node name may be, and
-/// `LORE_ERROR_CODE_INVALID_ARGUMENTS` for any other bad entry. A failure after those checks
-/// pass reports `LORE_ERROR_CODE_INTERNAL` and may leave earlier entries applied. An entry
-/// the tree gave up on under load, in its checks or after, reports
-/// `LORE_ERROR_CODE_SLOW_DOWN` instead. The load is heavy concurrent change on the handle,
-/// or a store asking the tree to slow down, and a caller can retry. The batch reports
-/// `LORE_ERROR_CODE_SLOW_DOWN` where every failed entry did.
+/// `LORE_ERROR_CODE_INVALID_ARGUMENTS` for any other bad entry. A failure after those
+/// checks pass fails its entry with the code of the State's failure, and the call with
+/// `LORE_ERROR_CODE_INTERNAL`, and may leave earlier entries applied. An entry the tree
+/// gave up on under load, in its checks or after, reports `LORE_ERROR_CODE_SLOW_DOWN`
+/// instead. The load is heavy concurrent change on the handle, or a store asking the tree
+/// to slow down, and a caller can retry. The batch reports `LORE_ERROR_CODE_SLOW_DOWN`
+/// where every failed entry did.
 ///
 /// A move keeps the node: its node id, its `file_id` and its children come along, and
 /// the change is recorded as a move rather than as a deletion and an addition, so the
@@ -9275,9 +9065,9 @@ pub type LoreRevisionTreeCommitOptions =
 /// edits. The one failure that still poisons the handle is a restore that itself
 /// fails, which reports `INTERNAL` saying so. When the branch had advanced,
 /// `new_tip_hash` on the terminal carries that tip, which is also how a caller tells
-/// that failure apart: neither a tip collision nor an empty commit has a
-/// `lore_error_code_t` of its own, so both report `INTERNAL` with the reason in the
-/// completion detail — the same codes the file-system commit returns.
+/// that failure apart: the call's error set holds neither `BRANCH_ADVANCED` nor
+/// `NOTHING_STAGED`, which the file-system commit reports, so a tip collision and an
+/// empty commit both report `INTERNAL` with the reason in the completion detail.
 ///
 /// **A merge revision.** `options.parent_other` names a second parent, the merged
 /// revision; zero commits a revision with one parent. The loaded revision is always the

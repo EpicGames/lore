@@ -8,10 +8,8 @@ use serde::Serialize;
 
 use crate::errors::*;
 use crate::event;
-use crate::event::EventError;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::with_operation;
-use crate::interface::LoreError;
 use crate::lore::Address;
 use crate::node::NodeFlags;
 use crate::repository::RepositoryContext;
@@ -89,22 +87,6 @@ pub enum ObliterateError {
     TokenNotFound,
     WriteRequired,
     MissingIdentity,
-}
-
-impl EventError for ObliterateError {
-    fn translated(&self) -> LoreError {
-        match self {
-            ObliterateError::InvalidArguments(_)
-            | ObliterateError::InvalidPath(_)
-            | ObliterateError::InvalidAddress(_) => LoreError::InvalidArguments,
-            ObliterateError::FileNotFound(_) => LoreError::FileNotFound,
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 pub(crate) async fn obliterate_file(

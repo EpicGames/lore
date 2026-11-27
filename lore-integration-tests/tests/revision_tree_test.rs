@@ -33,7 +33,6 @@ mod support {
     use lore_revision::event::LoreEvent;
     use lore_revision::event::revision_tree::LoreRevisionTreeInfoEventData;
     use lore_revision::event::revision_tree::LoreRevisionTreeNodeInfoEventData;
-    use lore_revision::interface::LoreError;
     use lore_revision::interface::LoreEventCallback;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreMetadata;
@@ -46,7 +45,7 @@ mod support {
     /// The status a batch rejected during validation completes with. Asserted
     /// exactly rather than as "not zero", so a rejection that instead blew up in
     /// the apply phase — leaving part of the batch applied — fails the test.
-    pub(super) const REJECTED_STATUS: i32 = LoreError::InvalidArguments as i32;
+    pub(super) const REJECTED_STATUS: i32 = LoreErrorCode::InvalidArguments as i32;
 
     #[derive(Debug, Clone, PartialEq)]
     pub(super) enum Captured {
@@ -320,7 +319,6 @@ mod add_tests {
     use lore_base::types::Partition;
     use lore_revision::event::LoreErrorCode;
     use lore_revision::interface::LoreArray;
-    use lore_revision::interface::LoreError;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreNodeType;
     use lore_revision::interface::LoreString;
@@ -1001,7 +999,7 @@ mod add_tests {
         .await;
         assert_eq!(
             status,
-            LoreError::Oversized as i32,
+            LoreErrorCode::Oversized as i32,
             "a name over the length bound must reject its batch, got {events:?}"
         );
         assert_eq!(

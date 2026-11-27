@@ -19,13 +19,11 @@ use crate::branch;
 use crate::change::NodeChange;
 use crate::errors::*;
 use crate::event;
-use crate::event::EventError;
 use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::fs::realize::VerifiedChanges;
-use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreNodeType;
 use crate::interface::LoreString;
@@ -124,33 +122,6 @@ pub enum LinkError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
-}
-
-impl EventError for LinkError {
-    fn translated(&self) -> LoreError {
-        match self {
-            LinkError::Disconnected(_) => LoreError::Connection,
-            LinkError::SlowDown(_) => LoreError::SlowDown,
-            LinkError::Oversized(_) => LoreError::Oversized,
-            LinkError::FileNotFound(_) => LoreError::FileNotFound,
-            LinkError::NotFound(_)
-            | LinkError::LayerNotFound(_)
-            | LinkError::RevisionNotFound(_)
-            | LinkError::BranchNotFound(_)
-            | LinkError::LinkNotFound(_)
-            | LinkError::LinkPathNotFound(_) => LoreError::NotFound,
-            LinkError::AddressNotFound(_) => LoreError::AddressNotFound,
-            LinkError::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            LinkError::InvalidPath(_) | LinkError::InvalidArguments(_) => {
-                LoreError::InvalidArguments
-            }
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Context information for discovered links during tree traversal

@@ -25,9 +25,7 @@ use crate::errors::PayloadNotFound;
 use crate::errors::SlowDown;
 use crate::errors::WriteRequired;
 use crate::event;
-use crate::event::EventError;
 use crate::immutable;
-use crate::interface::LoreError;
 use crate::lore::Address;
 use crate::lore::BranchId;
 use crate::lore::Context;
@@ -100,19 +98,6 @@ pub enum BranchMetadataError {
     NotAuthorized,
     NotSupported,
     FileNotFound,
-}
-
-impl EventError for BranchMetadataError {
-    fn translated(&self) -> LoreError {
-        match self {
-            BranchMetadataError::Disconnected(_) => LoreError::Connection,
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 fn is_read_only_key(key: &str) -> bool {

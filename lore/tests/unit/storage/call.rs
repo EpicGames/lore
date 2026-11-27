@@ -13,13 +13,12 @@ use lore_revision::interface::LoreGlobalArgs;
 use lore_storage::StorageError;
 
 use crate::call::test_support::completes;
-use crate::call::test_support::has_error_event;
 use crate::call::test_support::recording_callback;
 use crate::call::test_support::registered_store;
 use crate::call::test_support::take_recorded;
 
 #[tokio::test]
-async fn handle_miss_completes_with_error_code_and_no_error_event() {
+async fn handle_miss_completes_with_error_code() {
     let (sink, callback) = recording_callback();
     let status = storage_call(
         LoreGlobalArgs::default(),
@@ -32,11 +31,6 @@ async fn handle_miss_completes_with_error_code_and_no_error_event() {
     .await;
 
     let events = take_recorded(&sink);
-    assert!(
-        !has_error_event(&events),
-        "no Error event must be emitted on terminal failure"
-    );
-
     let completes = completes(&events);
     assert_eq!(completes.len(), 1, "exactly one Complete event");
 
@@ -96,7 +90,7 @@ async fn happy_path_completes_with_status_zero_and_decrements_counter() {
 }
 
 #[tokio::test]
-async fn op_error_completes_with_error_code_and_no_error_event() {
+async fn op_error_completes_with_error_code() {
     let (store, store_handle) = registered_store("call-test").await;
     let (sink, callback) = recording_callback();
     let status = storage_call(
@@ -119,11 +113,6 @@ async fn op_error_completes_with_error_code_and_no_error_event() {
     );
 
     let events = take_recorded(&sink);
-    assert!(
-        !has_error_event(&events),
-        "no Error event must be emitted on terminal failure"
-    );
-
     let completes = completes(&events);
     assert_eq!(completes.len(), 1, "exactly one Complete event");
 

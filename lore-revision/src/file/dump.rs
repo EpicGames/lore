@@ -79,8 +79,6 @@ pub enum DumpError {
     MissingIdentity,
 }
 
-impl crate::event::EventError for DumpError {}
-
 pub(crate) async fn dump_file(
     repository: Arc<RepositoryContext>,
     path: String,

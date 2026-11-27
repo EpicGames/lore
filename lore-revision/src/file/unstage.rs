@@ -13,7 +13,6 @@ use serde::Serialize;
 
 use crate::errors::*;
 use crate::event;
-use crate::event::EventError;
 use crate::file::stage::route_layer_paths;
 use crate::filter::Filter;
 use crate::filter::FilterMode;
@@ -22,7 +21,6 @@ use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreArray;
-use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
 use crate::layer;
@@ -170,21 +168,6 @@ pub enum UnstageError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
-}
-
-impl EventError for UnstageError {
-    fn translated(&self) -> LoreError {
-        match self {
-            UnstageError::InvalidArguments(_) | UnstageError::InvalidPath(_) => {
-                LoreError::InvalidArguments
-            }
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 #[derive(Default)]

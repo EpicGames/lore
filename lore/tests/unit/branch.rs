@@ -14,7 +14,6 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::BranchId;
 use lore_error_set::FfiError;
 use lore_revision::branch::BranchError;
-use lore_revision::event::LoreEvent;
 use lore_revision::interface::ExecutionContext;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::relay::EventDispatcher;
@@ -23,8 +22,6 @@ use lore_revision::repository::RepositoryContext;
 use lore_revision::test_util::context_with_state;
 use lore_transport::ProtocolError;
 
-use crate::call::test_support::has_error_event;
-use crate::call::test_support::recording_callback;
 use crate::revision_graph::support::create_in_store;
 use crate::revision_graph::support::hash;
 use crate::revision_graph::support::new_branch;
@@ -59,27 +56,20 @@ fn cascade_scope_rejects_a_path_together_with_include_all() {
     );
 }
 
-/// What [`archive_feature`] saw: the archive's result and every event its call sent.
-struct Archived {
-    result: Result<(), BranchError>,
-    events: Vec<LoreEvent>,
-}
-
 /// Runs `archive_impl` of the branch named `feature`, cascading to the layer `layer` where it isn't
 /// empty, in a repository with no remote, after `setup` has prepared the repository with the
 /// branch's id.
 async fn archive_feature<F: Future<Output = ()>>(
     layer: &str,
     setup: impl FnOnce(Arc<RepositoryContext>, BranchId) -> F,
-) -> Archived {
-    let (events, callback) = recording_callback();
+) -> Result<(), BranchError> {
     let execution = Arc::new(ExecutionContext::new_client(
         LoreGlobalArgs::default(),
-        EventDispatcher::new(callback),
+        EventDispatcher::no_dispatch(),
     ));
     let layer = LoreString::from(layer);
-    let result = LORE_CONTEXT
-        .scope(execution.clone(), async move {
+    LORE_CONTEXT
+        .scope(execution, async move {
             let store = in_memory_for_tests("archive").await;
             let repository_id = new_repository();
             let branch = new_branch();
@@ -98,57 +88,48 @@ async fn archive_feature<F: Future<Output = ()>>(
             )
             .await
         })
-        .await;
-    execution.dispatcher.drain().await;
-    let events = std::mem::take(&mut *events.lock().unwrap());
-    Archived { result, events }
+        .await
 }
 
-/// `lore branch archive` of the current branch fails with `DeleteCurrent` and sends no `Error` event.
+/// `lore branch archive` of the current branch fails with `DeleteCurrent`.
 #[tokio::test]
 async fn archive_of_the_current_branch_fails_with_delete_current() {
-    let archived = archive_feature("", |repository, branch| async move {
+    let result = archive_feature("", |repository, branch| async move {
         lore_revision::instance::store_current_anchor_branch(&repository, branch)
             .await
             .expect("stores the current branch");
     })
     .await;
 
-    let result = &archived.result;
     assert!(
         result.as_ref().is_err_and(|err| err.is_delete_current()),
         "got {result:?}"
     );
-    assert!(!has_error_event(&archived.events));
 }
 
-/// `lore branch archive` of the repository's default branch fails with `DeleteDefault` and sends no
-/// `Error` event.
+/// `lore branch archive` of the repository's default branch fails with `DeleteDefault`.
 #[tokio::test]
 async fn archive_of_the_default_branch_fails_with_delete_default() {
-    let archived = archive_feature("", |repository, branch| async move {
+    let result = archive_feature("", |repository, branch| async move {
         store_repository_metadata(&repository, branch).await;
     })
     .await;
 
-    let result = &archived.result;
     assert!(
         result.as_ref().is_err_and(|err| err.is_delete_default()),
         "got {result:?}"
     );
-    assert!(!has_error_event(&archived.events));
 }
 
 /// `lore branch archive` of the default branch with a layer the repository doesn't have fails
 /// with the local refusal, `DeleteDefault`, rather than with the layer's failure.
 #[tokio::test]
 async fn archive_refusal_takes_precedence_over_a_failed_cascade() {
-    let archived = archive_feature("not-a-layer", |repository, branch| async move {
+    let result = archive_feature("not-a-layer", |repository, branch| async move {
         store_repository_metadata(&repository, branch).await;
     })
     .await;
 
-    let result = &archived.result;
     assert!(
         result.as_ref().is_err_and(|err| err.is_delete_default()),
         "got {result:?}"

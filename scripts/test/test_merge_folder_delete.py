@@ -243,7 +243,6 @@ def test_merge_folder_delete_with_added_child(new_lore_repo):
     )
     logger.info("merge_start output:\n%s", output)
 
-    error_events: list[dict] = []
     merge_end: dict | None = None
     complete_status: int | None = None
     for line in output.strip().split("\n"):
@@ -256,17 +255,11 @@ def test_merge_folder_delete_with_added_child(new_lore_repo):
             continue
         tag = item.get("tagName")
         data = item.get("data", {})
-        if tag == "error":
-            error_events.append(data)
-        elif tag == "branchMergeStartEnd":
+        if tag == "branchMergeStartEnd":
             merge_end = data
         elif tag == "complete":
             complete_status = data.get("status")
 
-    assert not error_events, (
-        "merge_start emitted error events while staging an add under a "
-        f"multi-level target-deleted folder. Errors:\n{error_events}"
-    )
     assert complete_status == 0, (
         f"merge_start reported non-zero completion status {complete_status}. "
         f"Output:\n{output}"

@@ -10,13 +10,11 @@ use serde::Serialize;
 
 use crate::errors::*;
 use crate::event;
-use crate::event::EventError;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::set_file_to_node;
 use crate::fs::filesystem_provider::with_operation;
 use crate::immutable;
-use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lore::Address;
 use crate::lore::Hash;
@@ -90,23 +88,6 @@ pub enum WriteError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
-}
-
-impl EventError for WriteError {
-    fn translated(&self) -> LoreError {
-        match self {
-            WriteError::InvalidArguments(_)
-            | WriteError::InvalidPath(_)
-            | WriteError::InvalidAddress(_) => LoreError::InvalidArguments,
-            WriteError::RevisionNotFound(_) | WriteError::NotFound(_) => LoreError::NotFound,
-            WriteError::FileNotFound(_) => LoreError::FileNotFound,
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 #[derive(Clone, Debug)]

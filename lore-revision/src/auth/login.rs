@@ -40,8 +40,6 @@ use crate::errors::Oversized;
 use crate::errors::SlowDown;
 use crate::errors::TokenNotFound;
 use crate::event;
-use crate::event::EventError;
-use crate::interface::LoreError;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_info;
@@ -61,22 +59,6 @@ pub enum LoginError {
     TokenNotFound,
 }
 
-impl EventError for LoginError {
-    fn translated(&self) -> LoreError {
-        match self {
-            LoginError::Disconnected(_) => LoreError::Connection,
-            LoginError::SlowDown(_) => LoreError::SlowDown,
-            LoginError::Oversized(_) => LoreError::Oversized,
-            LoginError::NotFound(_) => LoreError::NotFound,
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
-}
-
 #[error_set]
 pub enum InteractiveLoginError {
     Disconnected,
@@ -90,22 +72,6 @@ pub enum InteractiveLoginError {
     NotSupported,
     Oversized,
     TokenNotFound,
-}
-
-impl EventError for InteractiveLoginError {
-    fn translated(&self) -> LoreError {
-        match self {
-            InteractiveLoginError::Disconnected(_) => LoreError::Connection,
-            InteractiveLoginError::SlowDown(_) => LoreError::SlowDown,
-            InteractiveLoginError::Oversized(_) => LoreError::Oversized,
-            InteractiveLoginError::NotFound(_) => LoreError::NotFound,
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 fn select_auth_path(environment: &EnvironmentConfig) -> Result<Selected, ProtocolError> {

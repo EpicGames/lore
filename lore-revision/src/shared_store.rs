@@ -10,14 +10,12 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::errors::*;
-use crate::event::EventError;
 use crate::event::LoreEvent;
 use crate::global::GlobalConfig;
 use crate::global::GlobalConfigError;
 use crate::global::get_global_data_dir;
 use crate::instance::InstanceId;
 use crate::interface::LoreArray;
-use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lore::RepositoryId;
 use crate::lore::execution_context;
@@ -50,19 +48,6 @@ pub enum SharedStoreError {
     Oversized,
     PayloadNotFound,
     SlowDown,
-}
-
-impl EventError for SharedStoreError {
-    fn translated(&self) -> LoreError {
-        match self {
-            SharedStoreError::InvalidPath(_) => LoreError::InvalidArguments,
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]

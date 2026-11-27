@@ -64,7 +64,8 @@ pub struct LoreRevisionTreeResolvePathCompleteEventData {
     pub repository: RepositoryId,
     /// Revision the resolved node belongs to.
     pub revision: Hash,
-    /// The outcome of the call.
+    /// The outcome: on a failure of the State, any code of the State's error set, while
+    /// `Complete` reports the verb's own code.
     pub error_code: LoreErrorCode,
 }
 
@@ -135,7 +136,8 @@ pub struct LoreRevisionTreeInfoEventData {
     pub author_identity: LoreString,
     /// The number of metadata keys on the revision.
     pub metadata_key_count: u32,
-    /// The outcome of the call.
+    /// The outcome: the code of the failure that ended it, while `Complete` reports the
+    /// verb's own code.
     pub error_code: LoreErrorCode,
 }
 
@@ -185,7 +187,8 @@ pub struct LoreRevisionTreeNodeInfoEventData {
     pub address: Address,
     /// The preserved file id of the node.
     pub file_id: Context,
-    /// The outcome of the call.
+    /// The outcome: on a failure of the State, any code of the State's error set, while
+    /// `Complete` reports the verb's own code.
     pub error_code: LoreErrorCode,
 }
 
@@ -267,7 +270,8 @@ pub struct LoreRevisionTreeAddCompleteEventData {
     pub entry_id: u64,
     /// The newly-added node.
     pub node_id: NodeID,
-    /// The outcome of the call.
+    /// The outcome: on a failure of the State, any code of the State's error set, while
+    /// `Complete` reports the verb's own code.
     pub error_code: LoreErrorCode,
 }
 
@@ -291,7 +295,8 @@ pub struct LoreRevisionTreeDeleteCompleteEventData {
     /// How many nodes the entry's subtree removed, staged and discarded
     /// together. Zero on failure, whatever part of the subtree was removed.
     pub node_count: u64,
-    /// The outcome of the call.
+    /// The outcome: on a failure of the State, any code of the State's error set, while
+    /// `Complete` reports the verb's own code.
     pub error_code: LoreErrorCode,
 }
 
@@ -316,7 +321,8 @@ pub struct LoreRevisionTreeModifyCompleteEventData {
     pub entry_id: u64,
     /// The modified node.
     pub node_id: NodeID,
-    /// The outcome of the call.
+    /// The outcome: on a failure of the State, any code of the State's error set, while
+    /// `Complete` reports the verb's own code.
     pub error_code: LoreErrorCode,
 }
 
@@ -340,7 +346,8 @@ pub struct LoreRevisionTreeMoveCompleteEventData {
     pub entry_id: u64,
     /// The moved node.
     pub node_id: NodeID,
-    /// The outcome of the call.
+    /// The outcome: on a failure of the State, any code of the State's error set, while
+    /// `Complete` reports the verb's own code.
     pub error_code: LoreErrorCode,
 }
 
@@ -361,7 +368,8 @@ pub struct LoreRevisionTreeMoveCompleteEventData {
 pub struct LoreRevisionTreeMetadataSetCompleteEventData {
     /// Correlation id of the entry this reports, not of the call.
     pub entry_id: u64,
-    /// The outcome of the call.
+    /// The outcome: the code of the failure that ended it, while `Complete` reports the
+    /// verb's own code.
     pub error_code: LoreErrorCode,
 }
 
@@ -486,6 +494,7 @@ pub struct LoreRevisionTreeListChildrenBeginEventData {
     pub repository: RepositoryId,
     /// Revision the listed children belong to.
     pub revision: Hash,
-    /// The outcome of the call.
+    /// The outcome: on a failure of the State, any code of the State's error set, while
+    /// `Complete` reports the verb's own code.
     pub error_code: LoreErrorCode,
 }

@@ -17,7 +17,6 @@ use crate::branch::merge;
 use crate::branch::merge::MergeType;
 use crate::change::NodeChange;
 use crate::errors::*;
-use crate::event::EventError;
 use crate::event::LoreEvent;
 use crate::filter;
 use crate::filter::FilterInstance;
@@ -32,7 +31,6 @@ use crate::fs::hold;
 use crate::fs::realize::realize_state;
 use crate::history;
 use crate::interface::LoreBranchLocation;
-use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
 use crate::layer;
@@ -190,16 +188,6 @@ pub enum SyncError {
     Oversized,
     PayloadNotFound,
     MissingIdentity,
-}
-
-impl EventError for SyncError {
-    fn translated(&self) -> LoreError {
-        LoreError::Internal
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 impl From<FsError> for SyncError {

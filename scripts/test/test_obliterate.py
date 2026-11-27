@@ -214,7 +214,6 @@ def test_clone_and_sync_materialize_available_files_after_obliteration(
         complete = [event for event in events if event["tagName"] == "complete"]
         assert len(complete) == 1
         assert complete[0]["data"]["status"] != 0
-        assert not any(event["tagName"] == "error" for event in events)
         warnings = [
             event
             for event in events

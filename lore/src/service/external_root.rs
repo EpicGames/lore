@@ -14,7 +14,6 @@ use lore_base::error::ServiceUnavailable;
 use lore_base::fs::lock::FSLock;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_error_set::prelude::*;
-use lore_revision::event::EventError;
 use lore_revision::event::LoreServiceStatusEventData;
 use lore_revision::global::external_dir::access::try_exclusive_for_move;
 use lore_revision::global::external_dir::canonical_global;
@@ -54,8 +53,6 @@ pub enum StopForMoveError {
     InvalidArguments,
     MountsBusy,
 }
-
-impl EventError for StopForMoveError {}
 
 /// What answers on the service socket before a move.
 #[allow(clippy::large_enum_variant)]

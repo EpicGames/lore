@@ -23,11 +23,9 @@ use lore_storage::ReadOptions;
 use zerocopy::IntoBytes;
 
 use crate::errors::*;
-use crate::event::EventError;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::with_operation;
 use crate::immutable;
-use crate::interface::LoreError;
 use crate::lore::Address;
 use crate::lore::BranchId;
 use crate::lore::Context;
@@ -97,21 +95,6 @@ pub enum MetadataErrors {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
-}
-
-impl EventError for MetadataErrors {
-    fn translated(&self) -> LoreError {
-        match self {
-            MetadataErrors::FileNotFound(_) => LoreError::NotFound,
-            MetadataErrors::Oversized(_) => LoreError::Oversized,
-            MetadataErrors::Disconnected(_) => LoreError::Connection,
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Commit message ([`MetadataType::String`])

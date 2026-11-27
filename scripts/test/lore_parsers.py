@@ -281,11 +281,6 @@ def parse_complete_json(output: str) -> dict | None:
     return entries[-1] if entries else None
 
 
-def parse_error_json(output: str) -> list[dict]:
-    """Parse `--json` output and return any error events."""
-    return parse_jsonl(output, "error")
-
-
 def parse_lock_acquire(output: str):
     lines = output.strip().splitlines()
     is_parsing_already_owned = False

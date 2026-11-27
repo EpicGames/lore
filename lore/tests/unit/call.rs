@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_base::error::RepositoryNotFound;
-use lore_revision::event::EventError;
 use lore_revision::repository::RepositoryError;
 
 pub(crate) mod test_support;
@@ -16,7 +15,6 @@ use lore_error_set::Location;
 use lore_error_set::prelude::*;
 use lore_revision::interface::LoreGlobalArgs;
 use test_support::completes;
-use test_support::has_error_event;
 use test_support::recording_callback;
 use test_support::take_recorded;
 
@@ -28,10 +26,8 @@ enum SampleError {
     NotFound,
 }
 
-impl EventError for SampleError {}
-
 #[tokio::test]
-async fn failing_op_completes_with_error_code_and_no_error_event() {
+async fn failing_op_completes_with_error_code() {
     let (sink, callback) = recording_callback();
     let status = no_repository_call(
         LoreGlobalArgs::default(),
@@ -43,11 +39,6 @@ async fn failing_op_completes_with_error_code_and_no_error_event() {
     .await;
 
     let events = take_recorded(&sink);
-
-    assert!(
-        !has_error_event(&events),
-        "no Error event must be emitted on terminal failure"
-    );
 
     // Exactly one `Complete` event.
     let completes = completes(&events);
@@ -518,7 +509,6 @@ async fn a_call_inside_a_mount_with_an_unknown_external_directory_completes_with
         );
         assert_eq!(completes[0].status, status);
         assert_eq!(completes[0].error.error_code, status);
-        assert!(!has_error_event(&events));
     }
 }
 

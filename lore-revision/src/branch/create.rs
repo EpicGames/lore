@@ -8,8 +8,6 @@ use lore_error_set::prelude::*;
 use super::execution_context;
 use crate::branch;
 use crate::errors::*;
-use crate::event::EventError;
-use crate::interface::LoreError;
 use crate::layer;
 use crate::lore::BranchId;
 use crate::lore::Context;
@@ -69,32 +67,6 @@ pub enum CreateError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
-}
-
-impl EventError for CreateError {
-    fn translated(&self) -> LoreError {
-        match self {
-            CreateError::Disconnected(_) => LoreError::Connection,
-            CreateError::SlowDown(_) => LoreError::SlowDown,
-            CreateError::Oversized(_) => LoreError::Oversized,
-            CreateError::FileNotFound(_) => LoreError::FileNotFound,
-            CreateError::NotFound(_)
-            | CreateError::BranchNotFound(_)
-            | CreateError::RevisionNotFound(_)
-            | CreateError::LayerNotFound(_) => LoreError::NotFound,
-            CreateError::AddressNotFound(_) => LoreError::AddressNotFound,
-            CreateError::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            CreateError::InvalidPath(_) | CreateError::InvalidArguments(_) => {
-                LoreError::InvalidArguments
-            }
-            CreateError::BranchAlreadyExists(_) => LoreError::AlreadyExists,
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Creates the branch `branch` off the instance's current branch and makes it current. Where

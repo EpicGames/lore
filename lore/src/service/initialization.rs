@@ -34,28 +34,19 @@ pub enum ServiceInitializationError {
 /// Seconds after a write that the service's immutable disk stores flush their index.
 const SERVICE_STORE_FLUSH_SECONDS: NonZeroU64 = NonZeroU64::new(30).unwrap();
 
-/// Builds the execution context callback that buffers service-level logs and
-/// errors in `service_state`, so a status report can hand them back later.
+/// Builds the execution context callback that buffers service-level logs in
+/// `service_state`, so a status report can hand them back later.
 fn service_log_callback(service_state: Arc<ServiceStateImpl>) -> LoreEventCallback {
     Some(Box::new(move |event| {
         push_service_log(&service_state, event);
     }))
 }
 
-/// Buffers `event` in `service_state` where it is a log or an error, so a status report can hand
-/// it back later.
+/// Buffers `event` in `service_state` where it is a log, so a status report can hand it back
+/// later.
 pub(crate) fn push_service_log(service_state: &ServiceStateImpl, event: &LoreEvent) {
-    match event {
-        LoreEvent::Log(data) => {
-            service_state.push_log(data.level, data.message.as_str().to_string());
-        }
-        LoreEvent::Error(data) => {
-            service_state.push_log(
-                lore_base::log::LoreLogLevel::Error,
-                data.error_inner.as_str().to_string(),
-            );
-        }
-        _ => {}
+    if let LoreEvent::Log(data) = event {
+        service_state.push_log(data.level, data.message.as_str().to_string());
     }
 }
 
@@ -154,32 +145,22 @@ mod tests {
             location: crate::interface::LoreString::default(),
             message: crate::interface::LoreString::from("Test log message"),
         }));
-        callback(&LoreEvent::Error(crate::interface::LoreErrorEventData {
-            error_type: 0,
-            error_inner: crate::interface::LoreString::from("Test error message"),
-        }));
 
         let (messages, dropped) = state.drain_logs();
         assert_eq!(dropped, 0);
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].level, LoreLogLevel::Info);
         assert_eq!(messages[0].message, "Test log message");
-        assert_eq!(
-            messages[1].level,
-            LoreLogLevel::Error,
-            "An error event is recorded at error level"
-        );
-        assert_eq!(messages[1].message, "Test error message");
     }
 
     #[test]
-    fn the_callback_ignores_events_that_are_not_logs_or_errors() {
+    fn the_callback_ignores_events_that_are_not_logs() {
         let state = Arc::new(ServiceStateImpl::new());
         let callback = service_log_callback(state.clone()).expect("A callback is always built");
 
         callback(&LoreEvent::End(LoreEndEventData::default()));
 
         let (messages, _dropped) = state.drain_logs();
-        assert!(messages.is_empty(), "Only logs and errors are buffered");
+        assert!(messages.is_empty(), "Only logs are buffered");
     }
 }

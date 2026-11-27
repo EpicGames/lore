@@ -64,8 +64,6 @@ pub enum HistoryError {
     MissingIdentity,
 }
 
-impl crate::event::EventError for HistoryError {}
-
 /// How a round takes a line further.
 enum Step {
     /// The round walks the line in the local store.

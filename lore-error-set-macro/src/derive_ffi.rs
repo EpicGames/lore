@@ -3,7 +3,8 @@
 //! Derive macro implementation for `FfiError`.
 //!
 //! Parses `#[ffi_code(N)]` on a struct or enum and generates an
-//! `impl FfiError` that returns the given integer constant.
+//! `impl FfiError` that returns the given integer constant, and a check that the
+//! registry's `LoreErrorCode` names the type with that code.
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -25,6 +26,13 @@ pub fn derive_ffi_error(input: &DeriveInput) -> TokenStream {
         // Codes share one numeric space and one process-exit-status space, so
         // they are allocated in exactly one place.
         const _: fn() = __ffi_code_registry_marker;
+        // The registry's `LoreErrorCode` names this type with its code, and `from_ffi_code` maps
+        // the code back to it. Resolved where the derive is written, as the marker is.
+        const _: () = assert!(
+            LoreErrorCode::#name as i32 == #code
+                && LoreErrorCode::from_ffi_code(#code) as i32 == #code,
+            concat!("LoreErrorCode does not name ", stringify!(#name), " by its code"),
+        );
 
         impl #name {
             /// This type's FFI error code, usable in const position.

@@ -13,22 +13,20 @@ use lore::revision_tree::modify::ModifyError;
 use lore::revision_tree::move_node::MoveError;
 use lore_base::error::InvalidArguments;
 use lore_base::error::NodeNotFound;
+use lore_base::error::NotAuthorized;
 use lore_base::error::SlowDown;
 use lore_error_set::prelude::*;
-use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
-use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::state::StateError;
 
 use crate::call::test_support::completes;
-use crate::call::test_support::has_error_event;
 use crate::call::test_support::recording_callback;
 use crate::call::test_support::take_recorded;
 use crate::revision_tree::handle::test_support;
 
 #[tokio::test]
-async fn handle_miss_completes_with_error_code_and_no_error_event() {
+async fn handle_miss_completes_with_error_code() {
     let (sink, callback) = recording_callback();
     let missed = Arc::new(AtomicBool::new(false));
     let missed_setter = missed.clone();
@@ -47,11 +45,6 @@ async fn handle_miss_completes_with_error_code_and_no_error_event() {
         "on_handle_miss must fire when the handle is unknown"
     );
     let events = take_recorded(&sink);
-    assert!(
-        !has_error_event(&events),
-        "no Error event must be emitted on terminal failure"
-    );
-
     let completes = completes(&events);
     assert_eq!(completes.len(), 1, "exactly one Complete event");
 
@@ -116,7 +109,7 @@ async fn happy_path_completes_with_status_zero_and_decrements_counter() {
 }
 
 #[tokio::test]
-async fn verb_error_completes_with_error_code_and_no_error_event() {
+async fn verb_error_completes_with_error_code() {
     let internal = test_support::new_for_testing().await;
     let handle_value = handle::register(internal.clone());
     let (sink, callback) = recording_callback();
@@ -147,11 +140,6 @@ async fn verb_error_completes_with_error_code_and_no_error_event() {
     );
 
     let events = take_recorded(&sink);
-    assert!(
-        !has_error_event(&events),
-        "no Error event must be emitted on terminal failure"
-    );
-
     let completes = completes(&events);
     assert_eq!(completes.len(), 1, "exactly one Complete event");
 
@@ -167,36 +155,44 @@ async fn verb_error_completes_with_error_code_and_no_error_event() {
     handle::unregister(handle_value);
 }
 
-/// A State `SlowDown` fails an entry as slowed down, which reports `SLOW_DOWN`; every other State
-/// failure as internal, which reports `INTERNAL`; an entry that has not failed reports no code.
+/// A State failure fails an entry with the failure's own code: `SLOW_DOWN` for a `SlowDown`,
+/// `NODE_NOT_FOUND` for a `NodeNotFound`, `INTERNAL` for an internal failure. An entry that has not
+/// failed reports no code.
 #[test]
-fn a_state_slow_down_fails_an_entry_as_slowed_down_and_any_other_failure_as_internal() {
+fn a_state_failure_fails_an_entry_with_its_own_code() {
     let slowed = EntryFailure::of(&StateError::from(SlowDown));
-    assert_eq!(slowed, EntryFailure::SlowedDown);
+    assert_eq!(slowed, EntryFailure::SLOWED_DOWN);
     assert!(slowed.failed());
     assert_eq!(slowed.code(), LoreErrorCode::SlowDown);
-    for error in [
-        StateError::internal("a block that cannot be read"),
-        StateError::from(NodeNotFound),
+    for (error, code) in [
+        (
+            StateError::internal("a block that cannot be read"),
+            LoreErrorCode::Internal,
+        ),
+        (StateError::from(NodeNotFound), LoreErrorCode::NodeNotFound),
+        (
+            StateError::from(NotAuthorized),
+            LoreErrorCode::NotAuthorized,
+        ),
     ] {
         let failure = EntryFailure::of(&error);
-        assert_eq!(failure, EntryFailure::Internal, "{error}");
         assert!(failure.failed());
-        assert_eq!(failure.code(), LoreErrorCode::Internal);
+        assert_eq!(failure.code(), code, "{error}");
     }
-    assert!(!EntryFailure::None.failed());
-    assert_eq!(EntryFailure::None.code(), LoreErrorCode::None);
+    assert_eq!(EntryFailure::INTERNAL.code(), LoreErrorCode::Internal);
+    assert!(!EntryFailure::NONE.failed());
+    assert_eq!(EntryFailure::NONE.code(), LoreErrorCode::None);
 }
 
 /// Two failures of one entry, from two tasks or two nodes of its subtree, merge to the stronger in
-/// either order: internal outranks slowed down, which outranks none. The kind takes a byte, as the
-/// flag it carries a delete's per-entry failures in place of did.
+/// either order: any failure other than a `SlowDown` outranks one, which outranks none, and of two
+/// of one rank the first is kept. The failure takes a byte.
 #[test]
 fn an_entry_failing_twice_keeps_the_stronger_failure() {
     let ranked = [
-        EntryFailure::None,
-        EntryFailure::SlowedDown,
-        EntryFailure::Internal,
+        EntryFailure::NONE,
+        EntryFailure::SLOWED_DOWN,
+        EntryFailure::INTERNAL,
     ];
     for (first_rank, first) in ranked.iter().enumerate() {
         for (second_rank, second) in ranked.iter().enumerate() {
@@ -209,6 +205,22 @@ fn an_entry_failing_twice_keeps_the_stronger_failure() {
             );
         }
     }
+
+    let not_found = EntryFailure::of(&StateError::from(NodeNotFound));
+    let refused = EntryFailure::of(&StateError::from(NotAuthorized));
+    let mut merged = EntryFailure::SLOWED_DOWN;
+    merged.merge(not_found);
+    assert_eq!(merged.code(), LoreErrorCode::NodeNotFound);
+    merged.merge(refused);
+    merged.merge(EntryFailure::INTERNAL);
+    assert_eq!(
+        merged.code(),
+        LoreErrorCode::NodeNotFound,
+        "the first of a rank"
+    );
+    assert!(not_found.outranks(EntryFailure::SLOWED_DOWN));
+    assert!(!not_found.outranks(refused));
+
     assert_eq!(std::mem::size_of::<EntryFailure>(), 1);
 }
 
@@ -219,8 +231,7 @@ fn an_entry_failing_twice_keeps_the_stronger_failure() {
 fn a_calls_error_keeps_a_state_slow_down_and_takes_any_other_failure_as_internal() {
     let slowed: ModifyError = state_failure(StateError::from(SlowDown), "rewrite the node");
     assert!(slowed.is_slow_down(), "{slowed:?}");
-    assert_eq!(slowed.ffi_code(), LoreError::SlowDown as i32);
-    assert_eq!(slowed.translated() as i32, LoreError::SlowDown as i32);
+    assert_eq!(slowed.ffi_code(), LoreErrorCode::SlowDown as i32);
     assert!(
         slowed
             .trace()
@@ -230,13 +241,13 @@ fn a_calls_error_keeps_a_state_slow_down_and_takes_any_other_failure_as_internal
         "the context is on the trace: {slowed:?}"
     );
     assert_eq!(
-        lore::revision_tree::modify::batch_error_code(&Err(slowed)),
+        LoreErrorCode::of(&Err::<(), _>(slowed)),
         LoreErrorCode::SlowDown
     );
 
     let failed: ModifyError = state_failure(StateError::from(NodeNotFound), "rewrite the node");
     assert!(failed.is_internal(), "{failed:?}");
-    assert_eq!(failed.ffi_code(), LoreError::Internal as i32);
+    assert_eq!(failed.ffi_code(), LoreErrorCode::Internal as i32);
     assert!(
         failed.to_string().starts_with("rewrite the node: "),
         "{failed}"
@@ -244,12 +255,12 @@ fn a_calls_error_keeps_a_state_slow_down_and_takes_any_other_failure_as_internal
 
     let moved: MoveError = state_failure(StateError::from(SlowDown), "move the node");
     assert_eq!(
-        lore::revision_tree::move_node::batch_error_code(&Err(moved)),
+        LoreErrorCode::of(&Err::<(), _>(moved)),
         LoreErrorCode::SlowDown
     );
     let deleted: DeleteError = state_failure(StateError::from(SlowDown), "delete the subtree");
     assert_eq!(
-        lore::revision_tree::delete::batch_error_code(&Err(deleted)),
+        LoreErrorCode::of(&Err::<(), _>(deleted)),
         LoreErrorCode::SlowDown
     );
 }
@@ -259,7 +270,7 @@ fn a_calls_error_keeps_a_state_slow_down_and_takes_any_other_failure_as_internal
 /// with an `Internal` naming the count.
 #[test]
 fn a_batch_ends_slowed_down_only_where_every_failure_slowed_down() {
-    let slowed: ModifyError = EntryFailure::SlowedDown.call_error("2/3 node modifies failed");
+    let slowed: ModifyError = EntryFailure::SLOWED_DOWN.call_error("2/3 node modifies failed");
     assert!(slowed.is_slow_down(), "{slowed:?}");
     assert!(
         slowed
@@ -269,7 +280,7 @@ fn a_batch_ends_slowed_down_only_where_every_failure_slowed_down() {
             .any(|location| location.context() == Some("2/3 node modifies failed")),
         "the count is on the trace: {slowed:?}"
     );
-    for strongest in [EntryFailure::Internal, EntryFailure::None] {
+    for strongest in [EntryFailure::INTERNAL, EntryFailure::NONE] {
         let failed: ModifyError = strongest.call_error("2/3 node modifies failed");
         assert!(failed.is_internal(), "{strongest:?}: {failed:?}");
         assert_eq!(failed.to_string(), "2/3 node modifies failed");

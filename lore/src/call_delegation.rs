@@ -10,7 +10,6 @@ use lore_base::error::ShutDown;
 use lore_base::text::TextNotUtf8;
 use lore_base::text::ValidateText;
 use lore_error_set::prelude::*;
-use lore_revision::event::EventError;
 use lore_revision::event::LoreCompleteEventData;
 use lore_revision::event::LoreEndEventData;
 use lore_revision::event::LoreErrorDetail;
@@ -43,19 +42,15 @@ pub(crate) enum ArgumentError {
     InvalidArguments,
 }
 
-impl EventError for ArgumentError {}
-
 /// Rejection of a call that arrived after `lore_shutdown()`.
 #[error_set]
 pub(crate) enum ShutdownError {
     ShutDown,
 }
 
-impl EventError for ShutdownError {}
-
 /// Emits Complete and End events if called after shutdown. Shutdown is terminal
 /// and terminates the runtime. Therefore we cannot use the normal
-/// `crate::runtime().block_on(reject_call(...))` mechanism to emit the error events.
+/// `crate::runtime().block_on(reject_call(...))` mechanism to emit the events.
 fn reject_after_shutdown(callback: LoreEventCallbackConfig) -> i32 {
     let error = ShutdownError::from(ShutDown);
     let status = error.ffi_code();

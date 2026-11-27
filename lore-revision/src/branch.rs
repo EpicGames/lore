@@ -46,7 +46,6 @@ use crate::change::NodeChange;
 use crate::commit;
 use crate::errors::*;
 use crate::event;
-use crate::event::EventError;
 use crate::find;
 use crate::hash;
 use crate::history;
@@ -57,7 +56,6 @@ use crate::immutable::read_options_from_repository;
 use crate::interface::LoreArray;
 use crate::interface::LoreBranchLocation;
 use crate::interface::LoreBranchPoint;
-use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
 use crate::link;
@@ -365,34 +363,6 @@ pub enum BranchError {
     SharedStoreNotFound,
     TokenNotFound,
     MissingIdentity,
-}
-
-impl EventError for BranchError {
-    fn translated(&self) -> LoreError {
-        match self {
-            BranchError::Disconnected(_) => LoreError::Connection,
-            BranchError::SlowDown(_) => LoreError::SlowDown,
-            BranchError::Oversized(_) => LoreError::Oversized,
-            BranchError::FileNotFound(_) => LoreError::FileNotFound,
-            BranchError::NotFound(_)
-            | BranchError::BranchNotFound(_)
-            | BranchError::RevisionNotFound(_)
-            | BranchError::LayerNotFound(_)
-            | BranchError::LinkNotFound(_)
-            | BranchError::NodeNotFound(_) => LoreError::NotFound,
-            BranchError::AddressNotFound(_) => LoreError::AddressNotFound,
-            BranchError::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            BranchError::InvalidPath(_)
-            | BranchError::InvalidArguments(_)
-            | BranchError::Divergent(_) => LoreError::InvalidArguments,
-            BranchError::BranchAlreadyExists(_) => LoreError::AlreadyExists,
-            _ => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 pub const MAX_DIVERGENT_HISTORY_LENGTH: usize = 500;

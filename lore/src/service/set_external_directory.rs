@@ -11,7 +11,6 @@ use futures::FutureExt;
 use lore_base::error::InvalidArguments;
 use lore_base::error::MountsBusy;
 use lore_error_set::prelude::*;
-use lore_revision::event::EventError;
 use lore_revision::fs::walk::Progress;
 use lore_revision::fs::walk::TreeSize;
 use lore_revision::global::external_dir::check::check_new_root;
@@ -54,8 +53,6 @@ pub enum SetExternalDirectoryError {
     InvalidArguments,
     MountsBusy,
 }
-
-impl EventError for SetExternalDirectoryError {}
 
 /// What the command does with its target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

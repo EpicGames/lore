@@ -5,14 +5,12 @@ use std::sync::Mutex;
 use std::sync::mpsc;
 
 use bytes::Bytes;
-use lore_base::error::RepositoryNotFound;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_revision::branch::push::LoreBranchPushStatsEventData;
 use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
 use lore_revision::logging::LoreLogLevel;
 use lore_revision::relay::EventDispatcher;
-use lore_revision::repository::RepositoryError;
 
 use crate::helper::setup_test_execution;
 
@@ -30,7 +28,6 @@ fn recording_dispatcher(
             sink.lock().unwrap().push(match event {
                 LoreEvent::Log(_) => "log",
                 LoreEvent::BranchPushStats(_) => "push stats",
-                LoreEvent::Error(_) => "error",
                 LoreEvent::Complete(_) => "complete",
                 LoreEvent::End(_) => "end",
                 _ => "other",
@@ -67,9 +64,6 @@ fn a_refused_event_never_reaches_the_callback() {
             dispatcher.send(push_stats());
             dispatcher.send(log());
             dispatcher.send_with_bytes(push_stats(), Bytes::from_static(b"payload"));
-            dispatcher.send_error(RepositoryError::from(RepositoryNotFound {
-                repository: "refused".to_string(),
-            }));
             dispatcher.send(log());
             dispatcher
                 .complete(LoreErrorDetail {
