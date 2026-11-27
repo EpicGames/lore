@@ -127,7 +127,8 @@ pub struct LoreRepositoryCloneArgs {
     pub view: LoreString,
     /// Clone without any files
     pub bare: u8,
-    /// Use direct file write
+    /// Use direct file write: on Windows, write each file of one fragment past the file cache. A
+    /// clone writes every file at its own path either way
     pub direct_file_write: u8,
     /// Which VFS to use, if any
     pub vfs: LoreVfsType,

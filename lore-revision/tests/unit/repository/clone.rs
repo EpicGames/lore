@@ -41,6 +41,7 @@ use crate::branch::null_repository;
 use crate::fs::filesystem_provider::setup_test_execution;
 use crate::repository::test_helpers::caused_by;
 use crate::repository::test_helpers::file_node;
+use crate::repository::test_helpers::stored_as_list;
 use crate::repository::test_helpers::working_tree_repository;
 use crate::repository::test_helpers::working_tree_repository_filtered;
 
@@ -1606,4 +1607,62 @@ async fn a_clone_asked_for_direct_file_write_writes_its_files_directly() {
         );
         assert!(repository.disable_upload());
     }
+}
+
+/// A clone without direct file write writes a file stored as a fragment list at its own path and
+/// makes no temporary file: a directory standing at the temporary path, which a write through a
+/// temporary file cannot open, is left as it was.
+#[tokio::test]
+async fn a_clone_without_direct_file_write_writes_a_fragment_list_with_no_temporary_file() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let temp = TempDir::new("lore-clone-in-place-");
+            let repository = working_tree_repository(temp.path()).await;
+            apply_clone_settings(&repository, &CloneOptions::default());
+            let content: Vec<u8> = (0..1024u32).map(|index| index as u8).collect();
+            let node = stored_as_list(&repository, &content, 256).await;
+            let temporary = temp.path().join(format!(
+                "list.bin{}",
+                lore_revision::repository::TEMP_FILE_EXTENSION
+            ));
+            std::fs::create_dir(&temporary).expect("create a directory at the temporary path");
+            let ctx = CloneContext {
+                operation: repository
+                    .file_system()
+                    .begin_operation()
+                    .await
+                    .expect("Starting test operation"),
+                repository: repository.clone(),
+                state: State::new(),
+                options: Arc::default(),
+                stats: Arc::default(),
+                modified_times: Arc::default(),
+            };
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(CloneWorkItem {
+                repository: repository.clone(),
+                node,
+                repository_path: relative_path("list.bin"),
+            })
+            .expect("queue the file");
+            drop(tx);
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), clone_execute(rx, ctx))
+                .await
+                .expect("the clone does not wait on the temporary path")
+                .expect("the clone writes the file in place");
+
+            assert_eq!(
+                std::fs::read(temp.path().join("list.bin")).expect("read the cloned file"),
+                content
+            );
+            assert_eq!(
+                std::fs::read_dir(&temporary)
+                    .expect("list the temporary path")
+                    .count(),
+                0,
+                "the directory at the temporary path is left as it was"
+            );
+        })
+        .await;
 }

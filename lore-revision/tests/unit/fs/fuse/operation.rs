@@ -4466,3 +4466,18 @@ async fn a_remount_keeps_a_link_that_local_changes_name() {
     })
     .await;
 }
+
+/// The context a provider reads through writes its files through temporary files whatever the
+/// context it is built over writes, as a clone's does: a clone's in-place writes stay with it.
+#[tokio::test]
+async fn a_provider_reads_through_temporary_files_whatever_its_source_writes() {
+    in_context(async {
+        let mounted = mounted().await;
+        mounted.fixture.repository.set_write_in_place(true);
+
+        let provider = mounted.fs.provider_repository(&mounted.fixture.repository);
+
+        assert!(!lore_revision::immutable::read_options_from_repository(&provider).write_in_place);
+    })
+    .await;
+}

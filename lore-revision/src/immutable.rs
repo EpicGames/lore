@@ -175,6 +175,7 @@ pub fn read_options_from_repository(repository: &RepositoryContext) -> ReadOptio
         no_local_write: local_reads == LocalReads::Skip,
         strict_local: local_reads == LocalReads::Strict,
         direct_write: repository.direct_file_write(),
+        write_in_place: repository.write_in_place(),
         sync_data,
         trust_remote: repository.remote_trust.unwrap_or(globals_trust_remote),
         ..Default::default()

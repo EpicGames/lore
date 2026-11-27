@@ -646,8 +646,9 @@ async fn claim_provider_stores(
 /// The context every provider read goes through: without command locks, holding the provider's
 /// claims on its stores, so work done through it keeps them until it ends, over the provider's
 /// own remote, so content stored on the remote alone stays readable after a command run offline
-/// built or published it, and caching whatever it fetches whatever `repository` says, so content
-/// once served stays readable offline.
+/// built or published it, caching whatever it fetches whatever `repository` says, so content
+/// once served stays readable offline, and writing files through temporary files whatever
+/// `repository` writes.
 fn provider_context(
     repository: &RepositoryContext,
     stores: Option<&Arc<StoreHold>>,
@@ -658,6 +659,7 @@ fn provider_context(
         .with_shared_remote(remote)
         .with_shared_store_hold(stores.cloned());
     provider.set_disable_cache(false);
+    provider.set_write_in_place(false);
     Arc::new(provider)
 }
 

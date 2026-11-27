@@ -291,7 +291,7 @@ Also see: base revision, three-way merge.
 
 ### Direct write
 
-A setting that writes files in place instead of through a temporary file, which is faster but not atomic. An error while writing can leave a file incomplete. On Windows it also writes each file of one fragment past the file cache, so the first read of such a file comes from the device.
+A setting that writes files in place instead of through a temporary file, which is faster but not atomic. An error while writing can leave a file incomplete. On Windows it also writes each file of one fragment past the file cache, so the first read of such a file comes from the device. `lore clone` writes every file in place whatever it says.
 
 ### Dirty
 

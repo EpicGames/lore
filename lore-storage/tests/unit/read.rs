@@ -1779,6 +1779,48 @@ async fn file_read_shapes(
     ]
 }
 
+/// A read writing in place writes a fragment list at its own path and makes no temporary file: a
+/// directory standing at the temporary path, which a write through a temporary file cannot open,
+/// is left as it was.
+#[tokio::test]
+async fn a_read_writing_in_place_writes_a_fragment_list_with_no_temporary_file() {
+    let (_store_dir, store) = make_test_store().await;
+    let target_dir = TempDir::new("lore-storage-read-in-place-");
+    let partition = Partition::from([0xA7; 16]);
+    let context = Context::from([0xA7; 16]);
+    let (address, content) = put_two_leaf_list(&store, partition, context).await;
+    let target = target_dir.child("content.bin");
+    let temporary = target_dir.child("content.bin.~loretemp");
+    std::fs::create_dir(&temporary).expect("create a directory at the temporary path");
+
+    let read = read_into_file(
+        store,
+        partition,
+        address,
+        target.as_path(),
+        ".~loretemp",
+        None,
+        ReadOptions {
+            write_in_place: true,
+            ..no_remote()
+        },
+        None,
+    );
+    tokio::time::timeout(Duration::from_secs(5), read)
+        .await
+        .expect("the read does not wait on the temporary path")
+        .expect("the read writes the file in place");
+
+    assert_eq!(std::fs::read(&target).expect("read the target"), content);
+    assert_eq!(
+        std::fs::read_dir(&temporary)
+            .expect("list the temporary path")
+            .count(),
+        0,
+        "the directory at the temporary path is left as it was"
+    );
+}
+
 /// A file read asked to create its parent lands below directories that are not there, one level
 /// or several deep, and leaves no temporary file.
 #[tokio::test]

@@ -1743,8 +1743,8 @@ pub fn read_into_file(
 /// its own offset and peak memory follows the leaf rather than the content — and no metadata comes
 /// back, because the handle moves into the pipeline. A hole is left unwritten, and every leaf is
 /// written, one of zeros included. That path writes through `<path><temp_file_extension>` and
-/// renames, unless `options.direct_write` asks for the target to be written in place. With
-/// `options.resume_write`, for a range of at least
+/// renames, unless `options` asks for the target to be written in place
+/// ([`ReadOptions::writes_in_place`]). With `options.resume_write`, for a range of at least
 /// [`RESUME_WRITE_MIN_LEN`](crate::options::RESUME_WRITE_MIN_LEN), the temporary file is kept when
 /// the write fails or stops, and a later write of the same content and range resumes from it, as
 /// [`crate::resume`] describes: the file it resumes is sized, and is emptied and written again as a
@@ -1789,7 +1789,7 @@ fn write_root_to_file(
         if fragment.flags & FragmentFlags::PayloadFragmented == FragmentFlags::PayloadFragmented {
             let mut retry = crate::retry(10, 10_000, 10);
 
-            let mut file_path = if options.direct_write {
+            let mut file_path = if options.writes_in_place() {
                 path.to_path_buf()
             } else {
                 let mut temporary_path = path.as_os_str().to_os_string();
@@ -1798,9 +1798,9 @@ fn write_root_to_file(
             };
 
             let mut resuming = options.resume_write
-                && !options.direct_write
+                && !options.writes_in_place()
                 && range.len() >= crate::options::RESUME_WRITE_MIN_LEN;
-            let mut temporary = (!options.direct_write && !resuming)
+            let mut temporary = (!options.writes_in_place() && !resuming)
                 .then(|| TemporaryFile::guard(file_path.clone()));
 
             let mut create_parent = options.create_parent;
@@ -1918,7 +1918,7 @@ fn write_root_to_file(
             // The handle holds no userspace buffer, so there is nothing to flush.
             drop(file);
 
-            if !options.direct_write {
+            if !options.writes_in_place() {
                 lore_io::IoDriver::global()
                     .rename(file_path.as_path(), path)
                     .await

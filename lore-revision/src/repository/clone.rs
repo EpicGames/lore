@@ -356,7 +356,8 @@ pub struct CloneOptions {
     /// Ignore existing files
     pub ignore_existing: bool,
     /// Write the clone's files with direct file write, whatever the new instance's
-    /// `[file] direct_write` says, which the clone leaves as it is
+    /// `[file] direct_write` says, which the clone leaves as it is: on Windows, each file of one
+    /// fragment past the file cache. A clone writes every file at its own path either way
     pub direct_file_write: bool,
     /// Access recording whose paths a virtual clone warms in the background: one
     /// repository-relative path per line, directories ending with `/`
@@ -1501,11 +1502,13 @@ pub async fn clone(
 }
 
 /// Sets on `repository`, the context a clone materializes its files through, what the clone's
-/// `options` ask of it: no upload, and direct file write where `options.direct_file_write` asks,
-/// whatever the new instance's `[file] direct_write` says.
+/// `options` ask of it: no upload, every file written at its own path with no temporary file, and
+/// direct file write where `options.direct_file_write` asks, whatever the new instance's
+/// `[file] direct_write` says.
 #[lore_macro::test_pub]
 fn apply_clone_settings(repository: &RepositoryContext, options: &CloneOptions) {
     repository.set_disable_upload(true);
+    repository.set_write_in_place(true);
     if options.direct_file_write {
         repository.set_direct_file_write(true);
     }

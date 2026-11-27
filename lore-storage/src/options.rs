@@ -218,6 +218,9 @@ pub struct ReadOptions {
     /// Write to file directly, with no temporary file, and on Windows a file of one fragment past the
     /// file cache unless with `sparse_write` ([`Self::writes_unbuffered`])
     pub direct_write: bool,
+    /// Write a file read at its own path, with no temporary file, and without the unbuffered write
+    /// `direct_write` adds. A write that fails or stops leaves the file partly written.
+    pub write_in_place: bool,
     /// Make the file a read of a fragment list writes sparse before sizing it
     /// ([`lore_io::IoFile::set_len_sparse`]), so a hole of the content holds no storage on a file
     /// system that holds none only for a file marked sparse, as those of Windows do. On Windows a
@@ -230,8 +233,8 @@ pub struct ReadOptions {
     /// from a temporary file that a read of the same content and range left at the same path; any
     /// other temporary file is emptied. A read of a shorter range, or of a single fragment, writes
     /// as one without this, and so does one whose file system refuses the temporary file's lock.
-    /// With `direct_write` a read writes no temporary file. A defragment into a file
-    /// ([`DefragmentSink::File`]) with this aborts its fetch pool and write sink when it is
+    /// With `direct_write` or `write_in_place` a read writes no temporary file. A defragment into a
+    /// file ([`DefragmentSink::File`]) with this aborts its fetch pool and write sink when it is
     /// dropped, so that nothing is written to the file past it.
     ///
     /// [`DefragmentSink::File`]: crate::defragment::DefragmentSink::File
@@ -272,6 +275,7 @@ impl Default for ReadOptions {
             no_local_write: false,
             strict_local: false,
             direct_write: false,
+            write_in_place: false,
             sparse_write: false,
             resume_write: false,
             resume_held: false,
@@ -290,6 +294,12 @@ impl ReadOptions {
     /// and without `sparse_write`. A fragment list is written through the file cache.
     pub fn writes_unbuffered(&self) -> bool {
         cfg!(target_family = "windows") && self.direct_write && !self.sparse_write
+    }
+
+    /// Whether a read into a file writes a fragment list at its own path, with no temporary file:
+    /// with `direct_write` or `write_in_place`.
+    pub fn writes_in_place(&self) -> bool {
+        self.direct_write || self.write_in_place
     }
 
     pub fn with_decompress(mut self) -> Self {

@@ -483,6 +483,8 @@ pub struct RepositoryRuntimeSettings {
     pub disable_cache: AtomicBool,
     /// Write directly to target file instead of write to temporary file + move
     pub direct_file_write: AtomicBool,
+    /// Write every file at its own path, with no temporary file, whatever `direct_file_write` says
+    pub write_in_place: AtomicBool,
     /// Prefetch a sync target's tree in bulk, from `[sync] prefetch_tree`
     pub prefetch_tree: AtomicBool,
 }
@@ -493,6 +495,7 @@ impl Default for RepositoryRuntimeSettings {
             disable_upload: AtomicBool::new(true),
             disable_cache: AtomicBool::new(true),
             direct_file_write: AtomicBool::new(false),
+            write_in_place: AtomicBool::new(false),
             prefetch_tree: AtomicBool::new(false),
         }
     }
@@ -504,6 +507,7 @@ impl Clone for RepositoryRuntimeSettings {
             disable_upload: AtomicBool::new(self.disable_upload.load(Ordering::Relaxed)),
             disable_cache: AtomicBool::new(self.disable_cache.load(Ordering::Relaxed)),
             direct_file_write: AtomicBool::new(self.direct_file_write.load(Ordering::Relaxed)),
+            write_in_place: AtomicBool::new(self.write_in_place.load(Ordering::Relaxed)),
             prefetch_tree: AtomicBool::new(self.prefetch_tree.load(Ordering::Relaxed)),
         }
     }
@@ -519,6 +523,10 @@ impl Clone for RepositoryRuntimeSettings {
         );
         self.direct_file_write.store(
             source.direct_file_write.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.write_in_place.store(
+            source.write_in_place.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
         self.prefetch_tree.store(
@@ -1671,6 +1679,18 @@ impl RepositoryContext {
         self.settings
             .direct_file_write
             .store(direct, Ordering::Relaxed);
+    }
+
+    /// See [`RepositoryRuntimeSettings::write_in_place`].
+    pub fn write_in_place(&self) -> bool {
+        self.settings.write_in_place.load(Ordering::Relaxed)
+    }
+
+    /// See [`RepositoryRuntimeSettings::write_in_place`].
+    pub fn set_write_in_place(&self, in_place: bool) {
+        self.settings
+            .write_in_place
+            .store(in_place, Ordering::Relaxed);
     }
 
     pub fn prefetch_tree(&self) -> bool {
