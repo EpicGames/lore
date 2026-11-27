@@ -53,7 +53,7 @@ The `[store]` table tunes the repository's local stores — the on-disk immutabl
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `max_capacity` | integer (fragments) | `2000000` | Maximum number of fragments in the local immutable store. Eviction removes the least recently used fragments to hold the store near 70% of it. The periodic eviction pass treats a value below `1048576` as `1048576`. |
-| `eviction_delay` | integer (seconds) | `30` | Interval between background eviction passes. The first pass runs one interval after the store opens. |
+| `eviction_delay` | integer (seconds) | `30` | Interval between background eviction passes. The first pass runs one interval after the store opens. Under `--no-background-flush` a pass evicts in memory and leaves its index writes to the end of the command. |
 | `max_size` | integer (bytes) | `10737418240` (10 GiB) | Maximum total size of the local immutable store's packfiles. Above it, compaction evicts the least recently used content toward 70% of it and rewrites packfiles to reclaim the space. |
 | `compaction_delay` | integer (seconds) | `50` | Interval before a background compaction pass starts from the beginning. A pass that an earlier command stopped after its first step resumes as soon as the store opens. |
 | `verify_write` | Boolean | unset (behaves as `false`) | Verify each write by reading the data back and rehashing it. |

@@ -6663,4 +6663,124 @@ mod open_tests {
         let (_, close_cb) = make_sink();
         assert_eq!(close_handle(handle, close_cb).await, 0);
     }
+
+    /// The length and modified time of every bucket and level file of the store's index under
+    /// `repo_path`, the files a flush writes.
+    fn index_files(repo_path: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+        let mut files = Vec::new();
+        let mut pending = vec![repo_path.join(".lore").join("immutable").join("index")];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let metadata = entry.metadata().expect("an index entry's metadata");
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if metadata.is_dir() {
+                    if name != "pack" {
+                        pending.push(entry.path());
+                    }
+                } else if name.starts_with("index_") || name == "level" {
+                    files.push((
+                        entry.path(),
+                        metadata.len(),
+                        metadata.modified().expect("a modified time"),
+                    ));
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// Open with `no_background_flush=1`: a put held only locally schedules no delayed flush, so
+    /// the store's index files stay as they were past the flush delay, and close writes them.
+    /// Without it the delayed flush writes them while the handle is open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_without_background_flush_writes_the_index_at_close() {
+        use std::time::Duration;
+        use std::time::Instant;
+
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        for deferred in [true, false] {
+            let repo_dir = tempdir("no-background-flush");
+            let repo_path = repo_dir.path();
+            create_repo(repo_path).await;
+
+            let (open_sink, open_cb) = make_sink();
+            let mut g = globals();
+            g.no_background_flush = u8::from(deferred);
+            let status = open::open(
+                g,
+                LoreStorageOpenArgs {
+                    repository_path: LoreString::from(repo_path.display().to_string().as_str()),
+                    in_memory: 0,
+                    ..Default::default()
+                },
+                open_cb,
+            )
+            .await;
+            assert_eq!(status, 0);
+            let id = take_opened(&open_sink.lock().unwrap()).expect("Opened");
+            let handle = lore::storage::handle::LoreStore { handle_id: id };
+            let before = index_files(repo_path);
+
+            let payload = b"a payload the background flush would index".to_vec();
+            let item = lore::storage::put::LoreStoragePutItem {
+                id: 0,
+                partition: Partition::from([0xd1u8; 16]),
+                context: Context::from([0x5au8; 16]),
+                data: lore_revision::event::LoreBytes {
+                    ptr: payload.as_ptr().cast(),
+                    len: payload.len(),
+                },
+                remote_write: 0,
+                local_cache: 0,
+                remote_query: 0,
+                fixed_size_chunk: 0,
+            };
+            let (_sink, cb) = make_sink();
+            let status = lore::storage::put::put(
+                globals(),
+                lore::storage::put::LoreStoragePutArgs {
+                    handle,
+                    items: lore_revision::interface::LoreArray::from_vec(vec![item]),
+                },
+                cb,
+            )
+            .await;
+            assert_eq!(status, 0);
+
+            let delay = Duration::from_secs(
+                lore_storage::local::immutable_store::DEFAULT_FLUSH_DELAY_SECONDS + 2,
+            );
+            if deferred {
+                tokio::time::sleep(delay).await;
+                assert_eq!(
+                    index_files(repo_path),
+                    before,
+                    "no background flush wrote the index while the handle was open"
+                );
+            } else {
+                let deadline = Instant::now() + delay * 2;
+                while index_files(repo_path) == before {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the delayed flush writes the index while the handle is open"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+
+            let written = index_files(repo_path);
+            let (_, close_cb) = make_sink();
+            assert_eq!(close_handle(handle, close_cb).await, 0);
+            if deferred {
+                assert_ne!(index_files(repo_path), written, "the close wrote the index");
+            }
+        }
+    }
 }

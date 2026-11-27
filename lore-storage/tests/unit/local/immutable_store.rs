@@ -10772,3 +10772,247 @@ mod eviction_flush_delay {
         );
     }
 }
+
+mod background_flush_hold {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    use super::evict::background_settings;
+    use super::evict::entries_on_disk;
+    use super::evict::store_with_written;
+    use super::evict::two_groups;
+    use super::*;
+
+    /// Settings of a client store: no background flush of durable entries, the full bucket
+    /// layout, and no delay before a delayed flush.
+    fn client_store_settings() -> ImmutableStoreSettings {
+        ImmutableStoreSettings {
+            flush_background: false,
+            flush_delay_seconds: 0,
+            ..background_settings(false)
+        }
+    }
+
+    /// Whether every one of `written` holds `entries` entries on disk.
+    async fn all_on_disk(
+        store: &LocalImmutableStore,
+        written: &[(usize, usize)],
+        entries: usize,
+    ) -> bool {
+        for &(group_index, bucket_index) in written {
+            if entries_on_disk(store, group_index, bucket_index).await != entries {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// **An eviction pass on a held store writes nothing, and the store's explicit flush writes
+    /// what it evicted.** The unwritten buckets keep the flock until then.
+    #[tokio::test]
+    async fn a_held_stores_eviction_waits_for_its_explicit_flush() {
+        let dir = lore_base::test_util::TempDir::new("is_hold_evict_");
+        let (store, written) =
+            store_with_written(&dir, client_store_settings(), &two_groups()).await;
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+        let hold = store.clone().hold_background_flush();
+        assert!(hold.is_some(), "a disk-backed store takes a hold");
+
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 2);
+
+        assert!(
+            all_on_disk(&store, &written, 1).await,
+            "the pass wrote no bucket"
+        );
+        for &(group_index, _) in &written {
+            assert!(
+                !store.group[group_index]
+                    .scheduled
+                    .load(atomic::Ordering::Relaxed),
+                "group {group_index} has no delayed flush due"
+            );
+        }
+        assert!(lock.is_held(), "the unwritten buckets keep the flock");
+
+        store.clone().flush(FlushOptions::default()).await.unwrap();
+
+        assert!(
+            all_on_disk(&store, &written, 0).await,
+            "the explicit flush wrote the eviction"
+        );
+        assert!(!lock.is_held(), "and let the store go");
+        drop(hold);
+    }
+
+    /// **A held store schedules no delayed flush for a change, and a delayed flush already due
+    /// writes nothing while the hold lasts.**
+    #[tokio::test]
+    async fn a_held_store_schedules_no_delayed_flush_and_one_already_due_writes_nothing() {
+        let dir = lore_base::test_util::TempDir::new("is_hold_delayed_");
+        let settings = ImmutableStoreSettings {
+            flush_delay_seconds: 0,
+            ..background_settings(false)
+        };
+        let (store, written) = store_with_written(&dir, settings, &two_groups()).await;
+        let (group_index, bucket_index) = written[0];
+        let group = &store.group[group_index];
+        let _hold = store.clone().hold_background_flush();
+
+        let changed = put_payload(
+            &store,
+            Partition::from([0x45u8; 16]),
+            Context::default(),
+            b"a change made under a hold",
+            false,
+        )
+        .await;
+        assert!(
+            !store.group[changed.hash.data()[0] as usize]
+                .scheduled
+                .load(atomic::Ordering::Relaxed),
+            "the change scheduled no delayed flush"
+        );
+
+        assert!(store.clone().evict(1, false, None).await.unwrap() > 0);
+        group.scheduled.store(true, atomic::Ordering::Relaxed);
+        ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, Duration::ZERO)
+            .await;
+
+        assert_eq!(
+            entries_on_disk(&store, group_index, bucket_index).await,
+            1,
+            "the delayed flush wrote nothing"
+        );
+        assert!(
+            group.needs_flush(bucket_index),
+            "and left the bucket flagged"
+        );
+        assert!(
+            !group.scheduled.load(atomic::Ordering::Relaxed),
+            "with no delayed flush due"
+        );
+    }
+
+    /// **Holds on one store count: the store's background writes wait for the last to drop, which
+    /// schedules the delayed flush of each group the holds left flagged.**
+    #[tokio::test]
+    async fn the_last_hold_to_drop_schedules_the_writes_the_holds_held_back() {
+        let dir = lore_base::test_util::TempDir::new("is_hold_last_");
+        let (store, written) =
+            store_with_written(&dir, client_store_settings(), &two_groups()).await;
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+        let first = store.clone().hold_background_flush();
+        let second = store.clone().hold_background_flush();
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 2);
+
+        drop(first);
+        tokio::task::yield_now().await;
+        assert!(
+            all_on_disk(&store, &written, 1).await,
+            "a hold left keeps the writes back"
+        );
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 0);
+        assert!(
+            all_on_disk(&store, &written, 1).await,
+            "including those of a later pass"
+        );
+
+        drop(second);
+
+        wait_for(
+            async || all_on_disk(&store, &written, 0).await,
+            "the delayed flushes write the eviction",
+        )
+        .await;
+        wait_for(async || !lock.is_held(), "and let the store go").await;
+    }
+
+    /// **A flush that fails under a hold leaves the evicted buckets flagged, and the hold's drop
+    /// schedules their write again.**
+    #[tokio::test]
+    async fn a_hold_dropped_after_a_failed_flush_schedules_the_writes_again() {
+        let dir = lore_base::test_util::TempDir::new("is_hold_failed_");
+        let (store, written) =
+            store_with_written(&dir, client_store_settings(), &two_groups()).await;
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+        let hold = store.clone().hold_background_flush();
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 2);
+        let (group_index, bucket_index) = written[0];
+        block_bucket_file(&store, group_index, bucket_index);
+
+        assert!(
+            store.clone().flush(FlushOptions::default()).await.is_err(),
+            "the blocked bucket cannot be written"
+        );
+        assert!(
+            store.group[group_index].needs_flush(bucket_index),
+            "the bucket stays flagged"
+        );
+        assert!(lock.is_held(), "and keeps the store claimed");
+
+        let root = store.path.clone().expect("a disk-backed store has a path");
+        std::fs::remove_dir_all(format_bucket_path(&root, group_index, bucket_index))
+            .expect("the bucket file's place is freed");
+        drop(hold);
+
+        wait_for(
+            async || all_on_disk(&store, &written, 0).await,
+            "the delayed flush writes the bucket the flush failed to",
+        )
+        .await;
+        wait_for(async || !lock.is_held(), "and lets the store go").await;
+    }
+
+    /// **A change made without a hold, while another caller holds the store, waits for that hold,
+    /// and the hold's drop schedules its write.**
+    #[tokio::test]
+    async fn a_change_made_without_a_hold_waits_for_the_hold_on_its_store() {
+        let dir = lore_base::test_util::TempDir::new("is_hold_other_");
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_store_settings())
+            .await
+            .unwrap();
+        let hold = store.clone().hold_background_flush();
+
+        let address = put_payload(
+            &store,
+            Partition::from([0x46u8; 16]),
+            Context::default(),
+            b"a change another caller makes",
+            false,
+        )
+        .await;
+        let group_index = address.hash.data()[0] as usize;
+        let group = &store.group[group_index];
+        let bucket_index = lore_storage::local::fan_out::bucket_index_for(
+            &address.hash,
+            group.bucket_count.load(atomic::Ordering::Relaxed),
+        );
+        let root = store.path.clone().expect("a disk-backed store has a path");
+        let bucket_file = format_bucket_path(&root, group_index, bucket_index);
+        assert!(
+            !group.scheduled.load(atomic::Ordering::Relaxed),
+            "the change scheduled no delayed flush"
+        );
+        tokio::task::yield_now().await;
+        assert!(!bucket_file.exists(), "nothing wrote the change");
+
+        drop(hold);
+
+        wait_for(
+            async || {
+                bucket_file.exists()
+                    && entries_on_disk(&store, group_index, bucket_index).await == 1
+            },
+            "the delayed flush the hold's drop scheduled writes the change",
+        )
+        .await;
+    }
+
+    /// **A store with nothing on disk takes no hold.**
+    #[tokio::test]
+    async fn an_in_memory_store_takes_no_hold() {
+        let store = LocalImmutableStore::new(None, client_store_settings())
+            .await
+            .unwrap();
+        assert!(store.hold_background_flush().is_none());
+    }
+}

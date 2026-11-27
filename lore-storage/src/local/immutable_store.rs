@@ -652,6 +652,35 @@ impl Drop for GcStopRequest<'_> {
     }
 }
 
+/// Holds back a disk-backed store's background index writes while it lives: a delayed group flush
+/// that wakes, or an eviction pass that ends, meanwhile writes nothing and leaves its buckets
+/// flagged. The store's explicit flushes write as they do without it. As the last hold on the
+/// store drops, the store schedules the delayed flush of each group still flagged, as an eviction
+/// pass of a store that defers its eviction writes does, unless its garbage collection was asked
+/// to stop. Until they are written, flagged buckets keep the store's flock.
+pub struct BackgroundFlushHold {
+    store: Weak<LocalImmutableStore>,
+}
+
+impl Drop for BackgroundFlushHold {
+    fn drop(&mut self) {
+        let Some(store) = self.store.upgrade() else {
+            return;
+        };
+        if store
+            .background_flush_holds
+            .fetch_sub(1, atomic::Ordering::Relaxed)
+            == 1
+            && !store.gc_stop_requested()
+        {
+            atomic::fence(atomic::Ordering::SeqCst);
+            drop(lore_base::lore_spawn!(async move {
+                store.schedule_eviction_flushes(true).await;
+            }));
+        }
+    }
+}
+
 #[lore_macro::test_pub]
 pub struct LocalImmutableStore {
     info: RwLock<ImmutableStoreInfo>,
@@ -672,6 +701,8 @@ pub struct LocalImmutableStore {
     /// Stop requests outstanding; callers overlap, so the stop stays raised until the last
     /// of them has drained.
     stop_requests: AtomicUsize,
+    /// The [`BackgroundFlushHold`]s on this store.
+    background_flush_holds: AtomicUsize,
     /// Bytes reclaimed by the compaction step in progress, accumulated across its groups
     /// and reset as the step starts. Reported in the compaction-end callback.
     compaction_reclaimed: AtomicU64,
@@ -1635,9 +1666,9 @@ impl ImmutableStoreGroup {
             || self.fan_out_uncommitted()
     }
 
-    /// Writes out the group's flagged buckets after `delay`. Before writing each bucket, rolls
-    /// forward a fan-out commit the group left pending and commits a level marker the group has
-    /// yet to write.
+    /// Writes out the group's flagged buckets after `delay`, unless a [`BackgroundFlushHold`]
+    /// holds them back then. Before writing each bucket, rolls forward a fan-out commit the group
+    /// left pending and commits a level marker the group has yet to write.
     ///
     /// On a store that defers its eviction writes, a group with changes is written in full when it
     /// may still need to fan out or its fan-out awaits commit. Writing the whole group can change
@@ -1670,6 +1701,9 @@ impl ImmutableStoreGroup {
             // Cleared before a single flag is read: a bucket flagged from here on schedules
             // the next sweep, and one flagged before this is seen by this one.
             group.scheduled.store(false, atomic::Ordering::Relaxed);
+            if store.background_flush_held() {
+                return;
+            }
             // Looked at before claiming, because a sweep that finds nothing — the usual
             // case once a command's own flush has run — must not claim to write: that
             // advances the epoch and tells every other process its state is worthless.
@@ -2369,6 +2403,7 @@ impl LocalImmutableStore {
             eviction: Semaphore::new(1),
             compaction: Semaphore::new(1),
             stop_requests: AtomicUsize::new(0),
+            background_flush_holds: AtomicUsize::new(0),
             compaction_reclaimed: AtomicU64::new(0),
             deserialize_all: Semaphore::new(1),
             deserialized_all: AtomicBool::new(false),
@@ -3688,9 +3723,13 @@ impl LocalImmutableStore {
         .await;
     }
 
-    /// Starts the group's delayed flush after `delay` unless a flush is already due. The bucket's
-    /// flag must be set before this call. See [`ImmutableStoreGroup::scheduled`].
+    /// Starts the group's delayed flush after `delay` unless a flush is already due or a
+    /// [`BackgroundFlushHold`] holds it back. The bucket's flag must be set before this call. See
+    /// [`ImmutableStoreGroup::scheduled`].
     async fn schedule_flush(self: &Arc<Self>, group_index: usize, delay: Duration) {
+        if self.background_flush_held() {
+            return;
+        }
         let group = &self.group[group_index];
         if group.scheduled.swap(true, atomic::Ordering::Relaxed) {
             return;
@@ -3746,6 +3785,17 @@ impl LocalImmutableStore {
 
     fn defers_eviction_flush(&self) -> bool {
         self.settings.defer_eviction_flush && self.settings.flush_background && self.path.is_some()
+    }
+
+    /// Whether a [`BackgroundFlushHold`] holds back this store's background index writes. Called
+    /// after the caller's flags are set. A count seen above zero is read again after a fence that
+    /// pairs with the one in [`BackgroundFlushHold`]'s drop, so either this read sees the last
+    /// hold gone or the drop's scan sees the flags.
+    fn background_flush_held(&self) -> bool {
+        self.background_flush_holds.load(atomic::Ordering::Relaxed) > 0 && {
+            atomic::fence(atomic::Ordering::SeqCst);
+            self.background_flush_holds.load(atomic::Ordering::Relaxed) > 0
+        }
     }
 
     pub async fn load(
@@ -5357,6 +5407,15 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         self.lock.as_ref()?.try_join(Intent::Read)
     }
 
+    fn hold_background_flush(self: Arc<Self>) -> Option<BackgroundFlushHold> {
+        self.path.as_ref()?;
+        self.background_flush_holds
+            .fetch_add(1, atomic::Ordering::Relaxed);
+        Some(BackgroundFlushHold {
+            store: Arc::downgrade(&self),
+        })
+    }
+
     fn store_lock(&self) -> Option<Arc<StoreLock>> {
         self.lock.clone()
     }
@@ -5887,19 +5946,22 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                 Ok(count)
             }
         );
-        // **A pass that defers eviction writes schedules a delayed flush for every changed bucket,
-        // including buckets that an earlier delayed flush failed to write. Any other pass writes
-        // its eviction changes before it ends. Every write holds a claim until it finishes,
-        // independent of other uses of the store.** A changed bucket holds the flock until it is
-        // written. Eviction runs on a background timer. Without a scheduled write, a changed bucket
-        // could hold the flock indefinitely if the process keeps the store but no longer uses it.
+        // **A pass on a store whose background writes a hold holds back leaves its changes to the
+        // flush that ends the hold. A pass that defers eviction writes schedules a delayed flush
+        // for every changed bucket, including buckets that an earlier delayed flush failed to
+        // write. Any other pass writes its eviction changes before it ends. Every write holds a
+        // claim until it finishes, independent of other uses of the store.** A changed bucket
+        // holds the flock until it is written. Eviction runs on a background timer. Without a
+        // scheduled write, a changed bucket could hold the flock indefinitely if the process keeps
+        // the store but no longer uses it, which is why the last hold to go schedules one.
         let evicted_any = evicted.result.as_ref().is_ok_and(|count| *count > 0);
         // Deferral is safe only when nothing waits on the write. Delayed flushes do not perform the
         // sync a caller may request. A pass ending after a stop request writes its own evictions so
         // delayed flushes do not claim the store after background work is asked to stop.
-        if self.defers_eviction_flush() && !sync_data && !self.gc_stop_requested() {
+        let held = self.background_flush_held();
+        if !held && self.defers_eviction_flush() && !sync_data && !self.gc_stop_requested() {
             self.schedule_eviction_flushes(evicted_any).await;
-        } else if evicted_any {
+        } else if !held && evicted_any {
             // The write uses the eviction's claim because it lasts until the write finishes. It
             // can't rely on the span of another use of the store: that span may end while the write
             // is still running.

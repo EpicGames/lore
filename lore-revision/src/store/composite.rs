@@ -1516,6 +1516,12 @@ impl ImmutableStore for CompositeStore {
         self.local.target.try_join_claim()
     }
 
+    fn hold_background_flush(
+        self: Arc<Self>,
+    ) -> Option<lore_storage::local::immutable_store::BackgroundFlushHold> {
+        self.local.target.clone().hold_background_flush()
+    }
+
     /// Heals the local tier's copy, and then the durable store's, which the local tier was filled
     /// from. A read's write of `address` to the local tier ends first, so the local check sees the
     /// copy that write leaves: a payload the durable store served corrupt is dropped, not kept to

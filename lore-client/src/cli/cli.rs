@@ -141,6 +141,12 @@ pub struct LoreCli {
     #[clap(global = true, long = "no-gc", action)]
     no_gc: bool,
 
+    /// Leave the local stores' background index writes, eviction's included, until the command ends.
+    /// In the Lore service, the background writes of every other command on the same store wait
+    /// as well
+    #[clap(global = true, long, action)]
+    no_background_flush: bool,
+
     /// Force sync data to storage media during flush
     #[clap(global = true, long, action)]
     sync_data: bool,
@@ -495,6 +501,7 @@ pub fn lore_globals_from_args(cli: &LoreCli) -> Result<LoreGlobalArgs, LoreCliEr
         remote: cli.remote.into(),
         local: cli.local.into(),
         no_gc: cli.no_gc.into(),
+        no_background_flush: cli.no_background_flush.into(),
         sync_data: cli.sync_data.into(),
         fast_flush: cli.fast_flush.into(),
         cache: cli.cache.into(),

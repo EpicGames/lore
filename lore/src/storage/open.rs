@@ -319,15 +319,18 @@ fn open_local(
             None
         };
 
-        let store = Arc::new(StoreInternal::new(
-            identity,
-            immutable,
-            mutable,
-            remote,
-            bound_flags,
-            args.skip_verify != 0 || execution_context().globals().trust_remote(),
-            stores,
-        ));
+        let store = Arc::new(
+            StoreInternal::new(
+                identity,
+                immutable,
+                mutable,
+                remote,
+                bound_flags,
+                args.skip_verify != 0 || execution_context().globals().trust_remote(),
+                stores,
+            )
+            .holding_background_flush(execution_context().globals().no_background_flush()),
+        );
         let handle = handle::register(store);
         LoreEvent::StorageOpened(LoreStorageOpenedEventData {
             handle_id: handle.handle_id,

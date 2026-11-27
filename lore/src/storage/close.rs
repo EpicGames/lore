@@ -64,12 +64,12 @@ pub(crate) fn claims_for_flush(store: &StoreInternal) -> StoreHold {
     )
 }
 
-/// Flushes `store`'s stores in a task shutdown waits for, holding `claims` until it is done — see
-/// [`claims_for_flush`] — and sends the result to the returned receiver. The task waits for the
-/// immutable store's eviction and compaction passes in flight to give up and for a verification
-/// in flight to end, then flushes the stores through [`flush_stores`] as `options` asks; in-memory
-/// stores no-op. A failed flush no receiver takes is logged. Runs without the caller's execution
-/// context.
+/// Flushes `store`'s stores in a task shutdown waits for, holding `claims` — see
+/// [`claims_for_flush`] — and [`StoreInternal::background_flush`] until it is done, and sends the
+/// result to the returned receiver. The task waits for the immutable store's eviction and
+/// compaction passes in flight to give up and for a verification in flight to end, then flushes
+/// the stores through [`flush_stores`] as `options` asks; in-memory stores no-op. A failed flush
+/// no receiver takes is logged. Runs without the caller's execution context.
 ///
 /// A `SeqCst` fence before the flush reads the stores' `dirty` flags orders it against a revision
 /// tree's close, as [`crate::revision_tree::close::spawn_flush_after_storage_close`] describes.
@@ -81,6 +81,7 @@ pub(crate) fn spawn_flush(
     let (sender, receiver) = oneshot::channel();
     let immutable_store = store.immutable.clone();
     let mutable_store = store.mutable.clone();
+    let background_flush = store.background_flush.clone();
     let flush = async move {
         immutable_store.clone().stop_gc(false).await;
         fence(Ordering::SeqCst);
@@ -88,6 +89,7 @@ pub(crate) fn spawn_flush(
             .await
             .forward::<StorageError>("flushing a closed storage handle's stores");
         drop(claims);
+        drop(background_flush);
         flushed
     }
     .map(move |flushed| {

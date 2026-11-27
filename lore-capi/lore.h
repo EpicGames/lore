@@ -4631,6 +4631,17 @@ typedef struct lore_global_args_t {
   // Use in-memory stores instead of file-backed stores. No store data is
   // read from or written to the .urc/immutable/ and .urc/mutable/ directories.
   uint8_t in_memory;
+  // Leave the local stores' background index writes until the call ends: the delayed flushes
+  // of their changes, and the writes of eviction passes, which still run and evict in memory.
+  // The call's own flushes write as they do without it. The call writes what it held back
+  // before it completes, whether or not it fails, and a call that otherwise succeeds fails if
+  // that write fails. A storage handle opened with this holds the writes back until its close,
+  // whose flush writes them. In a process that serves several calls, such as the Lore service,
+  // a store holds back the background writes of every call on it while a call or handle that
+  // set this is active. If the process stops meanwhile, the index loses the changes held back:
+  // content fetched from the remote is fetched again, and content written locally stays in the
+  // packfiles unindexed until compaction reclaims it.
+  uint8_t no_background_flush;
   // Maximum number of files being processed in parallel
   uint64_t file_count_limit;
   // Maximum total size of all files being processed in parallel

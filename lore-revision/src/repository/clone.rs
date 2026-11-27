@@ -174,6 +174,7 @@ impl EventError for CloneError {
     }
 }
 
+#[lore_macro::test_pub]
 struct RepositoryCloneGuard {
     pub path: PathBuf,
     pub clean_path_on_drop: bool,
@@ -1470,20 +1471,20 @@ pub async fn clone(
         tokio::join!(local_init_fut, prefetch_branch_fut);
 
     if let Some(instance_id) = created_instance_id
-        && (local_result.is_err() || prefetch_result.is_err())
+        && local_result.is_err()
     {
         abandon_failed_fuse_clone(path, is_fuse, mount_point_preexisted, instance_id).await;
     }
 
     let repository = local_result?;
     let instance_id = repository.instance_id;
-    let prefetched_branch = prefetch_result?;
 
+    let held = repository.clone();
     let result = clone_into(
         repository,
         remote,
         repository_metadata,
-        prefetched_branch,
+        prefetch_result,
         path,
         revision,
         view,
@@ -1493,6 +1494,7 @@ pub async fn clone(
         &mut dot_directory_guard,
     )
     .await;
+    let result = clone_writing_held_back(&held, result).await;
 
     if result.is_err() {
         abandon_failed_fuse_clone(path, is_fuse, mount_point_preexisted, instance_id).await;
@@ -1546,20 +1548,42 @@ async fn abandon_failed_fuse_clone(
     }
 }
 
-/// Completes [`clone`] once the repository exists locally and its branch is fetched: applies the
-/// view, resolves the revision and layer, records the branch and materializes the tree.
+/// Returns `result`, the outcome of a clone of the instance `repository`, once a clone that failed
+/// has written what it held back ([`RepositoryContext::flush_held_back_after_failure`]), so that a
+/// clone writes it before it returns on every way out once its instance is open. A clone that
+/// succeeds has written it in its own flush.
+#[lore_macro::test_pub]
+async fn clone_writing_held_back(
+    repository: &RepositoryContext,
+    result: Result<(), CloneError>,
+) -> Result<(), CloneError> {
+    if result.is_err() {
+        repository
+            .flush_held_back_after_failure(execution_context().globals().flush_options())
+            .await;
+    }
+    result
+}
+
+/// Completes [`clone`] once the repository exists locally: returns the error of
+/// `prefetched_branch`, the fetch of the branch that ran beside the open of `repository`, where it
+/// failed, and otherwise applies the view, resolves the revision and layer, records the branch and
+/// materializes the tree.
 ///
 /// Sends the clone end event only for a clone that succeeded. A failure to materialize the tree
-/// is reported ahead of a failure to record the branch or to finish the operation.
+/// is reported ahead of a failure to record the branch or to finish the operation. A clone whose
+/// file operation fails to start returns that failure once it has recorded the branch and flushed
+/// the instance's stores, and logs a failure of either.
 ///
 /// A function of its own because its locals live across several awaits: kept in [`clone`] they
 /// would take space in its future while the repository is created as well.
+#[lore_macro::test_pub]
 #[allow(clippy::too_many_arguments)]
 async fn clone_into(
     repository: Arc<RepositoryContext>,
     remote: Arc<lore_transport::Connection>,
     repository_metadata: repository::RepositoryMetadata,
-    prefetched_branch: Option<branch::BranchStatus>,
+    prefetched_branch: Result<Option<branch::BranchStatus>, CloneError>,
     path: &Path,
     revision: Option<String>,
     view: Option<&Path>,
@@ -1568,6 +1592,7 @@ async fn clone_into(
     repository_path_guard: &mut RepositoryCloneGuard,
     dot_directory_guard: &mut RepositoryCloneGuard,
 ) -> Result<(), CloneError> {
+    let prefetched_branch = prefetched_branch?;
     let context = execution_context();
     let call = context.globals();
 
@@ -1745,11 +1770,31 @@ async fn clone_into(
 
     let stats = Arc::new(CloneStats::default());
 
-    let operation = repository
+    let begun = repository
         .file_system()
         .begin_operation()
         .await
-        .forward::<CloneError>("Starting the file operation of cloning")?;
+        .forward::<CloneError>("Starting the file operation of cloning");
+    let operation = match begun {
+        Ok(operation) => operation,
+        Err(err) => {
+            match store_task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(stored)) => {
+                    lore_warn!("Failed to store the cloned branch {branch_id}: {stored}");
+                }
+                Err(joined) => {
+                    lore_warn!("The task storing the cloned branch {branch_id} failed: {joined}");
+                }
+            }
+            if let Err(flushed) = repository.flush(call.flush_options()).await {
+                lore_warn!(
+                    "Failed to flush the cloned branch {branch_id} after the file operation failed to start: {flushed}"
+                );
+            }
+            return Err(err);
+        }
+    };
 
     let materialize_result = clone_materialize(
         CloneContext {
@@ -1772,9 +1817,10 @@ async fn clone_into(
         Err(e) => Err(CloneError::internal(format!("Store task failed: {e}"))),
     };
 
-    if let Err(err) = repository.flush(call.flush_options()).await {
-        lore_warn!("Failed to flush the cloned repository's stores: {err}");
-    }
+    let flush_result = clone_flush_result(
+        repository.flush(call.flush_options()).await,
+        call.no_background_flush(),
+    );
 
     // The current anchor is stored whether or not the tree was written whole.
     if materialize_result.is_err() {
@@ -1794,7 +1840,10 @@ async fn clone_into(
         let _ = task.await;
     }
 
-    materialize_result.and(store_result).and(operation_result)?;
+    materialize_result
+        .and(store_result)
+        .and(operation_result)
+        .and(flush_result)?;
 
     event::LoreEvent::RepositoryCloneEnd(LoreRepositoryCloneEndEventData {
         branch: branch_name.into(),
@@ -1888,6 +1937,27 @@ fn refuse_on_held_state(
         return Ok(());
     }
     Err(hold::refused("restrict cloning to a dependency set").into())
+}
+
+/// The clone's outcome of `flushed`, its flush of the cloned repository's stores: the flush's
+/// error for a clone that holds back its stores' background index writes
+/// ([`crate::interface::LoreGlobalArgs::no_background_flush`]), and `Ok`, after a warning, for
+/// any other clone.
+#[lore_macro::test_pub]
+fn clone_flush_result(
+    flushed: Result<(), crate::repository::RepositoryError>,
+    held_back: bool,
+) -> Result<(), CloneError> {
+    match flushed {
+        Err(err) if held_back => {
+            Err(err).forward::<CloneError>("flushing the cloned repository's stores")
+        }
+        Err(err) => {
+            lore_warn!("Failed to flush the cloned repository's stores: {err}");
+            Ok(())
+        }
+        Ok(()) => Ok(()),
+    }
 }
 
 /// Hands a provider that holds its state in a `State` ([`InstanceOperationImpl::holds_state`])

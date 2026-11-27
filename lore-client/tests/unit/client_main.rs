@@ -61,6 +61,25 @@ fn trusting_the_remote_and_fast_flush_reach_the_globals() {
     }
 }
 
+/// `--no-background-flush` reaches the command's globals, and is off without it.
+#[test]
+fn no_background_flush_reaches_the_globals() {
+    for (args, deferred) in [
+        (vec!["lore", "status"], false),
+        (vec!["lore", "status", "--no-background-flush"], true),
+    ] {
+        let cli = LoreCli::try_parse_from(&args).expect("the arguments must parse");
+        let globals =
+            lore_client::cli::lore_globals_from_args(&cli).expect("the globals must resolve");
+        assert_eq!(
+            globals.no_background_flush(),
+            deferred,
+            "{}",
+            args.join(" ")
+        );
+    }
+}
+
 /// The `[auth]` settings are set for the variables the environment leaves unset or blank, and
 /// left alone for those it sets.
 #[test]

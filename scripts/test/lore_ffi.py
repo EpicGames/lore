@@ -111,6 +111,7 @@ class LoreGlobalArgs(Structure):
         ("search_nearest", c_uint8),
         ("no_gc", c_uint8),
         ("in_memory", c_uint8),
+        ("no_background_flush", c_uint8),
         ("file_count_limit", c_uint64),
         ("file_size_limit", c_uint64),
         ("compress_task_limit", c_uint64),

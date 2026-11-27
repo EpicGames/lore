@@ -134,6 +134,7 @@ where
                     Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
                 };
                 let detail = LoreErrorDetail::from_result(&command(repository.clone(), args).await);
+                let detail = held_back_writes_outcome(&repository, detail).await;
                 (detail, Some(post_command_cleanup(repository)))
             };
 
@@ -191,6 +192,7 @@ where
                 };
                 let detail =
                     LoreErrorDetail::from_result(&command(repository.clone(), token, args).await);
+                let detail = held_back_writes_outcome(&repository, detail).await;
                 (detail, Some(post_command_cleanup(repository)))
             };
 
@@ -293,6 +295,7 @@ where
                     let detail = LoreErrorDetail::from_result(
                         &command(repository.clone(), token, &plan).await,
                     );
+                    let detail = held_back_writes_outcome(&repository, detail).await;
                     (detail, Some(post_command_cleanup(repository)))
                 };
                 check_no_lingering_repository(weak_repository);
@@ -412,6 +415,26 @@ async fn prepare_repository_call(
         })
         .await;
     Err(status)
+}
+
+/// The outcome of a call whose command on `repository` ended in `detail`, once the index writes
+/// the command held back ([`RepositoryContext::flush_held_back`]) are written, whatever the command
+/// returned: `detail` where the command failed, with a failure of the flush logged
+/// ([`RepositoryContext::flush_held_back_after_failure`]), and otherwise the error of the flush
+/// where it fails.
+async fn held_back_writes_outcome(
+    repository: &RepositoryContext,
+    detail: LoreErrorDetail,
+) -> LoreErrorDetail {
+    let options = execution_context().globals().flush_options();
+    if detail.error_code != 0 {
+        repository.flush_held_back_after_failure(options).await;
+        return detail;
+    }
+    match repository.flush_held_back(options).await {
+        Err(err) => LoreErrorDetail::from_error(&err),
+        Ok(()) => detail,
+    }
 }
 
 fn post_command_cleanup(repository: Arc<RepositoryContext>) -> std::sync::Weak<RepositoryContext> {

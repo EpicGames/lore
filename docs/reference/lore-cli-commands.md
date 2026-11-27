@@ -249,6 +249,8 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * `--search-nearest` — Set to search for nearest match when matching revisions
 * `--no-gc` — Prevent automatic incremental garbage collection for this command; it otherwise runs in the background on
   writes. `lore repository gc` always runs a full pass regardless
+* `--no-background-flush` — Leave the local stores' background index writes, eviction's included, until the command
+  ends. In the Lore service, the background writes of every other command on the same store wait as well
 * `--sync-data` — Force sync data to storage media during flush
 * `--fast-flush` — Have the command's flushes write the local stores' index in place rather than replacing each of its
   files through a temporary file. Faster where creating files is slow, but if the process stops or a write fails while a

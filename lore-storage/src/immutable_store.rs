@@ -28,6 +28,7 @@ use crate::errors::NotSupported;
 use crate::errors::Oversized;
 use crate::errors::PayloadNotFound;
 use crate::errors::SlowDown;
+use crate::local::immutable_store::BackgroundFlushHold;
 use crate::local::store_lock::StoreGuard;
 use crate::store_types::PayloadRead;
 use crate::store_types::StoreGetData;
@@ -564,6 +565,13 @@ pub trait ImmutableStore: Any + Send + Sync {
     /// Taken by an operation for work it spawns to outlive it: see [`claim_for_task`]. A wrapper
     /// delegates it as it delegates [`Self::hold_for_command`].
     fn try_join_claim(&self) -> Option<StoreGuard> {
+        None
+    }
+
+    /// Holds back this store's background index writes until the hold drops, see
+    /// [`BackgroundFlushHold`]: `None` for a store with nothing on disk to write. A wrapper
+    /// delegates it as it delegates [`Self::try_join_claim`].
+    fn hold_background_flush(self: Arc<Self>) -> Option<BackgroundFlushHold> {
         None
     }
 

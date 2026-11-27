@@ -186,6 +186,11 @@ pub(crate) struct StoreInternal {
     /// keep-alive window afterwards — retained memory, not an open store, and the epoch
     /// decides whether it is still usable when one is opened again.
     _hold: lore_storage::local::store_lock::StoreHold,
+    /// The hold on the immutable store's background index writes, for a handle opened with
+    /// `globals.no_background_flush`. Dropped with the last reference to the handle's state, as
+    /// [`Self::_hold`] is, or once a flush the handle's close or its last revision tree's close
+    /// started has ended, if that is later.
+    pub background_flush: Option<Arc<lore_storage::local::immutable_store::BackgroundFlushHold>>,
 }
 
 impl StoreInternal {
@@ -212,7 +217,18 @@ impl StoreInternal {
             invalid: AtomicBool::new(false),
             drained: Notify::new(),
             _hold: hold,
+            background_flush: None,
         }
+    }
+
+    /// This handle holding back its immutable store's background index writes where `hold` is
+    /// set, see [`Self::background_flush`].
+    #[must_use]
+    pub(crate) fn holding_background_flush(mut self, hold: bool) -> Self {
+        if hold {
+            self.background_flush = self.immutable.clone().hold_background_flush().map(Arc::new);
+        }
+        self
     }
 
     /// Builder variant: tag the handle with the IPC connection it was opened on. The IPC

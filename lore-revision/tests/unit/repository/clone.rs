@@ -5,12 +5,14 @@
 // reached.
 #![allow(clippy::disallowed_methods)]
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use lore_base::error::AddressNotFound;
+use lore_base::error::BranchNotFound;
 use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::test_util::TempDir;
@@ -22,11 +24,13 @@ use lore_revision::filter::FilterMode;
 use lore_revision::fs::filesystem_provider::FilesystemProvider;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
 use lore_revision::fs::os::OsFilesystem;
+use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::node::BLOCK_NODE_COUNT;
 use lore_revision::node::Node;
 use lore_revision::node::NodeBlock;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::repository::RepositoryMetadata;
 use lore_revision::repository::clone::*;
 use lore_revision::repository::prefetch::StopWhen;
 use lore_revision::stage::stage_single_node;
@@ -34,11 +38,21 @@ use lore_revision::state::State;
 use lore_revision::util::path::RelativePath;
 use lore_storage::StoreError;
 use lore_storage::hash::hash_string;
+use lore_storage::test_util::HookedStore;
 use lore_storage::test_util::StoreCall;
+use lore_storage::test_util::fail_packfile_syncs;
+use lore_storage::test_util::packfile_sync_failures_left;
 use zerocopy::FromZeros;
 
 use crate::branch::null_repository;
+use crate::fs::filesystem_provider::TestFilesystemProvider;
 use crate::fs::filesystem_provider::setup_test_execution;
+use crate::fs::filesystem_provider::test_execution_with;
+use crate::helper::RepositoryContextCreationArgsExt;
+use crate::helper::default_repository_creation_args;
+use crate::repository::flush_tests::context_with_unflushed_writes;
+use crate::repository::flush_tests::disk_stores;
+use crate::repository::flush_tests::load_from_disk;
 use crate::repository::test_helpers::caused_by;
 use crate::repository::test_helpers::file_node;
 use crate::repository::test_helpers::stored_as_list;
@@ -1576,6 +1590,370 @@ async fn creating_over_an_existing_shared_store_refuses_a_local_mutable_store() 
                 Err(error) => assert!(error.to_string().contains("local mutable store"), "{error}"),
                 Ok(_) => panic!("a local mutable store is refused"),
             }
+        })
+        .await;
+}
+
+/// A failed flush at the end of a clone fails a clone that holds back its stores' background
+/// index writes, and only warns for any other clone.
+#[tokio::test]
+async fn a_failed_end_of_clone_flush_fails_only_a_clone_holding_back_its_index_writes() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            for held_back in [true, false] {
+                let failed = Err(lore_revision::repository::RepositoryError::internal(
+                    "the flush failed",
+                ));
+                assert_eq!(
+                    clone_flush_result(failed, held_back).is_err(),
+                    held_back,
+                    "held back {held_back}: the clone's outcome of a failed flush"
+                );
+                assert!(clone_flush_result(Ok(()), held_back).is_ok());
+            }
+        })
+        .await;
+}
+
+/// Runs a clone that holds back its stores' background index writes, with flushes that sync, from
+/// the point it has opened its instance: an instance with an index write held back and a write to
+/// its mutable store not yet flushed. Its fetch of the branch ends in `prefetched_branch`, it
+/// reaches no remote, and where `flush_fails`, its write of what it held back fails at its
+/// packfile sync. Returns the clone's outcome, whether that packfile sync ran, and whether the
+/// mutable store's write is on disk once the clone has returned and its instance is closed.
+async fn clone_failing_after_holding_back(
+    prefetched_branch: Result<Option<branch::BranchStatus>, CloneError>,
+    flush_fails: bool,
+) -> (Result<(), CloneError>, bool, bool) {
+    let root = TempDir::new("clone-held-back-failing-");
+    let globals = LoreGlobalArgs {
+        no_background_flush: 1,
+        sync_data: 1,
+        ..LoreGlobalArgs::default()
+    };
+    LORE_CONTEXT
+        .scope(test_execution_with(globals), async {
+            let repository = context_with_unflushed_writes(root.path(), true).await;
+            let partition = repository.id;
+            let mut repository_path_guard = RepositoryCloneGuard::new(root.path(), false);
+            let mut dot_directory_guard = RepositoryCloneGuard::new(root.path(), false);
+            fail_packfile_syncs(usize::from(flush_fails));
+
+            let result = clone_into(
+                repository.clone(),
+                lore_transport::Connection::detached(Vec::new()),
+                RepositoryMetadata::default(),
+                prefetched_branch,
+                root.path(),
+                None,
+                None,
+                None,
+                CloneOptions::default(),
+                &mut repository_path_guard,
+                &mut dot_directory_guard,
+            )
+            .await;
+            let result = clone_writing_held_back(&repository, result).await;
+            drop(repository);
+
+            let synced = flush_fails && packfile_sync_failures_left() == 0;
+            fail_packfile_syncs(0);
+            let written = load_from_disk(root.path(), partition)
+                .await
+                .is_ok_and(|value| value == Hash::from_u64(0xE6));
+            (result, synced, written)
+        })
+        .await
+}
+
+/// A clone holding back its stores' background index writes whose fetch of the branch fails, after
+/// its instance is open, writes what it held back before it returns, and returns the fetch's
+/// error, also where that write fails.
+#[tokio::test]
+async fn a_clone_whose_branch_fetch_fails_writes_what_it_held_back_before_returning() {
+    for flush_fails in [false, true] {
+        let fetch_failed = Err(CloneError::from(BranchNotFound {
+            branch: "the cloned branch".to_owned(),
+        }));
+
+        let (result, synced, written) =
+            clone_failing_after_holding_back(fetch_failed, flush_fails).await;
+
+        assert!(
+            result.as_ref().is_err_and(CloneError::is_branch_not_found),
+            "flush fails {flush_fails}: the clone returns the fetch's error, {result:?}"
+        );
+        if flush_fails {
+            assert!(
+                synced,
+                "the clone writes what it held back before it returns"
+            );
+        } else {
+            assert!(
+                written,
+                "the clone writes what it held back before it returns"
+            );
+        }
+    }
+}
+
+/// A clone holding back its stores' background index writes that fails to load the state of the
+/// revision it clones, as it reaches no remote, writes what it held back before it returns, and
+/// fails, also where that write fails.
+#[tokio::test]
+async fn a_clone_whose_state_load_fails_writes_what_it_held_back_before_returning() {
+    for flush_fails in [false, true] {
+        let branch = branch::BranchStatus {
+            latest: Hash::from_u64(0x5EED),
+            metadata: Hash::from_u64(0x5EEE),
+            ..branch::BranchStatus::default()
+        };
+
+        let (result, synced, written) =
+            clone_failing_after_holding_back(Ok(Some(branch)), flush_fails).await;
+
+        assert!(
+            result.is_err(),
+            "flush fails {flush_fails}: the clone fails, {result:?}"
+        );
+        if flush_fails {
+            assert!(
+                synced,
+                "the clone writes what it held back before it returns"
+            );
+        } else {
+            assert!(
+                written,
+                "the clone writes what it held back before it returns"
+            );
+        }
+    }
+}
+
+/// What [`clone_failing_to_start`] observes.
+struct FailedStart {
+    /// The clone's outcome.
+    result: Result<(), CloneError>,
+    /// How many times the clone began its file operation.
+    begun: usize,
+    /// The branch's metadata, name and latest revision as the instance holds them once the clone
+    /// has returned.
+    held: (Option<Hash>, Option<BranchId>, Option<Hash>),
+    /// The branch's metadata and revision as the test wrote them.
+    written: (Hash, Hash),
+}
+
+/// The branch [`clone_with_failing_start`] clones.
+fn failing_start_branch() -> BranchId {
+    BranchId::from([2; 16])
+}
+
+/// Runs a clone, from the point it has opened its instance `repository` at `root`, of a branch
+/// whose metadata, with the name `cloned`, and revision are in the instance's stores, where the
+/// clone's file operation fails to start. `before_clone` runs once the branch is written and before
+/// the clone starts. Returns the clone's outcome and the branch's metadata and revision as written.
+///
+/// Nothing the clone awaits before its file operation fails yields on in-memory stores, so on a
+/// test running on one thread the task that records the branch runs only once the clone awaits it.
+async fn clone_with_failing_start(
+    repository: &Arc<RepositoryContext>,
+    root: &Path,
+    before_clone: impl FnOnce(),
+) -> (Result<(), CloneError>, Hash, Hash) {
+    let mut metadata = lore_revision::metadata::Metadata::new();
+    metadata
+        .set_branch(failing_start_branch())
+        .expect("the metadata holds the branch");
+    metadata
+        .set_string(branch::NAME, "cloned")
+        .expect("the metadata holds the name");
+    let metadata_hash = metadata
+        .serialize_local(repository.clone())
+        .await
+        .expect("the branch's metadata is stored");
+    let state = State::new();
+    state
+        .node_add(
+            repository.clone(),
+            ROOT_NODE,
+            file_node(b"cloned"),
+            "cloned.txt",
+        )
+        .await
+        .expect("the file is added");
+    let revision = state
+        .serialize(
+            repository.clone(),
+            repository.try_write_token().expect("a write token"),
+        )
+        .await
+        .expect("the revision's state is stored");
+    let mut repository_path_guard = RepositoryCloneGuard::new(root, false);
+    let mut dot_directory_guard = RepositoryCloneGuard::new(root, false);
+    before_clone();
+
+    let result = clone_into(
+        repository.clone(),
+        lore_transport::Connection::detached(Vec::new()),
+        RepositoryMetadata {
+            default_branch: failing_start_branch(),
+            ..RepositoryMetadata::default()
+        },
+        Ok(Some(branch::BranchStatus {
+            id: failing_start_branch(),
+            latest: revision,
+            metadata: metadata_hash,
+            ..branch::BranchStatus::default()
+        })),
+        root,
+        None,
+        None,
+        None,
+        CloneOptions::default(),
+        &mut repository_path_guard,
+        &mut dot_directory_guard,
+    )
+    .await;
+    (result, metadata_hash, revision)
+}
+
+/// The metadata of [`failing_start_branch`], the branch named `cloned` and its latest revision as
+/// `repository` holds them.
+async fn held_failing_start_branch(
+    repository: Arc<RepositoryContext>,
+) -> (Option<Hash>, Option<BranchId>, Option<Hash>) {
+    (
+        branch::metadata_hash(repository.clone(), failing_start_branch())
+            .await
+            .ok(),
+        branch::load_name_to_id_local(repository.clone(), "cloned")
+            .await
+            .ok(),
+        branch::load_latest_local(repository, failing_start_branch())
+            .await
+            .ok(),
+    )
+}
+
+/// Runs [`clone_with_failing_start`] on an instance with in-memory stores, where each write to the
+/// instance's mutable store fails as well where `store_fails`, and returns what it observes.
+async fn clone_failing_to_start(store_fails: bool) -> FailedStart {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let root = TempDir::new("clone-operation-fails-to-start-");
+            let provider = Arc::new(TestFilesystemProvider::failing_begin());
+            let failing = Arc::new(AtomicBool::new(false));
+            let failing_writes = failing.clone();
+            let (immutable, mutable) = lore_revision::repository::create_client_memory_stores()
+                .await
+                .expect("in-memory stores should be creatable");
+            let mutable: Arc<dyn lore_storage::MutableStore> = HookedStore::wrap(
+                mutable,
+                move |call, _key, _key_type| {
+                    if call != StoreCall::Load && failing_writes.load(Ordering::Acquire) {
+                        return Err(StoreError::from(AddressNotFound { address: [0; 48] }));
+                    }
+                    Ok(())
+                },
+                None,
+            );
+            let repository = Arc::new(
+                RepositoryContext::new(
+                    default_repository_creation_args(immutable, mutable)
+                        .with_path(root.path())
+                        .with_filesystem_provider(provider.clone()),
+                )
+                .with_write_token(
+                    lore_revision::repository::RepositoryWriteToken::acquire(root.path()).await,
+                ),
+            );
+
+            let (result, metadata, revision) =
+                clone_with_failing_start(&repository, root.path(), || {
+                    failing.store(store_fails, Ordering::Release);
+                })
+                .await;
+
+            FailedStart {
+                result,
+                begun: provider.begin_count.load(Ordering::Acquire),
+                held: held_failing_start_branch(repository).await,
+                written: (metadata, revision),
+            }
+        })
+        .await
+}
+
+/// A clone whose file operation fails to start returns that failure, the error of the start and
+/// not of the record of its branch, once it has recorded its branch in the instance: the branch's
+/// metadata, its name and its latest revision. Where the record fails, the clone returns the same
+/// failure, without the branch.
+#[tokio::test]
+async fn a_clone_whose_file_operation_fails_to_start_records_its_branch_before_returning() {
+    for store_fails in [false, true] {
+        let FailedStart {
+            result,
+            begun,
+            held,
+            written: (metadata, revision),
+        } = clone_failing_to_start(store_fails).await;
+
+        assert!(
+            result.as_ref().is_err_and(CloneError::is_internal),
+            "store fails {store_fails}: the clone returns the error of its file operation's \
+             start, {result:?}"
+        );
+        assert_eq!(begun, 1, "store fails {store_fails}");
+        let expected = if store_fails {
+            (None, None, None)
+        } else {
+            (Some(metadata), Some(failing_start_branch()), Some(revision))
+        };
+        assert_eq!(held, expected, "store fails {store_fails}");
+    }
+}
+
+/// A clone whose file operation fails to start writes the record of its branch to the instance's
+/// stores before it returns: stores opened afresh on the instance's directory hold the branch's
+/// metadata, its name and its latest revision.
+#[tokio::test]
+async fn a_clone_whose_file_operation_fails_to_start_writes_its_branch_to_disk() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let root = TempDir::new("clone-operation-fails-to-start-on-disk-");
+            let (immutable, mutable) = disk_stores(root.path()).await;
+            let repository = Arc::new(
+                RepositoryContext::new(
+                    default_repository_creation_args(immutable, mutable)
+                        .with_path(root.path())
+                        .with_filesystem_provider(
+                            Arc::new(TestFilesystemProvider::failing_begin()),
+                        ),
+                )
+                .with_write_token(
+                    lore_revision::repository::RepositoryWriteToken::acquire(root.path()).await,
+                ),
+            );
+            let id = repository.id;
+
+            let (result, metadata, revision) =
+                clone_with_failing_start(&repository, root.path(), || {}).await;
+            drop(repository);
+
+            assert!(
+                result.as_ref().is_err_and(CloneError::is_internal),
+                "the clone returns the error of its file operation's start, {result:?}"
+            );
+            let (immutable, mutable) = disk_stores(root.path()).await;
+            let reopened = Arc::new(RepositoryContext::new(
+                default_repository_creation_args(immutable, mutable)
+                    .with_path(root.path())
+                    .with_id(id),
+            ));
+            assert_eq!(
+                held_failing_start_branch(reopened).await,
+                (Some(metadata), Some(failing_start_branch()), Some(revision))
+            );
         })
         .await;
 }

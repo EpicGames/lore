@@ -521,3 +521,249 @@ async fn a_call_inside_a_mount_with_an_unknown_external_directory_completes_with
         assert!(!has_error_event(&events));
     }
 }
+
+/// Stores a fragment in `repository`'s immutable store, which its next flush writes.
+async fn store_a_fragment(repository: &lore_revision::repository::RepositoryContext) {
+    let payload = bytes::Bytes::from_static(b"a payload the call's flush syncs");
+    let address = lore_base::types::Address {
+        hash: lore_storage::hash::hash_slice(&payload),
+        context: lore_base::types::Context::default(),
+    };
+    let fragment = lore_base::types::Fragment {
+        flags: 0,
+        size_payload: payload.len() as u32,
+        size_content: payload.len() as u64,
+    };
+    repository
+        .immutable_store()
+        .put(repository.id, address, fragment, Some(payload), false)
+        .await
+        .expect("the fragment is stored");
+}
+
+/// Stores a fragment in `repository`'s immutable store, and makes the next packfile sync on this
+/// thread fail, so the flush that writes the fragment fails.
+async fn store_a_fragment_whose_sync_fails(
+    repository: &lore_revision::repository::RepositoryContext,
+) -> Result<(), SampleError> {
+    store_a_fragment(repository).await;
+    lore_storage::test_util::fail_packfile_syncs(1);
+    Ok(())
+}
+
+/// Stores a fragment in `repository`'s immutable store and fails with `NotFound`, after making
+/// the next packfile sync on this thread fail where `flush_fails`.
+async fn fail_after_storing_a_fragment(
+    repository: &lore_revision::repository::RepositoryContext,
+    flush_fails: bool,
+) -> Result<(), SampleError> {
+    store_a_fragment(repository).await;
+    if flush_fails {
+        lore_storage::test_util::fail_packfile_syncs(1);
+    }
+    Err(NotFound.into())
+}
+
+/// A read, write or planned exclusive call with `no_background_flush` writes what it held back
+/// before it completes, and completes with that write's error when it fails. Without the option
+/// the same failure, in the flush that follows the call, leaves the call's result alone.
+#[tokio::test]
+async fn a_call_holding_back_its_index_writes_fails_when_their_write_fails() {
+    for held in [true, false] {
+        for wrapper in ["read", "write", "exclusive"] {
+            let root = lore_base::test_util::TempDir::new("lore-call-held-back-");
+            new_local_repository(&root).await;
+            let globals = LoreGlobalArgs {
+                no_background_flush: u8::from(held),
+                sync_data: 1,
+                ..globals_at(&root)
+            };
+
+            let status =
+                match wrapper {
+                    "read" => {
+                        repository_call_read(
+                            globals,
+                            None,
+                            (),
+                            "held_back",
+                            |repository, ()| async move {
+                                store_a_fragment_whose_sync_fails(&repository).await
+                            },
+                        )
+                        .await
+                    }
+                    "write" => {
+                        repository_call_write(
+                            globals,
+                            None,
+                            (),
+                            "held_back",
+                            |repository, _token, ()| async move {
+                                store_a_fragment_whose_sync_fails(&repository).await
+                            },
+                        )
+                        .await
+                    }
+                    _ => repository_call_exclusive_planned(
+                        globals,
+                        None,
+                        (),
+                        "held_back",
+                        |_repository, ()| async move { Ok::<Option<()>, SampleError>(Some(())) },
+                        async move |repository, _token, _plan: &()| {
+                            store_a_fragment_whose_sync_fails(&repository).await
+                        },
+                        move |()| async move {},
+                    )
+                    .await,
+                };
+
+            assert_eq!(
+                status != 0,
+                held,
+                "{wrapper} call, held {held}: the call's status {status}"
+            );
+            lore_storage::test_util::fail_packfile_syncs(0);
+        }
+    }
+}
+
+/// Runs a `wrapper` call, read, write or planned exclusive, with `no_background_flush`, whose
+/// command fails after storing a fragment, and checks that the call writes what it held back
+/// before it completes, and completes with the command's error. Where `flush_fails`, that write
+/// fails, which the check sees in the packfile sync it failed. The flush is held at its packfile
+/// sync for long enough for a call that did not wait for it to complete meanwhile: a wait cannot
+/// be polled for, since it is the absence of progress. Each case runs in a test of its own, as the
+/// storage test points it arms are the thread's, and the flush a call leaves to run after it
+/// could take those of a later case.
+async fn assert_a_failing_holding_call_writes_before_completing(wrapper: &str, flush_fails: bool) {
+    let root = lore_base::test_util::TempDir::new("lore-call-held-back-failed-command-");
+    new_local_repository(&root).await;
+    let globals = LoreGlobalArgs {
+        no_background_flush: 1,
+        sync_data: 1,
+        ..globals_at(&root)
+    };
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let completed = order.clone();
+    let callback: lore::interface::LoreEventCallback =
+        Some(Box::new(move |event: &lore_revision::event::LoreEvent| {
+            if matches!(event, lore_revision::event::LoreEvent::Complete(_)) {
+                completed.lock().unwrap().push("complete");
+            }
+        }));
+    let pause = lore_storage::test_util::pause_at(lore_storage::test_util::PausePoint::Syncing);
+
+    let call = async {
+        match wrapper {
+            "read" => {
+                repository_call_read(
+                    globals,
+                    callback,
+                    (),
+                    "held_back_failed_command",
+                    |repository, ()| async move {
+                        fail_after_storing_a_fragment(&repository, flush_fails).await
+                    },
+                )
+                .await
+            }
+            "write" => {
+                repository_call_write(
+                    globals,
+                    callback,
+                    (),
+                    "held_back_failed_command",
+                    |repository, _token, ()| async move {
+                        fail_after_storing_a_fragment(&repository, flush_fails).await
+                    },
+                )
+                .await
+            }
+            _ => {
+                repository_call_exclusive_planned(
+                    globals,
+                    callback,
+                    (),
+                    "held_back_failed_command",
+                    |_repository, ()| async move { Ok::<Option<()>, SampleError>(Some(())) },
+                    async move |repository, _token, _plan: &()| {
+                        fail_after_storing_a_fragment(&repository, flush_fails).await
+                    },
+                    move |()| async move {},
+                )
+                .await
+            }
+        }
+    };
+    let flush = async {
+        let reached =
+            tokio::time::timeout(std::time::Duration::from_secs(10), pause.reached.notified())
+                .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if reached.is_ok() {
+            order.lock().unwrap().push("flush");
+        }
+        pause.resume.notify_one();
+    };
+    let (status, ()) = tokio::join!(call, flush);
+
+    assert_eq!(
+        *order.lock().unwrap(),
+        vec!["flush", "complete"],
+        "{wrapper} call, flush fails {flush_fails}"
+    );
+    assert_eq!(
+        status,
+        SampleError::from(NotFound).ffi_code(),
+        "{wrapper} call, flush fails {flush_fails}"
+    );
+    if flush_fails {
+        assert_eq!(
+            lore_storage::test_util::packfile_sync_failures_left(),
+            0,
+            "{wrapper} call: the write held back fails"
+        );
+    }
+}
+
+/// As [`assert_a_failing_holding_call_writes_before_completing`] describes, for a read call.
+#[tokio::test]
+async fn a_failing_read_call_writes_what_it_held_back_before_completing() {
+    assert_a_failing_holding_call_writes_before_completing("read", false).await;
+}
+
+/// As [`assert_a_failing_holding_call_writes_before_completing`] describes, for a read call whose
+/// held-back write fails.
+#[tokio::test]
+async fn a_failing_read_call_reports_its_error_when_its_held_back_write_fails() {
+    assert_a_failing_holding_call_writes_before_completing("read", true).await;
+}
+
+/// As [`assert_a_failing_holding_call_writes_before_completing`] describes, for a write call.
+#[tokio::test]
+async fn a_failing_write_call_writes_what_it_held_back_before_completing() {
+    assert_a_failing_holding_call_writes_before_completing("write", false).await;
+}
+
+/// As [`assert_a_failing_holding_call_writes_before_completing`] describes, for a write call whose
+/// held-back write fails.
+#[tokio::test]
+async fn a_failing_write_call_reports_its_error_when_its_held_back_write_fails() {
+    assert_a_failing_holding_call_writes_before_completing("write", true).await;
+}
+
+/// As [`assert_a_failing_holding_call_writes_before_completing`] describes, for a planned
+/// exclusive call.
+#[tokio::test]
+async fn a_failing_planned_exclusive_call_writes_what_it_held_back_before_completing() {
+    assert_a_failing_holding_call_writes_before_completing("exclusive", false).await;
+}
+
+/// As [`assert_a_failing_holding_call_writes_before_completing`] describes, for a planned
+/// exclusive call whose held-back write fails.
+#[tokio::test]
+async fn a_failing_planned_exclusive_call_reports_its_error_when_its_held_back_write_fails() {
+    assert_a_failing_holding_call_writes_before_completing("exclusive", true).await;
+}

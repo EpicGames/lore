@@ -793,6 +793,11 @@ pub struct RepositoryContext {
     /// using. Shared, as the holder is, with the contexts derived from this one and with
     /// the flush this context spawns when its command ends.
     own_stores: Option<Arc<lore_storage::local::store_lock::StoreHold>>,
+    /// The hold on the immutable store's background index writes, for a command that leaves them
+    /// until it ends ([`crate::interface::LoreGlobalArgs::no_background_flush`]). Shared, as
+    /// [`Self::own_stores`] is, with the contexts derived from this one and with the flush this
+    /// context spawns when its command ends, which drops it once the stores are flushed.
+    background_flush: Option<Arc<lore_storage::local::immutable_store::BackgroundFlushHold>>,
     /// The storage session pool this repository's reads and writes take sessions from,
     /// resolved on first use, and resolved again for a call under another correlation id or
     /// once the pool is stale, as after a reconnect rotated the server's session map.
@@ -951,6 +956,7 @@ impl RepositoryContext {
             repo_lock: None,
             memory_records: None,
             own_stores: None,
+            background_flush: None,
             session_pool: Default::default(),
             holds_its_sessions: false,
             endpoint: None,
@@ -987,6 +993,7 @@ impl RepositoryContext {
             repo_lock: self.repo_lock.clone(),
             memory_records: self.memory_records.clone(),
             own_stores: self.own_stores.clone(),
+            background_flush: self.background_flush.clone(),
             session_pool: Default::default(),
             holds_its_sessions: self.holds_its_sessions,
             endpoint: self.endpoint.clone(),
@@ -1146,6 +1153,21 @@ impl RepositoryContext {
         stores: lore_storage::local::store_lock::StoreHold,
     ) -> Self {
         self.own_stores = (!stores.is_empty()).then(|| Arc::new(stores));
+        self
+    }
+
+    /// This context holding back its immutable store's background index writes where `hold` is
+    /// set, see [`Self::background_flush`].
+    #[must_use]
+    #[lore_macro::test_pub]
+    pub(crate) fn holding_background_flush(mut self, hold: bool) -> Self {
+        if hold {
+            self.background_flush = self
+                .immutable_store
+                .clone()
+                .hold_background_flush()
+                .map(Arc::new);
+        }
         self
     }
 
@@ -1371,6 +1393,7 @@ impl RepositoryContext {
             .then(|| self.write_token.as_ref().map(RepositoryWriteToken::share))
             .flatten();
         let own_stores = self.own_stores.clone();
+        let background_flush = self.background_flush.clone();
         lore_base::runtime::LORE_CONTEXT.sync_scope(
             Arc::new(crate::interface::ExecutionContext::default())
                 as Arc<dyn std::any::Any + Send + Sync>,
@@ -1396,6 +1419,7 @@ impl RepositoryContext {
                     // The repository flock first, then the store claims it was taken inside.
                     drop(repo_lock);
                     drop(own_stores);
+                    drop(background_flush);
                 });
             },
         );
@@ -1505,6 +1529,7 @@ impl RepositoryContext {
             repo_lock: None,
             memory_records: None,
             own_stores: None,
+            background_flush: None,
             session_pool: Default::default(),
             holds_its_sessions: false,
             endpoint: None,
@@ -1525,6 +1550,7 @@ impl RepositoryContext {
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
             own_stores: None,
+            background_flush: None,
             ..self.inherited()
         }
     }
@@ -1552,6 +1578,7 @@ impl RepositoryContext {
             write_token: None,
             repo_lock: None,
             own_stores: None,
+            background_flush: None,
             file_system: crate::fs::invalid_filesystem_provider::InvalidFilesystemProvider::new(),
             ..self.inherited()
         }
@@ -1722,6 +1749,34 @@ impl RepositoryContext {
                 .await;
         }
         Ok(())
+    }
+
+    /// Flushes as [`Self::flush`] does where this context holds back its stores' background index
+    /// writes ([`Self::background_flush`]), for a command that writes them before it reports its
+    /// result, and does nothing otherwise.
+    ///
+    /// # Errors
+    ///
+    /// [`RepositoryError`] from the flush.
+    pub async fn flush_held_back(
+        &self,
+        options: lore_storage::FlushOptions,
+    ) -> Result<(), RepositoryError> {
+        if self.background_flush.is_none() {
+            return Ok(());
+        }
+        self.flush(options).await
+    }
+
+    /// Flushes as [`Self::flush_held_back`] does for a command that failed, whose error is its
+    /// outcome, and logs a failure of the flush as a warning.
+    pub async fn flush_held_back_after_failure(&self, options: lore_storage::FlushOptions) {
+        if let Err(err) = self.flush_held_back(options).await {
+            lore_warn!(
+                "Failed to flush repository {} after a failed command: {err}",
+                self.id
+            );
+        }
     }
 
     /// Returns the remote connection, awaiting the pending connect task on first call.
@@ -3845,7 +3900,9 @@ async fn open_repository(
         Some((lock, stores)) => repository.with_repository_lock(lock, stores),
         None => repository,
     };
-    let repository = repository.with_memory_records(memory_records);
+    let repository = repository
+        .with_memory_records(memory_records)
+        .holding_background_flush(global.no_background_flush());
     let repository = match write_token {
         Some(token) => repository.with_write_token(token),
         None => repository,

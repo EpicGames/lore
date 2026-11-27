@@ -27,12 +27,12 @@ use crate::helper::default_repository_creation_args;
 use crate::helper::setup_test_execution;
 
 /// The mutable store's key the tests write.
-fn key() -> Hash {
+pub(crate) fn key() -> Hash {
     Hash::from_u64(0x6E)
 }
 
 /// The stores on disk under `root`.
-async fn disk_stores(root: &Path) -> (Arc<dyn ImmutableStore>, Arc<dyn MutableStore>) {
+pub(crate) async fn disk_stores(root: &Path) -> (Arc<dyn ImmutableStore>, Arc<dyn MutableStore>) {
     let immutable = lore_storage::local::immutable_store::create(
         Some(root),
         ImmutableStoreCreateOptions::none(),
@@ -51,14 +51,18 @@ async fn disk_stores(root: &Path) -> (Arc<dyn ImmutableStore>, Arc<dyn MutableSt
     (immutable, mutable)
 }
 
-/// A context holding a write token over stores on disk under `root`, with a fragment written to
-/// its immutable store and not yet synced, and [`key`] written to its mutable store and not yet
-/// flushed.
-async fn context_with_unflushed_writes(root: &Path) -> Arc<RepositoryContext> {
+/// A context holding a write token over stores on disk under `root`, holding back their
+/// background index writes as `held` says, with a fragment written to its immutable store and not
+/// yet synced, and [`key`] written to its mutable store and not yet flushed.
+pub(crate) async fn context_with_unflushed_writes(
+    root: &Path,
+    held: bool,
+) -> Arc<RepositoryContext> {
     let (immutable, mutable) = disk_stores(root).await;
     let repository = Arc::new(
         RepositoryContext::new(default_repository_creation_args(immutable, mutable))
-            .with_write_token(RepositoryWriteToken::acquire(root).await),
+            .with_write_token(RepositoryWriteToken::acquire(root).await)
+            .holding_background_flush(held),
     );
     let payload = b"a payload whose sync fails";
     store_fragment(
@@ -84,7 +88,7 @@ async fn context_with_unflushed_writes(root: &Path) -> Arc<RepositoryContext> {
 
 /// What a mutable store opened afresh on the directory under `root` holds for [`key`] in
 /// `partition`.
-async fn load_from_disk(root: &Path, partition: Partition) -> Result<Hash, StoreError> {
+pub(crate) async fn load_from_disk(root: &Path, partition: Partition) -> Result<Hash, StoreError> {
     let (_immutable, mutable) = disk_stores(root).await;
     mutable
         .load(partition, key(), KeyType::BranchMetadata)
@@ -98,7 +102,7 @@ async fn a_flush_skips_the_mutable_store_after_a_failed_immutable_flush() {
     LORE_CONTEXT
         .scope(setup_test_execution(), async {
             let root = TempDir::new("repository-flush-immutable-fails-");
-            let repository = context_with_unflushed_writes(root.path()).await;
+            let repository = context_with_unflushed_writes(root.path(), false).await;
             let partition = repository.id;
 
             fail_packfile_syncs(1);
@@ -125,7 +129,7 @@ async fn a_post_command_flush_skips_the_mutable_store_after_a_failed_immutable_f
     LORE_CONTEXT
         .scope(setup_test_execution(), async {
             let root = TempDir::new("post-command-flush-immutable-fails-");
-            let repository = context_with_unflushed_writes(root.path()).await;
+            let repository = context_with_unflushed_writes(root.path(), false).await;
             let partition = repository.id;
 
             let mutable =
@@ -153,6 +157,31 @@ async fn a_post_command_flush_skips_the_mutable_store_after_a_failed_immutable_f
                     .is_err_and(|err| err.is_address_not_found()),
                 "the mutable store is not flushed once the immutable store's flush failed"
             );
+        })
+        .await;
+}
+
+/// The flush of held-back writes flushes a context that holds back its stores' background writes,
+/// and returns the flush's error, and leaves any other context's stores alone.
+#[tokio::test]
+async fn a_flush_of_held_back_writes_runs_only_under_a_hold_and_returns_its_error() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            for held in [true, false] {
+                let root = TempDir::new("repository-flush-held-back-");
+                let repository = context_with_unflushed_writes(root.path(), held).await;
+
+                fail_packfile_syncs(1);
+                let flushed = repository.flush_held_back(FlushOptions::SYNC_DATA).await;
+
+                assert_eq!(flushed.is_err(), held, "held {held}: the flush's result");
+                assert_eq!(
+                    packfile_sync_failures_left(),
+                    usize::from(!held),
+                    "held {held}: whether the flush ran"
+                );
+                fail_packfile_syncs(0);
+            }
         })
         .await;
 }
