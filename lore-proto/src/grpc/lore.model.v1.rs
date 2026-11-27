@@ -248,6 +248,42 @@ impl ::prost::Name for Branch {
         "/lore.model.v1.Branch".into()
     }
 }
+/// A scope of a repository: a unit of lock causality with its own id, name
+/// and lifecycle. The default scope, named `default`, has an id derived from
+/// the repository's and no stored record, so it has an empty creator and a
+/// zero `created`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Scope {
+    /// Caller-pre-generated unique identifier; stable across renames, archive
+    /// and restore.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub id: ::prost::bytes::Bytes,
+    /// Human-readable name, unique among live scopes regardless of case. Empty
+    /// while the scope is archived.
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    /// Identity that created the scope: the authenticated JWT identity, or
+    /// `<unknown>` on a server without authentication.
+    #[prost(string, tag = "3")]
+    pub creator: ::prost::alloc::string::String,
+    /// Server-assigned creation timestamp (Unix epoch milliseconds).
+    #[prost(uint64, tag = "4")]
+    pub created: u64,
+    /// True iff the scope is archived via ScopeArchive. The record survives
+    /// but the name → id mapping is erased.
+    #[prost(bool, tag = "5")]
+    pub archived: bool,
+}
+impl ::prost::Name for Scope {
+    const NAME: &'static str = "Scope";
+    const PACKAGE: &'static str = "lore.model.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.model.v1.Scope".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.model.v1.Scope".into()
+    }
+}
 /// Result of a fragment lookup against the storage layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

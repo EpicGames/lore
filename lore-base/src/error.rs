@@ -378,6 +378,13 @@ pub struct RepositoryAlreadyExists {
     pub path: String,
 }
 
+/// A resource the operation would create exists already, or a resource the operation would
+/// claim is held by another. The context on its trace names the resource.
+#[derive(Debug, Clone, Error, FfiError)]
+#[error("Already exists")]
+#[ffi_code(59)]
+pub struct AlreadyExists;
+
 // ---------------------------------------------------------------------------
 // Not found (79–99)
 //
@@ -681,6 +688,9 @@ pub enum LoreErrorCode {
     BranchAlreadyExists = 57,
     /// A repository already exists at the path.
     RepositoryAlreadyExists = 58,
+    /// A resource the operation would create exists already, or one it would claim is held by
+    /// another.
+    AlreadyExists = 59,
     /// A requested item was not found.
     NotFound = 79,
     /// A content-addressable object could not be found in any store.
@@ -771,6 +781,7 @@ impl LoreErrorCode {
             AlreadyLinked::FFI_CODE => Self::AlreadyLinked,
             BranchAlreadyExists::FFI_CODE => Self::BranchAlreadyExists,
             RepositoryAlreadyExists::FFI_CODE => Self::RepositoryAlreadyExists,
+            AlreadyExists::FFI_CODE => Self::AlreadyExists,
             NotFound::FFI_CODE => Self::NotFound,
             AddressNotFound::FFI_CODE => Self::AddressNotFound,
             PayloadNotFound::FFI_CODE => Self::PayloadNotFound,

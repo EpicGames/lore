@@ -228,8 +228,9 @@ async fn test_handle_cas_on_nonexistent_key() {
         .await;
 }
 
-/// Repository and branch metadata and a branch's latest pointer are written
-/// only through requests that validate the write; a compare-and-swap through
+/// Repository and branch metadata, a branch's latest pointer, and scope
+/// metadata and name mappings are written only through requests that validate
+/// the write; a compare-and-swap through
 /// the generic path would skip that, so it is refused and the stored value is
 /// left as it was.
 #[tokio::test]
@@ -243,6 +244,8 @@ async fn rejects_key_types_with_a_dedicated_write_request() {
         KeyType::RepositoryMetadata,
         KeyType::BranchMetadata,
         KeyType::BranchLatestPointer,
+        KeyType::ScopeMetadata,
+        KeyType::ScopeId,
     ] {
         let context = Arc::new(AttributeMap::default());
         context.insert(repository);

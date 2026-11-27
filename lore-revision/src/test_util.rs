@@ -271,20 +271,22 @@ impl Drop for Live<'_> {
     }
 }
 
-/// A point between two writes or reads of a branch create, restore, archive or protect, where a
-/// task run under [`step_branch_writes`] stops.
+/// A point between two writes or reads of a create, restore, archive or protect of a branch, or of
+/// a create, restore, rename or archive of a scope, where a task run under [`step_branch_writes`]
+/// stops. A scope's rename stops where its restore does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BranchStep {
     /// A create has found no metadata to restore and read the mapping of its name, and not yet
-    /// checked its parent.
+    /// checked a branch's parent or swapped in a scope's metadata.
     CreateNameRead,
     /// A create has found no metadata to restore and not yet swapped in the branch's metadata.
     CreateUnrestored,
     /// A create has swapped in the branch's metadata and not yet claimed its name.
     CreateMetadataStored,
-    /// A create has claimed its name and not yet stored the latest revision.
+    /// A create has claimed its name and not yet stored a branch's latest revision, or answered a
+    /// scope.
     CreateNameClaimed,
-    /// A restore has read the branch's metadata and not yet made its checks.
+    /// A restore has read the record's metadata and not yet made its checks.
     RestoreMetadataRead,
     /// A restore has made its checks and not yet recorded itself in the metadata.
     RestoreChecked,
@@ -297,12 +299,19 @@ pub enum BranchStep {
     PendingRestoreSettled,
     /// An archive has read the branch's metadata and not yet looked up its name.
     ArchiveMetadataRead,
-    /// An archive has looked up the branch's name and not yet swapped the metadata.
+    /// An archive has looked up the branch's name, or found a scope live, and not yet swapped the
+    /// metadata.
     ArchiveLookedUp,
     /// An archive has swapped the metadata and not yet released the name.
     ArchiveReleasing,
     /// A protect without a remote has read the branch's metadata and not yet swapped it.
     ProtectMetadataRead,
+    /// A rename of a scope has swapped in the metadata that names it under its new name, and not
+    /// yet released its old name.
+    RenameReleasing,
+    /// A release of a scope's name has read the scope's metadata and not yet swapped the name's
+    /// mapping.
+    ReleaseChecked,
 }
 
 /// Where a held task reports each point it reaches, and what it waits for to go on.

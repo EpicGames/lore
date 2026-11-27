@@ -32,6 +32,23 @@ service RepositoryService {
   // Compare-and-swap update of a repository's metadata pointer. CAS miss is
   // signalled in-band via the response, never as a non-OK gRPC status.
   rpc RepositoryMetadataSet(RepositoryMetadataSetRequest) returns (RepositoryMetadataSetResponse);
+  // Create a scope in the repository the request metadata names. The caller
+  // pre-generates `id` for retry idempotency. Re-issuing the `id` of a live
+  // scope returns the existing record when `name` is its name, compared
+  // case-sensitively, and ALREADY_EXISTS otherwise, as does a `name` that maps
+  // to another scope. The `id` of an archived scope restores the scope under
+  // `name`. Needs write access.
+  rpc ScopeCreate          (ScopeCreateRequest)          returns (ScopeCreateResponse);
+  // Look up a scope by id or by name. The name `default`, in any case, and
+  // the default scope's derived id answer the default scope.
+  rpc ScopeGet             (ScopeGetRequest)             returns (ScopeGetResponse);
+  // Give a live scope another name. Needs repository administration, or to be
+  // the scope's creator.
+  rpc ScopeRename          (ScopeRenameRequest)          returns (ScopeRenameResponse);
+  // Archive a scope: erase its name → id mapping and keep its record. An
+  // archived scope answers itself. Needs repository administration, or to be
+  // the scope's creator.
+  rpc ScopeArchive         (ScopeArchiveRequest)         returns (ScopeArchiveResponse);
 }
 
 // A service to receive requests forwarded on from another Lore Server,
@@ -171,4 +188,67 @@ message RepositoryMetadataSetRequest {
 message RepositoryMetadataSetResponse {
   // The repository's current metadata pointer after the call.
   bytes metadata = 1;
+}
+
+// Request to create a scope, or to restore an archived one. The caller
+// pre-generates `id` so retries are idempotent — a duplicate `id` of a live
+// scope yields ALREADY_EXISTS unless `name` is its name, compared
+// case-sensitively, in which case the server returns the existing record.
+message ScopeCreateRequest {
+  // Caller-pre-generated scope id (typically a UUIDv7), or an archived
+  // scope's id, which restores the scope under `name`. Must not be zero.
+  bytes id = 1;
+  // Human-readable scope name. Subject to the same validation rules as a
+  // branch name, and must not be `default` in any case.
+  string name = 2;
+}
+
+// Response containing the created or restored scope record.
+message ScopeCreateResponse {
+  // Full Scope record including the server-assigned `created` timestamp,
+  // which a restore keeps.
+  lore.model.v1.Scope scope = 1;
+}
+
+// Request to look up a scope by id or by name.
+message ScopeGetRequest {
+  // Lookup mode.
+  oneof query {
+    // Lookup by scope id. Answers an archived scope too.
+    bytes id = 1;
+    // Lookup by scope name, regardless of case. Answers live scopes only.
+    string name = 2;
+  }
+}
+
+// Response containing the resolved scope record.
+message ScopeGetResponse {
+  // Scope record matching the lookup.
+  lore.model.v1.Scope scope = 1;
+}
+
+// Request to give a live scope another name.
+message ScopeRenameRequest {
+  // Scope id. The default scope's id is refused.
+  bytes id = 1;
+  // The new name, subject to the same rules as ScopeCreateRequest.name.
+  string name = 2;
+}
+
+// Response containing the renamed scope record.
+message ScopeRenameResponse {
+  // Scope record under its new name.
+  lore.model.v1.Scope scope = 1;
+}
+
+// Request to archive a scope.
+message ScopeArchiveRequest {
+  // Scope id. The default scope's id is refused.
+  bytes id = 1;
+}
+
+// Response containing the archived scope record.
+message ScopeArchiveResponse {
+  // Scope record as archived, with an empty name.
+  lore.model.v1.Scope scope = 1;
 }

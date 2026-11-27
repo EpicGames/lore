@@ -50,14 +50,18 @@ impl MutableStoreOp {
 }
 
 /// Key types written only through a dedicated request that validates the write:
-/// `RepositoryMetadataSet` and `BranchMetadataSet` for metadata, and revision
-/// requests such as `BranchPush` for a branch's latest pointer. The generic mutable store write paths, store
+/// `RepositoryMetadataSet` and `BranchMetadataSet` for metadata, revision
+/// requests such as `BranchPush` for a branch's latest pointer, and the scope
+/// requests of the repository service for a scope's metadata and name mapping.
+/// The generic mutable store write paths, store
 /// and compare-and-swap, must not become a way to write them directly and
 /// bypass that validation.
 const DISALLOWED_KEY_TYPES: &[KeyType] = &[
     KeyType::RepositoryMetadata,
     KeyType::BranchMetadata,
     KeyType::BranchLatestPointer,
+    KeyType::ScopeMetadata,
+    KeyType::ScopeId,
 ];
 
 /// Refuses a generic mutable store write to a key type that has its own

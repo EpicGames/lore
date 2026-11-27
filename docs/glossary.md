@@ -56,7 +56,7 @@ Also see: bare, repository instance.
 
 ### Archive
 
-To retire a branch so it no longer appears in branch listings and its name can be reused, keeping its history (`lore branch archive`). Archived branches can still be listed with `lore branch list --archived`. Archiving a scope (`lore scope archive`) likewise drops its name and keeps its state, and restoring it brings the name back.
+To retire a branch so it no longer appears in branch listings and its name can be reused, keeping its history (`lore branch archive`). Archived branches can still be listed with `lore branch list --archived`. Archiving a scope (`lore scope archive`) likewise drops its name and keeps its state, and restoring it brings the scope back under a name.
 
 Also see: branch, scope, purge.
 
@@ -690,7 +690,7 @@ Also see: conflict, mine, theirs.
 
 ### Restore
 
-To make an earlier revision's content the branch's newest state by committing it as a new revision (`lore revision restore`). History is kept: the new revision's parent is the branch's latest. Restoring an archived scope (`lore scope restore`) brings back its name instead.
+To make an earlier revision's content the branch's newest state by committing it as a new revision (`lore revision restore`). History is kept: the new revision's parent is the branch's latest. Restoring an archived scope, by creating it again with its ID (`lore scope create --id`), brings the scope back under a name instead.
 
 Compare to: revert, reset.
 

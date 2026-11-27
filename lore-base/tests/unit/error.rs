@@ -229,6 +229,11 @@ fn registry() -> Vec<(&'static str, Group, i32)> {
             Group::AlreadyExists,
             RepositoryAlreadyExists { path: text() }.ffi_code(),
         ),
+        (
+            "AlreadyExists",
+            Group::AlreadyExists,
+            AlreadyExists.ffi_code(),
+        ),
         ("NotFound", Group::NotFound, NotFound.ffi_code()),
         (
             "AddressNotFound",

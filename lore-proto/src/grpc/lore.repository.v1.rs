@@ -299,6 +299,167 @@ impl ::prost::Name for RepositoryMetadataSetResponse {
         "/lore.repository.v1.RepositoryMetadataSetResponse".into()
     }
 }
+/// Request to create a scope, or to restore an archived one. The caller
+/// pre-generates `id` so retries are idempotent — a duplicate `id` of a live
+/// scope yields ALREADY_EXISTS unless `name` is its name, compared
+/// case-sensitively, in which case the server returns the existing record.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScopeCreateRequest {
+    /// Caller-pre-generated scope id (typically a UUIDv7), or an archived
+    /// scope's id, which restores the scope under `name`. Must not be zero.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub id: ::prost::bytes::Bytes,
+    /// Human-readable scope name. Subject to the same validation rules as a
+    /// branch name, and must not be `default` in any case.
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+}
+impl ::prost::Name for ScopeCreateRequest {
+    const NAME: &'static str = "ScopeCreateRequest";
+    const PACKAGE: &'static str = "lore.repository.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.repository.v1.ScopeCreateRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.repository.v1.ScopeCreateRequest".into()
+    }
+}
+/// Response containing the created or restored scope record.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScopeCreateResponse {
+    /// Full Scope record including the server-assigned `created` timestamp,
+    /// which a restore keeps.
+    #[prost(message, optional, tag = "1")]
+    pub scope: ::core::option::Option<crate::lore::model::v1::Scope>,
+}
+impl ::prost::Name for ScopeCreateResponse {
+    const NAME: &'static str = "ScopeCreateResponse";
+    const PACKAGE: &'static str = "lore.repository.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.repository.v1.ScopeCreateResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.repository.v1.ScopeCreateResponse".into()
+    }
+}
+/// Request to look up a scope by id or by name.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScopeGetRequest {
+    /// Lookup mode.
+    #[prost(oneof = "scope_get_request::Query", tags = "1, 2")]
+    pub query: ::core::option::Option<scope_get_request::Query>,
+}
+/// Nested message and enum types in `ScopeGetRequest`.
+pub mod scope_get_request {
+    /// Lookup mode.
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Query {
+        /// Lookup by scope id. Answers an archived scope too.
+        #[prost(bytes, tag = "1")]
+        Id(::prost::bytes::Bytes),
+        /// Lookup by scope name, regardless of case. Answers live scopes only.
+        #[prost(string, tag = "2")]
+        Name(::prost::alloc::string::String),
+    }
+}
+impl ::prost::Name for ScopeGetRequest {
+    const NAME: &'static str = "ScopeGetRequest";
+    const PACKAGE: &'static str = "lore.repository.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.repository.v1.ScopeGetRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.repository.v1.ScopeGetRequest".into()
+    }
+}
+/// Response containing the resolved scope record.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScopeGetResponse {
+    /// Scope record matching the lookup.
+    #[prost(message, optional, tag = "1")]
+    pub scope: ::core::option::Option<crate::lore::model::v1::Scope>,
+}
+impl ::prost::Name for ScopeGetResponse {
+    const NAME: &'static str = "ScopeGetResponse";
+    const PACKAGE: &'static str = "lore.repository.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.repository.v1.ScopeGetResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.repository.v1.ScopeGetResponse".into()
+    }
+}
+/// Request to give a live scope another name.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScopeRenameRequest {
+    /// Scope id. The default scope's id is refused.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub id: ::prost::bytes::Bytes,
+    /// The new name, subject to the same rules as ScopeCreateRequest.name.
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+}
+impl ::prost::Name for ScopeRenameRequest {
+    const NAME: &'static str = "ScopeRenameRequest";
+    const PACKAGE: &'static str = "lore.repository.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.repository.v1.ScopeRenameRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.repository.v1.ScopeRenameRequest".into()
+    }
+}
+/// Response containing the renamed scope record.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScopeRenameResponse {
+    /// Scope record under its new name.
+    #[prost(message, optional, tag = "1")]
+    pub scope: ::core::option::Option<crate::lore::model::v1::Scope>,
+}
+impl ::prost::Name for ScopeRenameResponse {
+    const NAME: &'static str = "ScopeRenameResponse";
+    const PACKAGE: &'static str = "lore.repository.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.repository.v1.ScopeRenameResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.repository.v1.ScopeRenameResponse".into()
+    }
+}
+/// Request to archive a scope.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScopeArchiveRequest {
+    /// Scope id. The default scope's id is refused.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub id: ::prost::bytes::Bytes,
+}
+impl ::prost::Name for ScopeArchiveRequest {
+    const NAME: &'static str = "ScopeArchiveRequest";
+    const PACKAGE: &'static str = "lore.repository.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.repository.v1.ScopeArchiveRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.repository.v1.ScopeArchiveRequest".into()
+    }
+}
+/// Response containing the archived scope record.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScopeArchiveResponse {
+    /// Scope record as archived, with an empty name.
+    #[prost(message, optional, tag = "1")]
+    pub scope: ::core::option::Option<crate::lore::model::v1::Scope>,
+}
+impl ::prost::Name for ScopeArchiveResponse {
+    const NAME: &'static str = "ScopeArchiveResponse";
+    const PACKAGE: &'static str = "lore.repository.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.repository.v1.ScopeArchiveResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.repository.v1.ScopeArchiveResponse".into()
+    }
+}
 /// Generated client implementations.
 pub mod repository_service_client {
     #![allow(
@@ -613,6 +774,132 @@ pub mod repository_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Create a scope in the repository the request metadata names. The caller
+        /// pre-generates `id` for retry idempotency. Re-issuing the `id` of a live
+        /// scope returns the existing record when `name` is its name, compared
+        /// case-sensitively, and ALREADY_EXISTS otherwise, as does a `name` that maps
+        /// to another scope. The `id` of an archived scope restores the scope under
+        /// `name`. Needs write access.
+        pub async fn scope_create(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ScopeCreateRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ScopeCreateResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.repository.v1.RepositoryService/ScopeCreate",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.repository.v1.RepositoryService",
+                        "ScopeCreate",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Look up a scope by id or by name. The name `default`, in any case, and
+        /// the default scope's derived id answer the default scope.
+        pub async fn scope_get(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ScopeGetRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ScopeGetResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.repository.v1.RepositoryService/ScopeGet",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("lore.repository.v1.RepositoryService", "ScopeGet"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Give a live scope another name. Needs repository administration, or to be
+        /// the scope's creator.
+        pub async fn scope_rename(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ScopeRenameRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ScopeRenameResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.repository.v1.RepositoryService/ScopeRename",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.repository.v1.RepositoryService",
+                        "ScopeRename",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Archive a scope: erase its name → id mapping and keep its record. An
+        /// archived scope answers itself. Needs repository administration, or to be
+        /// the scope's creator.
+        pub async fn scope_archive(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ScopeArchiveRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ScopeArchiveResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.repository.v1.RepositoryService/ScopeArchive",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.repository.v1.RepositoryService",
+                        "ScopeArchive",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -696,6 +983,47 @@ pub mod repository_service_server {
             request: tonic::Request<super::RepositoryMetadataSetRequest>,
         ) -> std::result::Result<
             tonic::Response<super::RepositoryMetadataSetResponse>,
+            tonic::Status,
+        >;
+        /// Create a scope in the repository the request metadata names. The caller
+        /// pre-generates `id` for retry idempotency. Re-issuing the `id` of a live
+        /// scope returns the existing record when `name` is its name, compared
+        /// case-sensitively, and ALREADY_EXISTS otherwise, as does a `name` that maps
+        /// to another scope. The `id` of an archived scope restores the scope under
+        /// `name`. Needs write access.
+        async fn scope_create(
+            &self,
+            request: tonic::Request<super::ScopeCreateRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ScopeCreateResponse>,
+            tonic::Status,
+        >;
+        /// Look up a scope by id or by name. The name `default`, in any case, and
+        /// the default scope's derived id answer the default scope.
+        async fn scope_get(
+            &self,
+            request: tonic::Request<super::ScopeGetRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ScopeGetResponse>,
+            tonic::Status,
+        >;
+        /// Give a live scope another name. Needs repository administration, or to be
+        /// the scope's creator.
+        async fn scope_rename(
+            &self,
+            request: tonic::Request<super::ScopeRenameRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ScopeRenameResponse>,
+            tonic::Status,
+        >;
+        /// Archive a scope: erase its name → id mapping and keep its record. An
+        /// archived scope answers itself. Needs repository administration, or to be
+        /// the scope's creator.
+        async fn scope_archive(
+            &self,
+            request: tonic::Request<super::ScopeArchiveRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ScopeArchiveResponse>,
             tonic::Status,
         >;
     }
@@ -1094,6 +1422,189 @@ pub mod repository_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = RepositoryMetadataSetSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.repository.v1.RepositoryService/ScopeCreate" => {
+                    #[allow(non_camel_case_types)]
+                    struct ScopeCreateSvc<T: RepositoryService>(pub Arc<T>);
+                    impl<
+                        T: RepositoryService,
+                    > tonic::server::UnaryService<super::ScopeCreateRequest>
+                    for ScopeCreateSvc<T> {
+                        type Response = super::ScopeCreateResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ScopeCreateRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RepositoryService>::scope_create(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ScopeCreateSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.repository.v1.RepositoryService/ScopeGet" => {
+                    #[allow(non_camel_case_types)]
+                    struct ScopeGetSvc<T: RepositoryService>(pub Arc<T>);
+                    impl<
+                        T: RepositoryService,
+                    > tonic::server::UnaryService<super::ScopeGetRequest>
+                    for ScopeGetSvc<T> {
+                        type Response = super::ScopeGetResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ScopeGetRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RepositoryService>::scope_get(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ScopeGetSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.repository.v1.RepositoryService/ScopeRename" => {
+                    #[allow(non_camel_case_types)]
+                    struct ScopeRenameSvc<T: RepositoryService>(pub Arc<T>);
+                    impl<
+                        T: RepositoryService,
+                    > tonic::server::UnaryService<super::ScopeRenameRequest>
+                    for ScopeRenameSvc<T> {
+                        type Response = super::ScopeRenameResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ScopeRenameRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RepositoryService>::scope_rename(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ScopeRenameSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.repository.v1.RepositoryService/ScopeArchive" => {
+                    #[allow(non_camel_case_types)]
+                    struct ScopeArchiveSvc<T: RepositoryService>(pub Arc<T>);
+                    impl<
+                        T: RepositoryService,
+                    > tonic::server::UnaryService<super::ScopeArchiveRequest>
+                    for ScopeArchiveSvc<T> {
+                        type Response = super::ScopeArchiveResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ScopeArchiveRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RepositoryService>::scope_archive(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ScopeArchiveSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

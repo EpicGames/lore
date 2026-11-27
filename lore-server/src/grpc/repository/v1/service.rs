@@ -18,6 +18,14 @@ use lore_proto::lore::repository::v1::RepositoryMetadataSetRequest;
 use lore_proto::lore::repository::v1::RepositoryMetadataSetResponse;
 use lore_proto::lore::repository::v1::RepositoryRenameRequest;
 use lore_proto::lore::repository::v1::RepositoryRenameResponse;
+use lore_proto::lore::repository::v1::ScopeArchiveRequest;
+use lore_proto::lore::repository::v1::ScopeArchiveResponse;
+use lore_proto::lore::repository::v1::ScopeCreateRequest;
+use lore_proto::lore::repository::v1::ScopeCreateResponse;
+use lore_proto::lore::repository::v1::ScopeGetRequest;
+use lore_proto::lore::repository::v1::ScopeGetResponse;
+use lore_proto::lore::repository::v1::ScopeRenameRequest;
+use lore_proto::lore::repository::v1::ScopeRenameResponse;
 use lore_proto::lore::repository::v1::repository_service_server::RepositoryService;
 use lore_revision::environment::EnvironmentConfig;
 use lore_telemetry::InstrumentProvider;
@@ -32,6 +40,10 @@ use super::repository_get;
 use super::repository_list;
 use super::repository_metadata_get;
 use super::repository_metadata_set;
+use super::scope_archive;
+use super::scope_create;
+use super::scope_get;
+use super::scope_rename;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_catalog::RepositoryCatalog;
 use crate::authnz::repository_registry::RepositoryRegistry;
@@ -204,6 +216,73 @@ impl RepositoryService for LoreRepositoryV1Service {
                 self.authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+            ),
+        )
+        .await
+    }
+
+    async fn scope_create(
+        &self,
+        request: Request<ScopeCreateRequest>,
+    ) -> Result<Response<ScopeCreateResponse>, Status> {
+        timeout_grpc(
+            self.rpc_timeout,
+            scope_create::handler(
+                request,
+                &self.authorizer,
+                self.immutable_store.clone(),
+                self.mutable_store.clone(),
+                &self.instrument_provider,
+            ),
+        )
+        .await
+    }
+
+    async fn scope_get(
+        &self,
+        request: Request<ScopeGetRequest>,
+    ) -> Result<Response<ScopeGetResponse>, Status> {
+        timeout_grpc(
+            self.rpc_timeout,
+            scope_get::handler(
+                request,
+                &self.authorizer,
+                self.immutable_store.clone(),
+                self.mutable_store.clone(),
+            ),
+        )
+        .await
+    }
+
+    async fn scope_rename(
+        &self,
+        request: Request<ScopeRenameRequest>,
+    ) -> Result<Response<ScopeRenameResponse>, Status> {
+        timeout_grpc(
+            self.rpc_timeout,
+            scope_rename::handler(
+                request,
+                &self.authorizer,
+                self.immutable_store.clone(),
+                self.mutable_store.clone(),
+                &self.instrument_provider,
+            ),
+        )
+        .await
+    }
+
+    async fn scope_archive(
+        &self,
+        request: Request<ScopeArchiveRequest>,
+    ) -> Result<Response<ScopeArchiveResponse>, Status> {
+        timeout_grpc(
+            self.rpc_timeout,
+            scope_archive::handler(
+                request,
+                &self.authorizer,
+                self.immutable_store.clone(),
+                self.mutable_store.clone(),
+                &self.instrument_provider,
             ),
         )
         .await

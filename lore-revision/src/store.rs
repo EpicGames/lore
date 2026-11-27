@@ -21,7 +21,6 @@ pub(crate) use lore_storage::StoreGetData;
 pub(crate) use lore_storage::StoreMatch;
 pub(crate) use lore_storage::StoreMatchResult;
 pub(crate) use lore_storage::StoreObliterateStats;
-pub(crate) use lore_storage::immutable_store::MatchedStoreError;
 pub(crate) use lore_storage::immutable_store::query_one;
 // Re-export maintenance functions (used as crate::store::gc etc.)
 pub(crate) use lore_storage::maintenance::gc;

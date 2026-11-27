@@ -53,6 +53,7 @@ use lore_revision::repository::RepositoryError;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::repository::ServerContext;
 use lore_revision::runtime::Cancellation;
+use lore_revision::scope::ScopeError;
 use lore_revision::state::StateError;
 use lore_storage::StoreError;
 use lore_telemetry::InstrumentProvider;
@@ -409,7 +410,7 @@ pub(crate) fn delete_branch_detached(
 /// Not an `async fn`, which would hold `task` in its future as well as spawn it: the task starts
 /// at the call, and the answer holds only its handle.
 #[lore_macro::test_pub]
-fn run_detached<T: Send + 'static>(
+pub(crate) fn run_detached<T: Send + 'static>(
     what: &'static str,
     task: impl Future<Output = T> + Send + 'static,
 ) -> impl Future<Output = Result<T, Status>> {
@@ -863,6 +864,7 @@ impl_filter_slow_down!(
     MetadataError,
     RepositoryError,
     RepositoryMetadataError,
+    ScopeError,
     StateError,
     StoreError,
 );

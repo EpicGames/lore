@@ -29,6 +29,10 @@ pub enum KeyType {
     /// because this is the only one they operate on; a publish large enough to fragment falls
     /// back to an ordinary mutable store write, which does carry it like any other type.
     Resolve = 7,
+    /// Key refers to scope metadata.
+    ScopeMetadata = 8,
+    /// Key refers to a scope identifier.
+    ScopeId = 9,
 }
 
 impl TryFrom<u8> for KeyType {
@@ -44,6 +48,8 @@ impl TryFrom<u8> for KeyType {
             5 => Ok(KeyType::RepositoryId),
             6 => Ok(KeyType::Instance),
             7 => Ok(KeyType::Resolve),
+            8 => Ok(KeyType::ScopeMetadata),
+            9 => Ok(KeyType::ScopeId),
             other => Err(other),
         }
     }

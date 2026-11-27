@@ -9,6 +9,7 @@ pub enum UnhandledError {
 
 // Re-export all FFI error types from lore-error (the single source of truth)
 pub(crate) use lore_base::error::AddressNotFound;
+pub(crate) use lore_base::error::AlreadyExists;
 pub(crate) use lore_base::error::AlreadyLinked;
 pub(crate) use lore_base::error::BranchAdvanced;
 pub(crate) use lore_base::error::BranchAlreadyExists;

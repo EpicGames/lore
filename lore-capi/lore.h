@@ -239,6 +239,9 @@ typedef enum lore_error_code_t {
   LORE_ERROR_CODE_BRANCH_ALREADY_EXISTS = 57,
   // A repository already exists at the path.
   LORE_ERROR_CODE_REPOSITORY_ALREADY_EXISTS = 58,
+  // A resource the operation would create exists already, or one it would claim is held by
+  // another.
+  LORE_ERROR_CODE_ALREADY_EXISTS = 59,
   // A requested item was not found.
   LORE_ERROR_CODE_NOT_FOUND = 79,
   // A content-addressable object could not be found in any store.
@@ -430,6 +433,10 @@ typedef enum lore_key_type_t {
   // because this is the only one they operate on; a publish large enough to fragment falls
   // back to an ordinary mutable store write, which does carry it like any other type.
   LORE_KEY_TYPE_RESOLVE = 7,
+  // Key refers to scope metadata.
+  LORE_KEY_TYPE_SCOPE_METADATA = 8,
+  // Key refers to a scope identifier.
+  LORE_KEY_TYPE_SCOPE_ID = 9,
 } lore_key_type_t;
 
 // The change staged on a node for the next revision. `None` is a node the

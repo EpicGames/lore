@@ -150,3 +150,24 @@ message Branch {
   // parent the branch was forked from; stack[N-1] is the ultimate root.
   repeated BranchPoint stack = 9;
 }
+
+// A scope of a repository: a unit of lock causality with its own id, name
+// and lifecycle. The default scope, named `default`, has an id derived from
+// the repository's and no stored record, so it has an empty creator and a
+// zero `created`.
+message Scope {
+  // Caller-pre-generated unique identifier; stable across renames, archive
+  // and restore.
+  bytes id = 1;
+  // Human-readable name, unique among live scopes regardless of case. Empty
+  // while the scope is archived.
+  string name = 2;
+  // Identity that created the scope: the authenticated JWT identity, or
+  // `<unknown>` on a server without authentication.
+  string creator = 3;
+  // Server-assigned creation timestamp (Unix epoch milliseconds).
+  uint64 created = 4;
+  // True iff the scope is archived via ScopeArchive. The record survives
+  // but the name → id mapping is erased.
+  bool archived = 5;
+}

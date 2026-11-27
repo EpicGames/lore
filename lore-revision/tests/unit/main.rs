@@ -50,6 +50,7 @@ mod relay;
 mod repository;
 mod revision;
 mod runtime;
+mod scope;
 mod service_state;
 mod stage;
 mod state;

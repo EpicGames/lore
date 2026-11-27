@@ -991,6 +991,19 @@ For repositories:
   the immutable store).
 - *Per repository name*: a *name-to-ID mapping* resolving repository names to their opaque IDs.
 
+For scopes, stored the way branches are:
+
+- *Per scope ID*: a *metadata pointer* (referring to a content-addressed metadata blob that holds
+  the scope's name, creator and creation time).
+- *Per scope name*: a *name-to-ID mapping* resolving each scope name to its opaque scope ID,
+  with the generation of the claim that wrote the mapping after the ID, so that a release of the
+  name takes only that claim.
+
+A repository's default scope has an ID derived from the repository's and no entries at all. Only
+the server writes scope entries, through the scope requests of the repository service: the
+generic mutable-store writes refuse both scope key types, as they refuse repository and branch
+metadata and branch latest pointers.
+
 The pattern across every entry is the same: a small key that names a piece of mutable state, a
 value that is either an inline pointer (a hash or an address) or another opaque identifier. The
 mutable store does not hold the metadata *bodies*; those are content-addressed and live in the
@@ -1049,6 +1062,10 @@ archived branch's history). Tools that need to refer to a branch
 unambiguously refer to it by ID; tools that need to present the branch to a human user
 use the name and let the mutable store resolve it.
 
+A scope has the same two identifiers and the same lifecycle: archiving it removes its name's
+mapping and keeps its metadata, and restoring it puts a mapping back. A scope can also be
+renamed, which claims the new name's mapping and then releases the old one.
+
 #### 9.4 Atomicity via compare-and-swap
 
 The mutable store's API is narrow: `load`, `store`, `cas`, `list`. The `cas` operation
@@ -1066,7 +1083,9 @@ metadata, restoring an archived name, registering a repository in the catalog - 
 store." No `cas` spans two keys. A restore writes the branch's metadata and its name's mapping,
 so it first records in the metadata the name it claims. A restore that stops between the two
 writes leaves that record, and the next restore or archive of the branch settles it: it releases
-the name, and keeps a record of it until a later restore removes it.
+the name, and keeps a record of it until a later restore removes it. A scope's restore and rename
+claim a name the same way, and the next rename, archive or restore of the scope settles one that
+stopped.
 The protocol exposes the `load`, `store`, and `cas` operations directly; clients and
 servers coordinate every mutable-state change through the same contract.
 

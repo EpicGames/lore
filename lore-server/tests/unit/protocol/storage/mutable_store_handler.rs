@@ -176,9 +176,9 @@ async fn test_handle_store_independent_keys() {
         .await;
 }
 
-/// Repository and branch metadata and a branch's latest pointer are written
-/// only through requests that validate the write; reaching the same keys
-/// through the generic store would skip that.
+/// Repository and branch metadata, a branch's latest pointer, and scope
+/// metadata and name mappings are written only through requests that validate
+/// the write; reaching the same keys through the generic store would skip that.
 #[tokio::test]
 async fn rejects_key_types_with_a_dedicated_write_request() {
     let repository = random::<RepositoryId>();
@@ -187,6 +187,8 @@ async fn rejects_key_types_with_a_dedicated_write_request() {
         KeyType::RepositoryMetadata,
         KeyType::BranchMetadata,
         KeyType::BranchLatestPointer,
+        KeyType::ScopeMetadata,
+        KeyType::ScopeId,
     ] {
         let context = Arc::new(AttributeMap::default());
         context.insert(repository);

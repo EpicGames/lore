@@ -6,6 +6,10 @@ pub mod info;
 pub mod latest;
 pub mod merge;
 pub mod push;
+#[cfg(not(feature = "test-util"))]
+pub(crate) mod record;
+#[cfg(feature = "test-util")]
+pub mod record;
 pub mod reset;
 
 use std::cmp::PartialEq;
@@ -29,6 +33,7 @@ use lore_transport::BranchRecord;
 use lore_transport::Connection;
 use lore_transport::MatchedProtocolError;
 use lore_transport::ProtocolError;
+use record::Branches;
 use serde::Serialize;
 use tokio::join;
 use tokio::sync::RwLock;
@@ -81,12 +86,12 @@ use crate::revision::DiffItem;
 use crate::revision::DiffResult;
 use crate::runtime::CancellationCheck;
 use crate::runtime::check_cancelled;
+use crate::scope;
 use crate::state;
 use crate::state::State;
 use crate::state::StateData;
 use crate::state::StateError;
 use crate::store::KeyType;
-use crate::store::MatchedStoreError;
 use crate::store::ReadConsistency;
 use crate::util;
 use crate::util::path::RelativePath;
@@ -451,12 +456,12 @@ pub const RESTORED: &str = "restored";
 /// settle set it. A restore's first swap sets it where the metadata doesn't say the branch is
 /// archived, and keeps it otherwise.
 pub const ARCHIVED: &str = "archived";
-/// The name a restore of the archived branch claims, set before the claim and removed when the
-/// restore finishes: a restore in progress, or one that stopped.
+/// The name a claim of a name for a record with metadata claims, set before the claim and removed
+/// when the write finishes: a claim in progress, or one that stopped.
 pub const RESTORING: &str = "restoring";
-/// The name a settled restore had claimed, which may still map to the branch: every archive of the
-/// branch releases it again, and the next restore releases it and removes the entry before it
-/// records itself.
+/// The name a settled claim had claimed, or a write left behind, which may still map to the
+/// record: the record's next archive releases it again, and its next claim releases it and removes
+/// the entry before it records itself.
 pub const RELEASED: &str = "released";
 pub const STACK: &str = "stack";
 pub const ID: &str = "id";
@@ -471,6 +476,8 @@ fn mutable_key_type(function: &str) -> KeyType {
         METADATA => KeyType::BranchMetadata,
         ID => KeyType::BranchId,
         LATEST => KeyType::BranchLatestPointer,
+        scope::METADATA => KeyType::ScopeMetadata,
+        scope::ID => KeyType::ScopeId,
         _ => KeyType::Untyped,
     }
 }
@@ -510,7 +517,9 @@ fn hash_branch_function(
     )
 }
 
-fn mutable_name_key(salt: &[u8], function: &str, name: &str) -> (Hash, KeyType) {
+/// The key of the mapping of `name`, lowercased, under `function`, hashed with `salt`, and the key
+/// type `function` takes.
+pub(crate) fn mutable_name_key(salt: &[u8], function: &str, name: &str) -> (Hash, KeyType) {
     let key = hash::hash_function_arg(salt, function, name.to_lowercase().as_str());
     let key_type = mutable_key_type(function);
     (key, key_type)
@@ -603,7 +612,7 @@ pub(crate) fn mutable_load(
     function: &str,
     branch: BranchId,
 ) -> impl Future<Output = Result<Hash, BranchError>> {
-    load_branch_key(repository, function, branch, |value, branch| {
+    load_record_key(repository, function, branch, |value, branch| {
         value.ok_or_else(|| {
             BranchError::from(BranchNotFound {
                 branch: branch.to_string(),
@@ -620,22 +629,22 @@ pub fn mutable_value(
     function: &str,
     branch: BranchId,
 ) -> impl Future<Output = Result<Option<Hash>, BranchError>> {
-    load_branch_key(repository, function, branch, |value, _| Ok(value))
+    load_record_key(repository, function, branch, |value, _| Ok(value))
 }
 
-/// What `answer` makes of `branch` and its `function` value in the mutable store of `repository`:
-/// the value, or `None` where the key is absent or holds zero, read from the store's answer, so the
-/// store's absence reaches `answer` as `None`.
+/// What `answer` makes of the record `id` and its `function` value in the mutable store of
+/// `repository`: the value, or `None` where the key is absent or holds zero, read from the store's
+/// answer, so the store's absence reaches `answer` as `None`.
 ///
 /// `answer` captures nothing at its callers, so it adds nothing to the future.
-async fn load_branch_key<T>(
+pub(crate) async fn load_record_key<T, E: record::RecordError>(
     repository: Arc<RepositoryContext>,
     function: &str,
-    branch: BranchId,
-    answer: impl FnOnce(Option<Hash>, BranchId) -> Result<T, BranchError>,
-) -> Result<T, BranchError> {
+    id: Context,
+    answer: impl FnOnce(Option<Hash>, Context) -> Result<T, E>,
+) -> Result<T, E> {
     let repository_id = repository.id;
-    let (key, key_type) = mutable_key(repository.salt(), function, repository_id, branch);
+    let (key, key_type) = mutable_key(repository.salt(), function, repository_id, id);
     let value = match repository
         .read_mutable_store()
         .load(repository_id, key, key_type)
@@ -643,15 +652,15 @@ async fn load_branch_key<T>(
     {
         Ok(value) if value.is_zero() => None,
         Ok(value) => {
-            lore_debug!("Load {function} for branch {branch} repository {repository_id}: {value}");
+            lore_debug!("Load {function} of {id} repository {repository_id}: {value}");
             Some(value)
         }
         Err(err) if err.is_address_not_found() || err.is_payload_not_found() => None,
         Err(err) => {
-            return Err(err).forward::<BranchError>("Failed to load data from mutable store");
+            return Err(err).forward::<E>("Failed to load data from mutable store");
         }
     };
-    answer(value, branch)
+    answer(value, id)
 }
 
 async fn mutable_store(
@@ -704,25 +713,7 @@ pub fn mutable_try_store(
 ) -> impl Future<Output = Result<Hash, BranchError>> + use<> {
     let (key, key_type) = mutable_key(repository.salt(), function, repository.id, branch);
     lore_debug!("Store {function} = {value} for branch {branch}");
-    mutable_try_store_key(repository, key, key_type, expect, value)
-}
-
-/// Swaps the value of `key` from `expected` to `value`, answering the value the key held. An
-/// absent key holds zero.
-async fn mutable_try_store_key(
-    repository: Arc<RepositoryContext>,
-    key: Hash,
-    key_type: KeyType,
-    expected: Hash,
-    value: Hash,
-) -> Result<Hash, BranchError> {
-    let handle = repository
-        .try_write_mutable_store()
-        .ok_or_else(|| BranchError::from(WriteRequired))?;
-    handle
-        .compare_and_swap(repository.id, key, expected, value, key_type)
-        .await
-        .forward_with::<BranchError, _>(|| format!("compare-and-swap of a {key_type:?} key"))
+    record::swap_key(repository, key, key_type, expect, value)
 }
 
 /// Claims `name` for branch `id` with a compare-and-swap of the name's mapping from `expected`,
@@ -767,7 +758,7 @@ fn swap_claim(
             reason: format!("the branch id claiming the name {name} is zero"),
         }));
     }
-    Ok(swap_name_to_id(
+    Ok(record::swap_mapping::<Branches>(
         repository,
         name,
         Hash::from_context(expected),
@@ -788,7 +779,7 @@ pub fn release_name(
 ) -> impl Future<Output = Result<(), BranchError>> {
     async move {
         if !expected.is_zero() {
-            let held = swap_name_to_id(
+            let held = record::swap_mapping::<Branches>(
                 repository,
                 name,
                 Hash::from_context(expected),
@@ -833,18 +824,6 @@ pub fn claim_name_unless_held(
             Err(err) => Err(err),
         }
     }
-}
-
-/// Swaps the mapping of `name` from `expected` to `value`, answering the value the mapping held.
-/// An absent mapping holds zero.
-fn swap_name_to_id(
-    repository: Arc<RepositoryContext>,
-    name: &str,
-    expected: Hash,
-    value: Hash,
-) -> impl Future<Output = Result<Hash, BranchError>> + use<> {
-    let (key, key_type) = mutable_name_key(repository.salt(), ID, name);
-    mutable_try_store_key(repository, key, key_type, expected, value)
 }
 
 /// The id `name` maps to: `name` itself when it parses as a non-zero id, else the mapping in the
@@ -1082,37 +1061,32 @@ pub fn local_claim_expected(
 /// The value the mapping of `name` holds in the local store, zero for none. A read that fails other
 /// than as not found fails.
 ///
-/// Not an `async fn`, which would hold a second copy of its arguments beside the read's future.
+/// Returns the read's future, without a future of its own.
 fn local_name_mapping(
     repository: Arc<RepositoryContext>,
     name: &str,
 ) -> impl Future<Output = Result<Context, BranchError>> {
-    futures::FutureExt::map(load_name_to_id_local(repository, name), |read| match read {
-        Err(err) if err.is_branch_not_found() => Ok(Context::default()),
-        read => read,
-    })
+    record::name_mapping::<Branches>(repository, name)
 }
 
 /// Strict local-only name-to-ID lookup. Checks only the mutable store for the
-/// name-to-ID mapping. No remote query, no `fallback_id` derivation.
-pub async fn load_name_to_id_local(
+/// name-to-ID mapping. No remote query, no `fallback_id` derivation. A name without a mapping
+/// fails with [`BranchNotFound`].
+///
+/// Returns the read's future with its answer mapped, without a future of its own.
+pub fn load_name_to_id_local(
     repository: Arc<RepositoryContext>,
     name: &str,
-) -> Result<Context, BranchError> {
-    let (key, key_type) = mutable_name_key(repository.salt(), ID, name);
-    let id = repository
-        .read_mutable_store()
-        .load(repository.id, key, key_type)
-        .await
-        .map_matched_err("Failed to resolve branch name", |m| match m {
-            MatchedStoreError::AddressNotFound(_) | MatchedStoreError::PayloadNotFound(_) => {
-                BranchError::from(BranchNotFound {
-                    branch: name.to_string(),
-                })
-            }
-            other => other.forward::<BranchError>("Failed to resolve branch name"),
-        })?;
-    Ok(id.to_context())
+) -> impl Future<Output = Result<Context, BranchError>> {
+    futures::FutureExt::map(
+        record::name_mapping::<Branches>(repository, name),
+        move |held| match held {
+            Ok(held) if held.is_zero() => Err(BranchError::from(BranchNotFound {
+                branch: name.to_string(),
+            })),
+            held => held,
+        },
+    )
 }
 
 pub async fn load_remote(
@@ -2639,19 +2613,25 @@ fn restore_existing_branch(
                 .set_string(RESTORING, name)
                 .forward::<BranchError>("Failed to record the restore in branch metadata")?;
             if !is_archived(&metadata) {
-                stamp_time(&mut metadata, ARCHIVED)?;
+                record::stamp_time::<BranchError>(&mut metadata, ARCHIVED)?;
                 metadata.remove_key(RESTORED);
             }
             let archived = metadata.get_u64(ARCHIVED).ok();
-            let recorded =
-                match swap_metadata(repository.clone(), branch, expected, &metadata).await {
-                    Ok(recorded) => recorded,
-                    Err(err) if err.is_branch_already_exists() => {
-                        yields = true;
-                        continue;
-                    }
-                    Err(err) => return Err(err),
-                };
+            let recorded = match record::swap_metadata::<Branches>(
+                repository.clone(),
+                branch,
+                expected,
+                &metadata,
+            )
+            .await
+            {
+                Ok(recorded) => recorded,
+                Err(err) if err.is_branch_already_exists() => {
+                    yields = true;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             #[cfg(feature = "test-util")]
             crate::test_util::branch_step(crate::test_util::BranchStep::RestoreRecorded).await;
 
@@ -2661,7 +2641,7 @@ fn restore_existing_branch(
             if held != branch
                 && let Err(err) = claimed_name(name, name_expected, held)
             {
-                revert_metadata(repository, branch, recorded, expected).await;
+                record::revert_metadata::<Branches>(repository, branch, recorded, expected).await;
                 return Err(err);
             }
             #[cfg(feature = "test-util")]
@@ -2865,15 +2845,24 @@ fn finish_restore(
                     .forward::<BranchError>("Failed to update branch name metadata")?;
             }
             patch_missing_metadata_fields(&mut metadata, category, creator, created)?;
-            stamp_time(&mut metadata, RESTORED)?;
-            let finished = serialize_metadata(repository.clone(), &metadata).await?;
-            match swap_metadata_key(repository.clone(), branch, recorded, finished).await {
+            record::stamp_time::<BranchError>(&mut metadata, RESTORED)?;
+            let finished =
+                record::serialize_metadata::<BranchError>(repository.clone(), &metadata).await?;
+            match record::swap_metadata_key::<Branches>(
+                repository.clone(),
+                branch,
+                recorded,
+                finished,
+            )
+            .await
+            {
                 Ok(_) => return Ok(()),
                 Err(err) if err.is_branch_already_exists() => {
                     let Some((current, current_metadata)) =
                         restore_record(repository.clone(), branch, name, archived).await?
                     else {
-                        release_unrecorded_claim(repository, branch, name).await;
+                        record::release_unrecorded_claim::<Branches>(repository, branch, name, ())
+                            .await;
                         return Err(err);
                     };
                     lore_debug!("Branch {branch} changed since its restore recorded itself");
@@ -2909,54 +2898,31 @@ async fn restore_record(
 
 /// The name a restore of the branch `metadata` describes has recorded as the one it claims, as
 /// [`RESTORING`] holds it: a restore in progress, or one that stopped.
-fn restoring(metadata: &Metadata) -> Option<&str> {
+pub(crate) fn restoring(metadata: &Metadata) -> Option<&str> {
     metadata.get_string(RESTORING).ok()
 }
 
 /// The name a settled restore of the branch `metadata` describes had claimed, as [`RELEASED`]
 /// holds it, which may still map to the branch.
-fn released(metadata: &Metadata) -> Option<&str> {
+pub(crate) fn released(metadata: &Metadata) -> Option<&str> {
     metadata.get_string(RELEASED).ok()
 }
 
 /// Settles the restore recorded in `metadata`, the metadata of `branch` a read found as `read`,
-/// which claims `pending`: it swaps the metadata from `read` to one that names `pending` as
-/// [`RELEASED`] in place of the record, with [`ARCHIVED`] set past the time it holds, as an archive
-/// does, which fails the restore's final swap, then releases `pending` from the branch while the
-/// metadata still marks it ([`unmarked`]). A metadata key that holds another value is
-/// left as it is, and answers `None`; a settled restore answers the hash its swap wrote, and
-/// whether its release took `pending` from the branch. A write that fails otherwise fails.
+/// which claims `pending`, as [`record::settle`] does. The swap expects the local metadata key to
+/// hold the value [`local_metadata_expected`] answers, and moves [`ARCHIVED`] on: a restore's
+/// record says the branch is archived.
 ///
-/// The swap comes first, so the restore can't finish once its name is released, and it moves the
-/// archive time on, so no later record of a restore makes the metadata the settled restore swaps
-/// from again. The [`RELEASED`] entry outlives the settle, so a settle that stops before its
-/// release, or a claim the restore makes after it and then stops, leaves the name for the next
-/// restore or archive to release. A restore that claims after the release and goes on finds its
-/// final swap refused, and releases its claim itself.
-async fn settle_pending_restore(
+/// Returns the settle's future, without a future of its own.
+fn settle_pending_restore<'a>(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
     read: Hash,
     read_locally: bool,
-    mut metadata: Metadata,
-    pending: &str,
-) -> Result<Option<(Hash, bool)>, BranchError> {
-    metadata.remove_key(RESTORING);
-    metadata
-        .set_string(RELEASED, pending)
-        .forward::<BranchError>("Failed to record the settled restore in branch metadata")?;
-    stamp_time(&mut metadata, ARCHIVED)?;
-    let expected = local_metadata_expected(repository.clone(), branch, read, read_locally).await;
-    let settled = match swap_metadata(repository.clone(), branch, expected, &metadata).await {
-        Ok(settled) => settled,
-        Err(err) if err.is_branch_already_exists() => return Ok(None),
-        Err(err) => return Err(err),
-    };
-    lore_info!("Settled a restore of branch {branch} under '{pending}' that didn't finish");
-    #[cfg(feature = "test-util")]
-    crate::test_util::branch_step(crate::test_util::BranchStep::PendingRestoreSettled).await;
-    let released = release_unless(repository, branch, pending, unmarked).await?;
-    Ok(Some((settled, released)))
+    metadata: Metadata,
+    pending: &'a str,
+) -> impl Future<Output = Result<Option<(Hash, bool)>, BranchError>> + 'a {
+    record::settle::<Branches>(repository, branch, read, read_locally, metadata, pending)
 }
 
 /// Caches `remote`, the remote's metadata hash of `branch`, in the local metadata key, and answers
@@ -2981,7 +2947,7 @@ pub(crate) async fn cache_remote_metadata(
         Err(err) if err.is_branch_not_found() => Hash::default(),
         Err(err) => return Err(err),
     };
-    swap_metadata_key(repository, branch, local, remote).await
+    record::swap_metadata_key::<Branches>(repository, branch, local, remote).await
 }
 
 /// Writes the local record of `branch` that a sync brings in from the remote: `metadata`, the
@@ -3017,7 +2983,7 @@ pub fn bring_in_record(
             Err(err) => Err(err),
         };
         if claimed.is_err() {
-            revert_metadata(repository, branch, metadata, replaced).await;
+            record::revert_metadata::<Branches>(repository, branch, metadata, replaced).await;
         }
         claimed
     }
@@ -3055,43 +3021,24 @@ async fn settle_local_restore(
     }
 }
 
-/// Releases `name` from `branch`, the claim of a restore whose final swap found the metadata
-/// changed, unless the metadata holds it ([`release_unless`], [`holds_name`]), logging a failure.
-/// A takeover releases the name itself where the restore had claimed it when the takeover read the
-/// metadata; this frees one claimed after.
-async fn release_unrecorded_claim(
-    repository: Arc<RepositoryContext>,
-    branch: BranchId,
-    name: &str,
-) {
-    if let Err(err) = release_unless(repository, branch, name, holds_name).await {
-        lore_warn!(
-            "Failed to release the name {name} of branch {branch}, whose restore didn't finish: {err}"
-        );
-    }
-}
-
 /// Releases `name` from `branch` unless the branch's metadata, read again first with
-/// [`metadata_local`], `keeps` it, and answers whether it released it. A mapping that names
-/// another branch, or none, is left as it is, and answers false. A read or release that fails
-/// otherwise fails.
-async fn release_unless(
+/// [`metadata_local`], `keeps` it, as [`record::release_unless`] does.
+///
+/// Returns the release's future, without a future of its own.
+fn release_unless(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
     name: &str,
     keeps: fn(&Metadata, &str) -> bool,
-) -> Result<bool, BranchError> {
-    if keeps(&metadata_local(repository.clone(), branch).await?, name) {
-        return Ok(false);
-    }
-    release_mapped_name(repository, branch, name).await
+) -> impl Future<Output = Result<bool, BranchError>> {
+    record::release_unless::<Branches>(repository, branch, name, keeps, ())
 }
 
 /// Whether `metadata` records a restore under `name` or names its branch live under it, compared
-/// as [`restores_name`] and [`names_branch`] compare: the mapping of `name` to the branch then
+/// as [`restores_name`] and [`names_record`] compare: the mapping of `name` to the branch then
 /// belongs to that restore.
-fn holds_name(metadata: &Metadata, name: &str) -> bool {
-    restores_name(metadata, name) || (!is_archived(metadata) && names_branch(metadata, name))
+pub(crate) fn holds_name(metadata: &Metadata, name: &str) -> bool {
+    restores_name(metadata, name) || (!is_archived(metadata) && names_record(metadata, name))
 }
 
 /// Whether `metadata` names its branch `name`, or records a restore under it, archived or not, as
@@ -3100,18 +3047,18 @@ fn holds_name(metadata: &Metadata, name: &str) -> bool {
 /// restore leaves one when it claims its name after its settle and after a later restore removed
 /// the [`RELEASED`] mark, and then stops.
 fn accounts_for_name(metadata: &Metadata, name: &str) -> bool {
-    restores_name(metadata, name) || names_branch(metadata, name)
+    restores_name(metadata, name) || names_record(metadata, name)
 }
 
 /// Whether `metadata` records a restore under `name` ([`RESTORING`]), compared regardless of case,
 /// as the name's mapping key is ([`fold_eq`]).
-fn restores_name(metadata: &Metadata, name: &str) -> bool {
+pub(crate) fn restores_name(metadata: &Metadata, name: &str) -> bool {
     restoring(metadata).is_some_and(|held| fold_eq(held, name))
 }
 
-/// Whether `metadata` names its branch `name`, compared regardless of case, as the name's mapping
+/// Whether `metadata` names its record `name`, compared regardless of case, as the name's mapping
 /// key is ([`fold_eq`]).
-fn names_branch(metadata: &Metadata, name: &str) -> bool {
+pub(crate) fn names_record(metadata: &Metadata, name: &str) -> bool {
     branch::name(metadata).is_ok_and(|held| fold_eq(held, name))
 }
 
@@ -3120,28 +3067,14 @@ fn names_branch(metadata: &Metadata, name: &str) -> bool {
 /// so does a lookup that caches the remote's metadata over the local one
 /// ([`cache_remote_metadata`]). Metadata without the mark may since name the branch under `name`,
 /// live or archived.
-fn unmarked(metadata: &Metadata, name: &str) -> bool {
+pub(crate) fn unmarked(metadata: &Metadata, name: &str) -> bool {
     released(metadata) != Some(name)
-}
-
-/// Releases `name` from `branch` with [`release_name`], answering whether it did: a mapping that
-/// names another branch, or none, is no failure, and answers false.
-async fn release_mapped_name(
-    repository: Arc<RepositoryContext>,
-    branch: BranchId,
-    name: &str,
-) -> Result<bool, BranchError> {
-    match release_name(repository, name, branch).await {
-        Ok(()) => Ok(true),
-        Err(err) if err.is_branch_not_found() => Ok(false),
-        Err(err) => Err(err),
-    }
 }
 
 /// Whether `metadata` says its branch is archived: it holds an [`ARCHIVED`] time and no
 /// [`RESTORED`] time, as an archive leaves it. Metadata with neither predates them, or belongs to
 /// a create that hasn't finished, and says nothing.
-fn is_archived(metadata: &Metadata) -> bool {
+pub(crate) fn is_archived(metadata: &Metadata) -> bool {
     metadata.get_u64(ARCHIVED).is_ok() && metadata.get_u64(RESTORED).is_err()
 }
 
@@ -3178,18 +3111,6 @@ fn claimed_name(name: &str, expected: Context, held: Context) -> Result<(), Bran
     }))
 }
 
-/// Sets the time `key` holds in `metadata` to the time now in milliseconds, or one past the time
-/// it holds where that is later, so a swap of the metadata key to the result writes a value other
-/// than the one it replaces.
-fn stamp_time(metadata: &mut Metadata, key: &str) -> Result<(), BranchError> {
-    let after = metadata
-        .get_u64(key)
-        .map_or(0, |time| time.saturating_add(1));
-    metadata
-        .set_u64(key, crate::util::time::timestamp().max(after))
-        .forward::<BranchError>("Failed to set a time in branch metadata")
-}
-
 /// The value a swap of the metadata key of `branch` from `read`, the hash a read of the metadata
 /// found, expects the local key to hold: `read` where the read was local, or where a lookup has
 /// since cached the remote's value locally, and zero otherwise, as the local key held none. A key
@@ -3207,49 +3128,6 @@ async fn local_metadata_expected(
         Ok(local) if local == read => read,
         _ => Hash::default(),
     }
-}
-
-/// Serializes `metadata` and swaps it into the metadata key of `branch` from `expected`,
-/// answering its hash, as [`swap_metadata_key`] swaps it.
-async fn swap_metadata(
-    repository: Arc<RepositoryContext>,
-    branch: BranchId,
-    expected: Hash,
-    metadata: &Metadata,
-) -> Result<Hash, BranchError> {
-    let hash = serialize_metadata(repository.clone(), metadata).await?;
-    swap_metadata_key(repository, branch, expected, hash).await?;
-    Ok(hash)
-}
-
-/// Stores `metadata` in the immutable store, answering its hash.
-async fn serialize_metadata(
-    repository: Arc<RepositoryContext>,
-    metadata: &Metadata,
-) -> Result<Hash, BranchError> {
-    metadata
-        .serialize(repository)
-        .await
-        .forward::<BranchError>("Failed to serialize branch metadata")
-}
-
-/// Swaps the metadata key of `branch` from `expected` to `hash`, answering `expected`, the value
-/// it replaced. A key that holds another value is left as it is, and the swap fails with
-/// [`BranchAlreadyExists`] naming the branch.
-async fn swap_metadata_key(
-    repository: Arc<RepositoryContext>,
-    branch: BranchId,
-    expected: Hash,
-    hash: Hash,
-) -> Result<Hash, BranchError> {
-    let held = mutable_try_store(repository, METADATA, branch, expected, hash).await?;
-    if held != expected {
-        lore_debug!("Branch {branch} has metadata {held}, not {expected}, so it isn't rewritten");
-        return Err(BranchError::from(BranchAlreadyExists {
-            branch: branch.to_string(),
-        }));
-    }
-    Ok(held)
 }
 
 /// Writes the record of a new branch: its metadata, swapped into the metadata key of `branch` from
@@ -3319,29 +3197,14 @@ pub fn create_record(
         crate::test_util::branch_step(crate::test_util::BranchStep::CreateMetadataStored).await;
 
         if let Err(err) = claim_name(repository.clone(), name, name_expected, branch).await {
-            revert_metadata(repository, branch, metadata_hash, Hash::default()).await;
+            record::revert_metadata::<Branches>(repository, branch, metadata_hash, Hash::default())
+                .await;
             return Err(err);
         }
         #[cfg(feature = "test-util")]
         crate::test_util::branch_step(crate::test_util::BranchStep::CreateNameClaimed).await;
 
         store_latest(repository, branch, Hash::default(), latest, status).await
-    }
-}
-
-/// Swaps the metadata of `branch` from `stored` back to `previous`, after a claim that failed. The
-/// key keeps any value but `stored`, so a value another writer stored since stays unless it is
-/// `stored` too. A failed write is logged.
-async fn revert_metadata(
-    repository: Arc<RepositoryContext>,
-    branch: BranchId,
-    stored: Hash,
-    previous: Hash,
-) {
-    if let Err(err) = mutable_try_store(repository, METADATA, branch, stored, previous).await {
-        lore_warn!(
-            "Failed to set the metadata of branch {branch}, whose claim of its name failed, back to {previous}: {err}"
-        );
     }
 }
 
@@ -4115,7 +3978,7 @@ pub mod test_util {
 /// Archives `branch`, named `name`, whose metadata the metadata key holds locally as `expected`.
 /// It swaps the metadata from `expected` to `metadata` with [`ARCHIVED`] set past the time it
 /// holds and [`RESTORED`] removed, which says the branch is archived, then releases the name from
-/// the branch with a compare-and-swap of the name's mapping ([`release_archived_name`]). A
+/// the branch with a compare-and-swap of the name's mapping, as [`record::archive`] does. A
 /// metadata key that holds another value is left as it is, and the archive fails with
 /// [`BranchAlreadyExists`] naming the branch, releasing nothing. A mapping that names another
 /// branch, or none, is left as it is, and the archive fails with [`BranchNotFound`]. The branch
@@ -4126,8 +3989,7 @@ pub mod test_util {
 /// and the release then leaves the name with it. `metadata` must hold no pending restore
 /// ([`RESTORING`]): a caller settles one first, as [`delete`] does. A [`RELEASED`] entry stays.
 ///
-/// Not an `async fn`, which would hold a second copy of its arguments.
-#[allow(clippy::manual_async_fn)]
+/// Returns the archive's future with its answer mapped, without a future of its own.
 pub fn archive_record(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
@@ -4135,38 +3997,16 @@ pub fn archive_record(
     expected: Hash,
     metadata: Metadata,
 ) -> impl Future<Output = Result<(), BranchError>> {
-    async move {
-        let archived = {
-            let mut metadata = metadata;
-            stamp_time(&mut metadata, ARCHIVED)?;
-            metadata.remove_key(RESTORED);
-            swap_metadata(repository.clone(), branch, expected, &metadata).await?
-        };
-        #[cfg(feature = "test-util")]
-        crate::test_util::branch_step(crate::test_util::BranchStep::ArchiveReleasing).await;
-        release_archived_name(repository, branch, name, archived).await
-    }
-}
-
-/// Releases `name` from `branch` with [`release_name`], once an archive has swapped the branch's
-/// metadata to `archived`, unless a restore holds the name since: the metadata key is read again,
-/// and where it holds another value, the metadata it holds records a restore under `name` or names
-/// the branch live under it ([`holds_name`]). A restore that read the archive's metadata claims
-/// the name only where it no longer maps to the branch, as one a failed restore released after the
-/// archive's lookup. A key that still holds `archived` is released from without a metadata read.
-/// A read that fails fails.
-async fn release_archived_name(
-    repository: Arc<RepositoryContext>,
-    branch: BranchId,
-    name: &str,
-    archived: Hash,
-) -> Result<(), BranchError> {
-    let current = mutable_load(repository.clone(), METADATA, branch).await?;
-    if current != archived && holds_name(&load_metadata(repository.clone(), current).await?, name) {
-        lore_debug!("A restore of {branch} holds {name} since its archive");
-        return Ok(());
-    }
-    release_name(repository, name, branch).await
+    futures::FutureExt::map(
+        record::archive::<Branches>(repository, branch, name, expected, metadata),
+        move |archived| match archived {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(BranchError::from(BranchNotFound {
+                branch: name.to_string(),
+            })),
+            Err(err) => Err(err),
+        },
+    )
 }
 
 /// Archives `branch` as [`archive_local`] does, and sends a `BranchArchive` event where
@@ -4522,7 +4362,14 @@ async fn set_protect(
                 .forward::<BranchError>("Failed to update branch protect metadata")?;
             let expected =
                 local_metadata_expected(repository.clone(), branch, read, read_locally).await;
-            match swap_metadata(repository.clone(), branch, expected, &branch_metadata).await {
+            match record::swap_metadata::<Branches>(
+                repository.clone(),
+                branch,
+                expected,
+                &branch_metadata,
+            )
+            .await
+            {
                 Ok(_) => break,
                 Err(err) if err.is_branch_already_exists() => {}
                 Err(err) => return Err(err),
@@ -4587,7 +4434,7 @@ pub async fn purge_mapped_branches(repository: Arc<RepositoryContext>) {
         .await;
     for (key, id) in mappings {
         let branch = id.to_context();
-        if let Err(err) = mutable_try_store_key(
+        if let Err(err) = record::swap_key::<BranchError>(
             repository.clone(),
             key,
             KeyType::BranchId,
