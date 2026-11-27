@@ -231,6 +231,8 @@ typedef enum lore_error_code_t {
   LORE_ERROR_CODE_LINK_DIVERGENT = 52,
   // The mounts of a linked repository disagree on their revision, branch or flags.
   LORE_ERROR_CODE_LINK_PINS_DIVERGE = 53,
+  // A repository rename may have stopped after its checks passed; run it again to complete it.
+  LORE_ERROR_CODE_REPOSITORY_RENAME_INCOMPLETE = 54,
   // The target repository is already used in a layer.
   LORE_ERROR_CODE_ALREADY_LINKED = 56,
   // The branch already exists.

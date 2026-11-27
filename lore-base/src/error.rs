@@ -673,6 +673,8 @@ pub enum LoreErrorCode {
     LinkDivergent = 52,
     /// The mounts of a linked repository disagree on their revision, branch or flags.
     LinkPinsDiverge = 53,
+    /// A repository rename may have stopped after its checks passed; run it again to complete it.
+    RepositoryRenameIncomplete = 54,
     /// The target repository is already used in a layer.
     AlreadyLinked = 56,
     /// The branch already exists.
@@ -765,6 +767,7 @@ impl LoreErrorCode {
             MountsBusy::FFI_CODE => Self::MountsBusy,
             LinkDivergent::FFI_CODE => Self::LinkDivergent,
             LinkPinsDiverge::FFI_CODE => Self::LinkPinsDiverge,
+            RepositoryRenameIncomplete::FFI_CODE => Self::RepositoryRenameIncomplete,
             AlreadyLinked::FFI_CODE => Self::AlreadyLinked,
             BranchAlreadyExists::FFI_CODE => Self::BranchAlreadyExists,
             RepositoryAlreadyExists::FFI_CODE => Self::RepositoryAlreadyExists,

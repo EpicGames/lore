@@ -9,8 +9,6 @@ use super::reference::RepositoryReference;
 use super::reference::instance_reference;
 use super::reference::remote_reference;
 use crate::errors::*;
-use crate::event::EventError;
-use crate::interface::LoreError;
 use crate::lore::RepositoryId;
 use crate::lore::execution_context;
 use crate::protocol;
@@ -33,22 +31,6 @@ pub enum RenameError {
     Oversized,
     AddressNotFound,
     RepositoryRenameIncomplete,
-}
-
-impl EventError for RenameError {
-    fn translated(&self) -> LoreError {
-        match self {
-            RenameError::InvalidArguments(_) | RenameError::InvalidPath(_) => {
-                LoreError::InvalidArguments
-            }
-            RenameError::NotFound(_) => LoreError::NotFound,
-            RenameError::Disconnected(_) => LoreError::Connection,
-            RenameError::SlowDown(_) => LoreError::SlowDown,
-            RenameError::Oversized(_) => LoreError::Oversized,
-            RenameError::AddressNotFound(_) => LoreError::AddressNotFound,
-            _ => LoreError::Internal,
-        }
-    }
 }
 
 /// Renames a repository on a remote to `name`. Its ID does not change.
