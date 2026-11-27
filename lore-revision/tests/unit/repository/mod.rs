@@ -6,6 +6,7 @@ mod clone_hold;
 mod clone_order;
 mod dry_run_store_tests;
 mod flush_tests;
+mod name_binding_tests;
 mod name_validation_tests;
 mod path_optional_tests;
 mod prefetch;

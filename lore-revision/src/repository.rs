@@ -5431,6 +5431,128 @@ pub async fn delete_name_to_id(
         .forward::<RepositoryError>("Failed to store repository metadata")
 }
 
+/// The outcome of [`bind_name_to_id`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameBind {
+    /// The name was unbound, and the call bound it to the ID.
+    Bound,
+    /// The name already mapped to the ID, and is left as it is.
+    AlreadyBound,
+    /// The name maps to this other ID, and is left as it is.
+    HeldByOther(RepositoryId),
+}
+
+/// Binds `name` to `id` with a compare-and-swap of the name's mapping, only when the name is
+/// unbound or already bound to `id`. A zero `id` fails with [`InvalidArguments`].
+pub async fn bind_name_to_id(
+    repository: Arc<RepositoryContext>,
+    name: impl AsRef<str>,
+    id: RepositoryId,
+) -> Result<NameBind, RepositoryError> {
+    if id.is_zero() {
+        return Err(RepositoryError::from(InvalidArguments {
+            reason: format!(
+                "the repository id binding the name {} is zero",
+                name.as_ref()
+            ),
+        }));
+    }
+    let value = Hash::from_context(id.into());
+    let held = swap_name_to_id(repository, name.as_ref(), Hash::default(), value).await?;
+    Ok(if held.is_zero() {
+        NameBind::Bound
+    } else if held == value {
+        NameBind::AlreadyBound
+    } else {
+        NameBind::HeldByOther(RepositoryId::from(held.to_context()))
+    })
+}
+
+/// Clears the mapping of `name` with a compare-and-swap, only when it still maps to `id`. A
+/// mapping to another ID, or none, is left as it is.
+pub async fn unbind_name_to_id(
+    repository: Arc<RepositoryContext>,
+    name: impl AsRef<str>,
+    id: RepositoryId,
+) -> Result<(), RepositoryError> {
+    let expected = Hash::from_context(id.into());
+    swap_name_to_id(repository, name.as_ref(), expected, Hash::default()).await?;
+    Ok(())
+}
+
+/// Swaps the mapping of `name` from `expected` to `value`, answering the value the mapping held.
+/// An unbound name holds zero.
+async fn swap_name_to_id(
+    repository: Arc<RepositoryContext>,
+    name: &str,
+    expected: Hash,
+    value: Hash,
+) -> Result<Hash, RepositoryError> {
+    let (key, key_type) = mutable_name_key(repository.salt(), ID, name);
+    let handle = repository
+        .try_write_mutable_store()
+        .ok_or_else(|| RepositoryError::from(WriteRequired))?;
+    handle
+        .compare_and_swap(RepositoryId::default(), key, expected, value, key_type)
+        .await
+        .forward_with::<RepositoryError, _>(|| format!("swapping the id of repository name {name}"))
+}
+
+/// The outcome of [`metadata_set_name`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetadataSwap {
+    /// The repository's metadata pointer refers to this blob, the copy with the new name.
+    Updated(Hash),
+    /// The metadata pointer held `current`, neither the expected hash nor the copy, and is left as
+    /// it is. A zero `current` means the repository has no metadata. Another key, or the name, may
+    /// have changed: the name in the blob `current` names tells which.
+    Lost { current: Hash },
+}
+
+/// Writes a copy of the metadata blob `expected` with `name` as its name and every other key
+/// kept, and swaps the repository's metadata pointer from `expected` to the copy. A pointer that
+/// already refers to the copy counts as updated. A zero `expected` fails with
+/// [`RepositoryNotFound`], and a copy larger than the metadata size limit with [`Oversized`].
+pub async fn metadata_set_name(
+    repository: Arc<RepositoryContext>,
+    expected: Hash,
+    name: impl AsRef<str>,
+) -> Result<MetadataSwap, RepositoryError> {
+    if expected.is_zero() {
+        return Err(RepositoryError::from(RepositoryNotFound {
+            repository: repository.id.to_string(),
+        }));
+    }
+    let handle = repository
+        .try_write_mutable_store()
+        .ok_or_else(|| RepositoryError::from(WriteRequired))?;
+    let updated = {
+        let mut metadata =
+            Metadata::deserialize(repository.clone(), expected)
+                .await
+                .forward::<RepositoryError>("reading the repository metadata to rename")?;
+        metadata
+            .set_string(NAME, name.as_ref())
+            .forward::<RepositoryError>("setting the repository name")?;
+        let options = crate::immutable::write_options_from_repository(repository.clone())
+            .with_local_cache_priority();
+        metadata
+            .serialize_borrowed(repository.clone(), options)
+            .await
+            .forward::<RepositoryError>("writing the renamed repository metadata")?
+    };
+    let (key, key_type) = mutable_key(repository.salt(), METADATA, repository.id);
+    let current = handle
+        .compare_and_swap(repository.id, key, expected, updated, key_type)
+        .await
+        .forward::<RepositoryError>("swapping the repository metadata pointer")?;
+    if current == expected || current == updated {
+        Ok(MetadataSwap::Updated(updated))
+    } else {
+        Ok(MetadataSwap::Lost { current })
+    }
+}
+
 pub async fn id_from_name(
     repository: Arc<RepositoryContext>,
     name: impl AsRef<str>,
