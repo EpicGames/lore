@@ -7,7 +7,12 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::PoisonError;
 
 use lore_base::error::BranchNotFound;
 use lore_base::lore_spawn;
@@ -626,26 +631,114 @@ async fn run_order(
 
 /// Runs `ops` from `start` in every order of their steps that switches away from an operation
 /// that hasn't ended at most `preemptions` times, and checks each with [`check`].
-async fn race(start: Start, ops: &[Op], preemptions: usize) {
-    Box::pin(with_execution(async {
-        let mut choices: Vec<usize> = Vec::new();
-        loop {
-            let run = run_order(start, ops, preemptions, |point, _| {
-                choices.get(point).copied().unwrap_or(0)
-            })
-            .await;
-            check(start, ops, &run);
-            let Some(point) = (0..run.taken.len())
-                .rev()
-                .find(|&point| run.taken[point] + 1 < run.options[point])
-            else {
-                return;
-            };
-            choices = run.taken[..point].to_vec();
-            choices.push(run.taken[point] + 1);
+///
+/// The orders run on as many threads as the machine has cores. Each thread runs its orders one at
+/// a time on a current-thread runtime of its own, so each order runs as it would alone. An order
+/// starts from the choices of the order that found it and takes the first option at every later
+/// point; every other option it meets past those choices is the start of another order, so each
+/// order runs once.
+fn race(start: Start, ops: &[Op], preemptions: usize) {
+    let orders = Orders {
+        state: Mutex::new(OrdersState {
+            pending: vec![Vec::new()],
+            running: 0,
+            failed: false,
+        }),
+        changed: Condvar::new(),
+    };
+    let threads = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime for the orders of a race")
+                    .block_on(Box::pin(with_execution(async {
+                        while let Some(choices) = orders.take() {
+                            let running = Running(&orders);
+                            let run = run_order(start, ops, preemptions, |point, _| {
+                                choices.get(point).copied().unwrap_or(0)
+                            })
+                            .await;
+                            check(start, ops, &run);
+                            let mut found = Vec::new();
+                            for point in choices.len()..run.taken.len() {
+                                for option in run.taken[point] + 1..run.options[point] {
+                                    let mut order = run.taken[..point].to_vec();
+                                    order.push(option);
+                                    found.push(order);
+                                }
+                            }
+                            running.end(found);
+                        }
+                    })));
+            });
         }
-    }))
-    .await;
+    });
+}
+
+/// The orders of a race left to run, which the threads running the race share.
+struct Orders {
+    state: Mutex<OrdersState>,
+    changed: Condvar,
+}
+
+struct OrdersState {
+    /// The choices each order left to run starts with.
+    pending: Vec<Vec<usize>>,
+    /// The orders running, which may yet find more.
+    running: usize,
+    /// Whether an order failed its check, which ends the race.
+    failed: bool,
+}
+
+impl Orders {
+    fn lock(&self) -> MutexGuard<'_, OrdersState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The choices of the next order to run, counted as running, waiting while none is left and
+    /// a running order may yet find one. `None` once every order has run, or one has failed.
+    fn take(&self) -> Option<Vec<usize>> {
+        let mut state = self.lock();
+        loop {
+            if state.failed {
+                return None;
+            }
+            if let Some(choices) = state.pending.pop() {
+                state.running += 1;
+                return Some(choices);
+            }
+            if state.running == 0 {
+                return None;
+            }
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// An order [`Orders::take`] handed out. Dropped without [`Running::end`], as when its check
+/// panics, it fails the race, so that the other threads stop rather than wait for it.
+struct Running<'a>(&'a Orders);
+
+impl Running<'_> {
+    /// Ends the order, adding the orders it `found`.
+    fn end(self, found: Vec<Vec<usize>>) {
+        self.0.lock().pending.extend(found);
+    }
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.lock();
+        state.running -= 1;
+        state.failed |= std::thread::panicking();
+        self.0.changed.notify_all();
+    }
 }
 
 /// Checks that each operation of `run` that failed failed as one that finds the branch or a name
@@ -948,345 +1041,304 @@ async fn a_rename_refuses_a_branch_whose_create_has_not_claimed_its_name() {
     .await;
 }
 
-#[tokio::test]
-async fn racing_creates_of_a_new_branch_under_two_names_end_as_if_one_at_a_time() {
+#[test]
+fn racing_creates_of_a_new_branch_under_two_names_end_as_if_one_at_a_time() {
     race(
         Start::Absent,
         &[create(RACED, BEE), create(RACED, SEA)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_creates_of_a_new_branch_under_one_name_end_as_if_one_at_a_time() {
+#[test]
+fn racing_creates_of_a_new_branch_under_one_name_end_as_if_one_at_a_time() {
     race(
         Start::Absent,
         &[create(RACED, BEE), create(RACED, BEE)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_creates_of_two_new_branches_under_one_name_end_as_if_one_at_a_time() {
+#[test]
+fn racing_creates_of_two_new_branches_under_one_name_end_as_if_one_at_a_time() {
     race(
         Start::Absent,
         &[create(RACED, BEE), create(OTHER, BEE)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_archive_and_rename_of_a_live_branch_end_as_if_one_at_a_time() {
+#[test]
+fn racing_archive_and_rename_of_a_live_branch_end_as_if_one_at_a_time() {
     race(
         Start::Live,
         &[archive(RACED), create(RACED, BEE)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn archive_local_racing_a_restore_ends_as_if_one_at_a_time() {
+#[test]
+fn archive_local_racing_a_restore_ends_as_if_one_at_a_time() {
     race(
         Start::Archived,
         &[archive_local(RACED), create(RACED, BEE)],
         EVERY_ORDER,
-    )
-    .await;
+    );
     race(
         Start::Stopped,
         &[archive_local(RACED), create(RACED, SEA)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_archives_of_a_live_branch_end_as_if_one_at_a_time() {
-    race(Start::Live, &[archive(RACED), archive(RACED)], EVERY_ORDER).await;
+#[test]
+fn racing_archives_of_a_live_branch_end_as_if_one_at_a_time() {
+    race(Start::Live, &[archive(RACED), archive(RACED)], EVERY_ORDER);
 }
 
-#[tokio::test]
-async fn racing_archive_and_restore_under_its_name_of_a_live_branch_end_as_if_one_at_a_time() {
+#[test]
+fn racing_archive_and_restore_under_its_name_of_a_live_branch_end_as_if_one_at_a_time() {
     race(
         Start::Live,
         &[archive(RACED), create(RACED, OLD)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_renames_of_an_archived_branch_end_as_if_one_at_a_time() {
+#[test]
+fn racing_renames_of_an_archived_branch_end_as_if_one_at_a_time() {
     race(
         Start::Archived,
         &[create(RACED, BEE), create(RACED, SEA)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_restore_under_its_name_and_rename_of_an_archived_branch_end_as_if_one_at_a_time() {
+#[test]
+fn racing_restore_under_its_name_and_rename_of_an_archived_branch_end_as_if_one_at_a_time() {
     race(
         Start::Archived,
         &[create(RACED, OLD), create(RACED, BEE)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_restores_under_its_name_of_an_archived_branch_end_as_if_one_at_a_time() {
+#[test]
+fn racing_restores_under_its_name_of_an_archived_branch_end_as_if_one_at_a_time() {
     race(
         Start::Archived,
         &[create(RACED, OLD), create(RACED, OLD)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_rename_of_an_archived_branch_and_create_of_another_under_the_name_end_as_if_one_at_a_time()
+#[test]
+fn racing_rename_of_an_archived_branch_and_create_of_another_under_the_name_end_as_if_one_at_a_time()
  {
     race(
         Start::Archived,
         &[create(RACED, BEE), create(OTHER, BEE)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_rename_and_archive_of_an_archived_branch_end_as_if_one_at_a_time() {
+#[test]
+fn racing_rename_and_archive_of_an_archived_branch_end_as_if_one_at_a_time() {
     race(
         Start::Archived,
         &[create(RACED, BEE), archive(RACED)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_restore_under_its_name_rename_and_archive_of_an_archived_branch_end_as_if_one_at_a_time()
- {
+#[test]
+fn racing_restore_under_its_name_rename_and_archive_of_an_archived_branch_end_as_if_one_at_a_time()
+{
     race(
         Start::Archived,
         &[create(RACED, OLD), create(RACED, BEE), archive(RACED)],
         PREEMPTIONS,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_two_renames_and_archive_of_an_archived_branch_end_as_if_one_at_a_time() {
+#[test]
+fn racing_two_renames_and_archive_of_an_archived_branch_end_as_if_one_at_a_time() {
     race(
         Start::Archived,
         &[create(RACED, BEE), create(RACED, SEA), archive(RACED)],
         PREEMPTIONS,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_two_restores_under_its_name_and_rename_of_an_archived_branch_end_as_if_one_at_a_time()
- {
+#[test]
+fn racing_two_restores_under_its_name_and_rename_of_an_archived_branch_end_as_if_one_at_a_time() {
     race(
         Start::Archived,
         &[create(RACED, OLD), create(RACED, OLD), create(RACED, BEE)],
         PREEMPTIONS,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_two_renames_and_restore_under_its_name_of_an_archived_branch_end_as_if_one_at_a_time()
- {
+#[test]
+fn racing_two_renames_and_restore_under_its_name_of_an_archived_branch_end_as_if_one_at_a_time() {
     race(
         Start::Archived,
         &[create(RACED, BEE), create(RACED, SEA), create(RACED, OLD)],
         PREEMPTIONS,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_creates_of_a_new_branch_under_three_names_end_as_if_one_at_a_time() {
+#[test]
+fn racing_creates_of_a_new_branch_under_three_names_end_as_if_one_at_a_time() {
     race(
         Start::Absent,
         &[create(RACED, OLD), create(RACED, BEE), create(RACED, SEA)],
         PREEMPTIONS,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_archive_rename_and_restore_under_its_name_of_a_live_branch_end_as_if_one_at_a_time()
-{
+#[test]
+fn racing_archive_rename_and_restore_under_its_name_of_a_live_branch_end_as_if_one_at_a_time() {
     race(
         Start::Live,
         &[archive(RACED), create(RACED, BEE), create(RACED, OLD)],
         PREEMPTIONS,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_three_renames_of_an_archived_branch_under_two_names_end_as_if_one_at_a_time() {
+#[test]
+fn racing_three_renames_of_an_archived_branch_under_two_names_end_as_if_one_at_a_time() {
     race(
         Start::Archived,
         &[create(RACED, BEE), create(RACED, SEA), create(RACED, BEE)],
         PREEMPTIONS,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_renames_of_a_branch_with_a_stopped_restore_end_as_if_one_at_a_time() {
+#[test]
+fn racing_renames_of_a_branch_with_a_stopped_restore_end_as_if_one_at_a_time() {
     race(
         Start::Stopped,
         &[create(RACED, SEA), create(RACED, OLD)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_restore_under_the_stopped_restores_name_and_archive_end_as_if_one_at_a_time() {
+#[test]
+fn racing_restore_under_the_stopped_restores_name_and_archive_end_as_if_one_at_a_time() {
     race(
         Start::Stopped,
         &[create(RACED, BEE), archive(RACED)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_rename_and_create_of_another_under_the_stopped_restores_name_end_as_if_one_at_a_time()
- {
+#[test]
+fn racing_rename_and_create_of_another_under_the_stopped_restores_name_end_as_if_one_at_a_time() {
     race(
         Start::Stopped,
         &[create(RACED, SEA), create(OTHER, BEE)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_archives_of_a_branch_with_a_stopped_restore_end_as_if_one_at_a_time() {
+#[test]
+fn racing_archives_of_a_branch_with_a_stopped_restore_end_as_if_one_at_a_time() {
     race(
         Start::Stopped,
         &[archive(RACED), archive(RACED)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_archives_of_a_branch_with_a_stopped_restore_under_its_own_name_end_as_if_one_at_a_time()
- {
+#[test]
+fn racing_archives_of_a_branch_with_a_stopped_restore_under_its_own_name_end_as_if_one_at_a_time() {
     race(
         Start::StoppedUnderOld,
         &[archive(RACED), archive(RACED)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_two_renames_and_archive_of_a_branch_with_a_stopped_restore_end_as_if_one_at_a_time()
-{
+#[test]
+fn racing_two_renames_and_archive_of_a_branch_with_a_stopped_restore_end_as_if_one_at_a_time() {
     race(
         Start::Stopped,
         &[create(RACED, BEE), create(RACED, SEA), archive(RACED)],
         PREEMPTIONS,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_renames_of_a_branch_a_stopped_settle_left_end_as_if_one_at_a_time() {
+#[test]
+fn racing_renames_of_a_branch_a_stopped_settle_left_end_as_if_one_at_a_time() {
     race(
         Start::Released,
         &[create(RACED, SEA), create(RACED, BEE)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_rename_and_archive_of_a_branch_a_stopped_settle_left_end_as_if_one_at_a_time() {
+#[test]
+fn racing_rename_and_archive_of_a_branch_a_stopped_settle_left_end_as_if_one_at_a_time() {
     race(
         Start::Released,
         &[create(RACED, SEA), archive(RACED)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_rename_and_create_of_another_under_the_released_name_end_as_if_one_at_a_time() {
+#[test]
+fn racing_rename_and_create_of_another_under_the_released_name_end_as_if_one_at_a_time() {
     race(
         Start::Released,
         &[create(RACED, SEA), create(OTHER, BEE)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_two_renames_and_archive_of_a_branch_a_stopped_settle_left_end_as_if_one_at_a_time()
-{
+#[test]
+fn racing_two_renames_and_archive_of_a_branch_a_stopped_settle_left_end_as_if_one_at_a_time() {
     race(
         Start::Released,
         &[create(RACED, BEE), create(RACED, SEA), archive(RACED)],
         PREEMPTIONS,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_restore_and_protect_of_an_archived_branch_end_as_if_one_at_a_time() {
+#[test]
+fn racing_restore_and_protect_of_an_archived_branch_end_as_if_one_at_a_time() {
     race(
         Start::Archived,
         &[create(RACED, BEE), Op::Protect { id: RACED }],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_renames_of_a_branch_an_older_version_archived_end_as_if_one_at_a_time() {
+#[test]
+fn racing_renames_of_a_branch_an_older_version_archived_end_as_if_one_at_a_time() {
     race(
         Start::OlderArchived,
         &[create(RACED, BEE), create(RACED, SEA)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_restore_and_archive_of_a_branch_an_older_version_archived_end_as_if_one_at_a_time()
-{
+#[test]
+fn racing_restore_and_archive_of_a_branch_an_older_version_archived_end_as_if_one_at_a_time() {
     race(
         Start::OlderArchived,
         &[create(RACED, OLD), archive(RACED)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
-#[tokio::test]
-async fn racing_restore_and_rename_of_a_branch_without_a_latest_revision_end_as_if_one_at_a_time() {
+#[test]
+fn racing_restore_and_rename_of_a_branch_without_a_latest_revision_end_as_if_one_at_a_time() {
     race(
         Start::OlderArchivedWithoutLatest,
         &[create(RACED, OLD), create(RACED, BEE)],
         EVERY_ORDER,
-    )
-    .await;
+    );
 }
 
 /// A restore that stops after it recorded itself or after its claim, as one whose process ends

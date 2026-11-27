@@ -607,32 +607,30 @@ mod resolve {
         const READ_CAP: usize = 1400;
         const CHUNK_CAP: usize = 16384;
 
-        for seed in CHAOS_SEEDS {
-            for v4 in [false, true] {
-                let mut chaos = Chaos::new(seed);
-                let messages = chaos_messages(&mut chaos, MESSAGE_COUNT, v4, MAX_PAYLOAD);
-                let stream = encode_all(&messages);
+        each_chaos_case(|seed, v4| {
+            let mut chaos = Chaos::new(seed);
+            let messages = chaos_messages(&mut chaos, MESSAGE_COUNT, v4, MAX_PAYLOAD);
+            let stream = encode_all(&messages);
 
-                let mut expected: Vec<Flat> = messages.iter().map(flatten_expected).collect();
-                expected.sort();
+            let mut expected: Vec<Flat> = messages.iter().map(flatten_expected).collect();
+            expected.sort();
 
-                for arrival in [ChaosArrival::InOrder, ChaosArrival::NearbySwaps] {
-                    let mut chunks = into_random_chunks(&mut chaos, &stream, READ_CAP);
-                    deliver(&mut chaos, &mut chunks, arrival);
+            for arrival in [ChaosArrival::InOrder, ChaosArrival::NearbySwaps] {
+                let mut chunks = into_random_chunks(&mut chaos, &stream, READ_CAP);
+                deliver(&mut chaos, &mut chunks, arrival);
 
-                    assert_assemblers_agree(
-                        header_size(v4),
-                        CHUNK_CAP,
-                        &chunks,
-                        &expected,
-                        &format!(
-                            "seed {seed:#018x}, v4 {v4}, {arrival:?}, {} bytes",
-                            stream.len()
-                        ),
-                    );
-                }
+                assert_assemblers_agree(
+                    header_size(v4),
+                    CHUNK_CAP,
+                    &chunks,
+                    &expected,
+                    &format!(
+                        "seed {seed:#018x}, v4 {v4}, {arrival:?}, {} bytes",
+                        stream.len()
+                    ),
+                );
             }
-        }
+        });
     }
 
     /// The same property under total reordering, where every chunk but the first has to be
@@ -645,27 +643,38 @@ mod resolve {
         const READ_CAP: usize = 256;
         const CHUNK_CAP: usize = 4096;
 
-        for seed in CHAOS_SEEDS {
-            for v4 in [false, true] {
-                let mut chaos = Chaos::new(seed);
-                let messages = chaos_messages(&mut chaos, MESSAGE_COUNT, v4, MAX_PAYLOAD);
-                let stream = encode_all(&messages);
+        each_chaos_case(|seed, v4| {
+            let mut chaos = Chaos::new(seed);
+            let messages = chaos_messages(&mut chaos, MESSAGE_COUNT, v4, MAX_PAYLOAD);
+            let stream = encode_all(&messages);
 
-                let mut chunks = into_random_chunks(&mut chaos, &stream, READ_CAP);
-                deliver(&mut chaos, &mut chunks, ChaosArrival::FullShuffle);
+            let mut chunks = into_random_chunks(&mut chaos, &stream, READ_CAP);
+            deliver(&mut chaos, &mut chunks, ChaosArrival::FullShuffle);
 
-                let mut expected: Vec<Flat> = messages.iter().map(flatten_expected).collect();
-                expected.sort();
+            let mut expected: Vec<Flat> = messages.iter().map(flatten_expected).collect();
+            expected.sort();
 
-                assert_assemblers_agree(
-                    header_size(v4),
-                    CHUNK_CAP,
-                    &chunks,
-                    &expected,
-                    &format!("seed {seed:#018x}, v4 {v4}, {} bytes", stream.len()),
-                );
+            assert_assemblers_agree(
+                header_size(v4),
+                CHUNK_CAP,
+                &chunks,
+                &expected,
+                &format!("seed {seed:#018x}, v4 {v4}, {} bytes", stream.len()),
+            );
+        });
+    }
+
+    /// Runs `case` for each of [`CHAOS_SEEDS`] with each header version, each on a thread of its
+    /// own, so that the cases run in parallel. A case that panics fails the test.
+    fn each_chaos_case(case: impl Fn(u64, bool) + Sync) {
+        std::thread::scope(|scope| {
+            for seed in CHAOS_SEEDS {
+                for v4 in [false, true] {
+                    let case = &case;
+                    scope.spawn(move || case(seed, v4));
+                }
             }
-        }
+        });
     }
 
     /// Payload sizes that land exactly on a chunk boundary, and payloads large enough to span

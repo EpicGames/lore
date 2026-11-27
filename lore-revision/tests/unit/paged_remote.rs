@@ -119,7 +119,23 @@ pub(crate) struct RemoteRevision {
 /// The revision numbered `number`, with `parent` as its self parent and `metadata` as its metadata
 /// hash, written nowhere the walk reads. A revision written with the same three is this one.
 pub(crate) async fn remote_revision(number: u64, parent: Hash, metadata: Hash) -> RemoteRevision {
-    let scratch = crate::branch::null_repository().await;
+    remote_revision_in(
+        &crate::branch::null_repository().await,
+        number,
+        parent,
+        metadata,
+    )
+    .await
+}
+
+/// [`remote_revision`], serialized in `scratch`, a [`crate::branch::null_repository`] that any
+/// number of revisions can share.
+pub(crate) async fn remote_revision_in(
+    scratch: &Arc<RepositoryContext>,
+    number: u64,
+    parent: Hash,
+    metadata: Hash,
+) -> RemoteRevision {
     let token = scratch
         .try_write_token()
         .expect("a null context carries a write token");
@@ -156,10 +172,11 @@ pub(crate) async fn branch_metadata(stores: &ClientStores, branch: BranchId) -> 
 /// Revisions numbered 1 to `count` that only the remote holds, oldest first, each with `metadata`
 /// as its metadata hash.
 pub(crate) async fn remote_line(count: u64, metadata: Hash) -> Vec<RemoteRevision> {
+    let scratch = crate::branch::null_repository().await;
     let mut line: Vec<RemoteRevision> = Vec::new();
     for number in 1..=count {
         let parent = line.last().map_or(Hash::default(), |below| below.signature);
-        line.push(remote_revision(number, parent, metadata).await);
+        line.push(remote_revision_in(&scratch, number, parent, metadata).await);
     }
     line
 }
@@ -756,9 +773,61 @@ impl ImmutableStore for CountingStore {
     }
 }
 
-/// A client context on `stores` whose remote is `remote`.
+/// A client context on `stores` whose remote is `remote`, with storage that fails every request as
+/// disconnected, which a read of it does not retry.
 pub(crate) fn client_on(stores: &ClientStores, remote: Arc<PagedRemote>) -> Arc<RepositoryContext> {
-    client_on_storage(stores, remote, Vec::new())
+    client_on_storage(stores, remote, vec![Arc::new(UnreachableStorage)])
+}
+
+/// Remote storage that answers every request with `Disconnected`.
+struct UnreachableStorage;
+
+#[async_trait]
+impl lore_transport::Storage for UnreachableStorage {
+    async fn session_start(&self, _: Partition, _: &str) -> Result<u32, ProtocolError> {
+        Err(ProtocolError::from(Disconnected))
+    }
+
+    async fn session_stop(&self, _: u32) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+
+    async fn get(&self, _: u32, _: &Address) -> Result<(Fragment, Bytes), ProtocolError> {
+        Err(ProtocolError::from(Disconnected))
+    }
+
+    async fn put(
+        &self,
+        _: u32,
+        _: Address,
+        _: Fragment,
+        _: Option<Bytes>,
+    ) -> Result<(), ProtocolError> {
+        Err(ProtocolError::from(Disconnected))
+    }
+
+    async fn query(&self, _: u32, _: &[Address]) -> Result<Bytes, ProtocolError> {
+        Err(ProtocolError::from(Disconnected))
+    }
+
+    async fn verify(
+        &self,
+        _: u32,
+        _: &Address,
+        _: bool,
+    ) -> Result<lore_base::types::VerifyResult, ProtocolError> {
+        Err(ProtocolError::from(Disconnected))
+    }
+
+    async fn copy(
+        &self,
+        _: u32,
+        _: Partition,
+        _: Address,
+        _: Context,
+    ) -> Result<(), ProtocolError> {
+        Err(ProtocolError::from(Disconnected))
+    }
 }
 
 /// A client context on `stores` whose remote is `remote`, with `storage` as the remote's storage.

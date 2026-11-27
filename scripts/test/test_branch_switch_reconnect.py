@@ -88,9 +88,10 @@ def _force_kill_server(server_proc: subprocess.Popen, server_log_fd) -> None:
 
     Why SIGKILL: the production failure shape is an abrupt connection drop
     (the client gave up on idle timeout). `_kill_server_by_pid` in
-    lore_server.py sends SIGTERM, sleeps 5 s, then SIGKILL — that grace
-    window risks the server cleanly closing its QUIC streams, delivering
-    ApplicationClosed to the client instead of the abrupt drop we want.
+    lore_server.py sends SIGTERM, waits up to 5 s for the server to exit,
+    then sends SIGKILL — that grace window risks the server cleanly closing
+    its QUIC streams, delivering ApplicationClosed to the client instead of
+    the abrupt drop we want.
 
     Why wait: the relaunch's _check_port_free does a TCP connect against
     HTTP/gRPC ports; if we return before the kernel has torn down those

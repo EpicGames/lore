@@ -220,7 +220,10 @@ mod tests {
     /// The directory that replaced the file is the root of a nested repository: the walk never
     /// descends into one, so a reset sync reports nothing under it, the non-recursive directory
     /// delete keeps it, and the sync fails without touching the nested repository's working files.
-    #[tokio::test(flavor = "multi_thread")]
+    ///
+    /// The clock is paused, so the waits between the sync's attempts to remove the directory pass
+    /// at once.
+    #[tokio::test(start_paused = true)]
     async fn a_reset_sync_leaves_a_nested_repository_that_replaced_a_file_alone() {
         const ENTRY: &str = "entry";
 

@@ -16,7 +16,9 @@ use crate::store::test_support::SlowDownImmutableStore;
 /// The server cannot attempt an operation over many minutes and should bail out
 /// early. Without the server policies, this test would time out as the Lore library
 /// retries up to 60 times by default.
-#[tokio::test]
+///
+/// The clock is paused, so the back-off and the timeout both pass in virtual time.
+#[tokio::test(start_paused = true)]
 async fn slow_down_store_exhausts_retries_with_server_policy() {
     let store: Arc<dyn ImmutableStore> = Arc::new(SlowDownImmutableStore);
     // Non-zero so read_raw's debug_assert passes and the store is actually called.

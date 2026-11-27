@@ -34,6 +34,9 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use lore_revision::node::Node;
 use lore_revision::node::NodeFlags;
@@ -1421,11 +1424,31 @@ fn assert_marked(
     }
 }
 
-/// Runs sequences `first` to `first + SEQUENCES_PER_TEST`, each as [`sequence_of`] runs it.
-async fn sequences_from(first: u64) {
-    for seed in first..first + SEQUENCES_PER_TEST {
-        sequence_of(seed).await;
-    }
+/// Runs sequences `first` to `first + SEQUENCES_PER_TEST`, each as [`sequence_of`] runs it, on as
+/// many threads as the machine has cores. Each thread runs its sequences one at a time on a
+/// current-thread runtime of its own, so each sequence runs as it would alone.
+fn sequences_from(first: u64) {
+    let next = AtomicU64::new(first);
+    let threads = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime for the sequences")
+                    .block_on(async {
+                        loop {
+                            let seed = next.fetch_add(1, Ordering::Relaxed);
+                            if seed >= first + SEQUENCES_PER_TEST {
+                                break;
+                            }
+                            sequence_of(seed).await;
+                        }
+                    });
+            });
+        }
+    });
 }
 
 /// Runs the sequence `seed` draws in every [`Order`], and asserts that the orders leave one
@@ -1492,22 +1515,22 @@ async fn generated_sequences_removing_a_directory_a_staged_move_left() {
     sequence_of(8543).await;
 }
 
-#[tokio::test]
-async fn generated_sequences_0() {
-    sequences_from(0).await;
+#[test]
+fn generated_sequences_0() {
+    sequences_from(0);
 }
 
-#[tokio::test]
-async fn generated_sequences_1() {
-    sequences_from(SEQUENCES_PER_TEST).await;
+#[test]
+fn generated_sequences_1() {
+    sequences_from(SEQUENCES_PER_TEST);
 }
 
-#[tokio::test]
-async fn generated_sequences_2() {
-    sequences_from(2 * SEQUENCES_PER_TEST).await;
+#[test]
+fn generated_sequences_2() {
+    sequences_from(2 * SEQUENCES_PER_TEST);
 }
 
-#[tokio::test]
-async fn generated_sequences_3() {
-    sequences_from(3 * SEQUENCES_PER_TEST).await;
+#[test]
+fn generated_sequences_3() {
+    sequences_from(3 * SEQUENCES_PER_TEST);
 }

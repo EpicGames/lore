@@ -593,6 +593,7 @@ mod line_pager {
     use lore_revision::state::State;
     use tokio::sync::Semaphore;
 
+    use crate::branch::null_repository;
     use crate::branch::write_line;
     use crate::helper::setup_test_execution;
     use crate::paged_remote::Anchor;
@@ -606,6 +607,7 @@ mod line_pager {
     use crate::paged_remote::paging_remote;
     use crate::paged_remote::remote_line;
     use crate::paged_remote::remote_revision;
+    use crate::paged_remote::remote_revision_in;
     use crate::paged_remote::signature_of;
     use crate::paged_remote::span;
     use crate::paged_remote::stored_locally;
@@ -1564,10 +1566,17 @@ mod line_pager {
                 let stores = client_stores().await;
                 let metadata = branch_metadata(&stores, branch()).await;
                 let line = remote_line(1000, metadata).await;
+                let scratch = null_repository().await;
                 let mut other = Vec::new();
                 for number in 1..=1000 {
                     other.push(
-                        remote_revision(number, Hash::default(), Hash::from([0xB0; 32])).await,
+                        remote_revision_in(
+                            &scratch,
+                            number,
+                            Hash::default(),
+                            Hash::from([0xB0; 32]),
+                        )
+                        .await,
                     );
                 }
                 let mut remote = PagedRemote::new(branch(), line[999].signature)
@@ -1726,10 +1735,16 @@ mod line_pager {
     /// whose revisions are off it.
     async fn skipping_line(metadata: Hash, below: u64) -> Vec<RemoteRevision> {
         let mut line = remote_line(1000, metadata).await;
+        let scratch = null_repository().await;
         for number in 805..=1000 {
             let parent = if number == 805 { below } else { number - 1 };
-            line[number as usize - 1] =
-                remote_revision(number, line[parent as usize - 1].signature, metadata).await;
+            line[number as usize - 1] = remote_revision_in(
+                &scratch,
+                number,
+                line[parent as usize - 1].signature,
+                metadata,
+            )
+            .await;
         }
         line
     }

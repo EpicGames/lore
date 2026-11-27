@@ -93,9 +93,14 @@ enum Edit {
     /// Adds a file at the path as [`Edit::Add`] does, with the mode.
     AddMode(&'static str, u64, u16),
     /// Adds a directory `Bulk` of that many files, which takes a revision's changes past the count
-    /// at which the 3-way diff walks the other side unfiltered.
+    /// at which the 3-way diff walks the other side unfiltered. Past [`BULK_PER_DIRECTORY`] files,
+    /// they stand that many to a directory below `Bulk`, as adding each to a directory of
+    /// thousands takes as long as the rest of a test.
     Bulk(u32),
 }
+
+/// The files of an [`Edit::Bulk`] past which they stand in directories of this many.
+const BULK_PER_DIRECTORY: u32 = 100;
 
 /// The node at `path` in `state`.
 async fn node_at(repository: &Arc<RepositoryContext>, state: &State, path: &str) -> NodeID {
@@ -212,10 +217,23 @@ async fn edited(repository: &Arc<RepositoryContext>, base: Hash, edits: &[Edit])
                     "Bulk",
                 )
                 .await;
+                let mut parent = (bulk, "Bulk".to_string());
                 for index in 0..count {
+                    if count > BULK_PER_DIRECTORY && index % BULK_PER_DIRECTORY == 0 {
+                        let name = format!("d{:03}", index / BULK_PER_DIRECTORY);
+                        let directory = add(
+                            &state,
+                            repository.clone(),
+                            bulk,
+                            directory_as_staged(&name),
+                            &name,
+                        )
+                        .await;
+                        parent = (directory, format!("Bulk/{name}"));
+                    }
                     let name = format!("f{index:05}.txt");
-                    let file = added_at(&format!("Bulk/{name}"), 7);
-                    add(&state, repository.clone(), bulk, file, &name).await;
+                    let file = added_at(&format!("{}/{name}", parent.1), 7);
+                    add(&state, repository.clone(), parent.0, file, &name).await;
                 }
                 continue;
             }
@@ -3689,7 +3707,7 @@ fn merged_name(
 ///
 /// Every case of the product runs: 25 pairs of renames by 100 pairs of changes below them, 2500
 /// cases. A case that panics fails with its two sides named.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn merges_below_case_only_renames_keep_their_invariants() {
     run(|repository| async move {
         use Respelling::*;
@@ -3701,47 +3719,58 @@ async fn merges_below_case_only_renames_keep_their_invariants() {
             (Lower, Lower),
             (Lower, Upper),
         ];
-        let mut cache = Trees::default();
-        let mut failures = Vec::new();
+        // Each pair of renames runs its cases in a task of its own, with trees of its own, so that
+        // the pairs run in parallel.
+        let mut pairs = Vec::new();
         for (dir_source, dir_target) in renames {
             for (sub_source, sub_target) in renames {
-                for source_below in Below::ALL {
-                    for target_below in Below::ALL {
-                        let source = Side {
-                            dir: dir_source,
-                            sub: sub_source,
-                            below: source_below,
-                        };
-                        let target = Side {
-                            dir: dir_target,
-                            sub: sub_target,
-                            below: target_below,
-                        };
-                        let checked = std::panic::AssertUnwindSafe(check_merge_invariants(
-                            &repository,
-                            base,
-                            &mut cache,
-                            (source, target),
-                        ))
-                        .catch_unwind()
-                        .await;
-                        let failure = match checked {
-                            Ok(checked) => checked.err(),
-                            Err(panic) => Some(format!(
-                                "panics: {}",
-                                panic
-                                    .downcast_ref::<String>()
-                                    .map(String::as_str)
-                                    .or_else(|| panic.downcast_ref::<&str>().copied())
-                                    .unwrap_or_default()
-                            )),
-                        };
-                        if let Some(failure) = failure {
-                            failures.push(format!("{source:?} against {target:?}: {failure}"));
+                let repository = repository.clone();
+                pairs.push(lore_spawn!(async move {
+                    let mut cache = Trees::default();
+                    let mut failures = Vec::new();
+                    for source_below in Below::ALL {
+                        for target_below in Below::ALL {
+                            let source = Side {
+                                dir: dir_source,
+                                sub: sub_source,
+                                below: source_below,
+                            };
+                            let target = Side {
+                                dir: dir_target,
+                                sub: sub_target,
+                                below: target_below,
+                            };
+                            let checked = std::panic::AssertUnwindSafe(check_merge_invariants(
+                                &repository,
+                                base,
+                                &mut cache,
+                                (source, target),
+                            ))
+                            .catch_unwind()
+                            .await;
+                            let failure = match checked {
+                                Ok(checked) => checked.err(),
+                                Err(panic) => Some(format!(
+                                    "panics: {}",
+                                    panic
+                                        .downcast_ref::<String>()
+                                        .map(String::as_str)
+                                        .or_else(|| panic.downcast_ref::<&str>().copied())
+                                        .unwrap_or_default()
+                                )),
+                            };
+                            if let Some(failure) = failure {
+                                failures.push(format!("{source:?} against {target:?}: {failure}"));
+                            }
                         }
                     }
-                }
+                    failures
+                }));
             }
+        }
+        let mut failures = Vec::new();
+        for pair in pairs {
+            failures.extend(pair.await.expect("the cases of a pair of renames"));
         }
         assert!(
             failures.is_empty(),

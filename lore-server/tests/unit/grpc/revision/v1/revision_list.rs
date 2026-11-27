@@ -3691,7 +3691,9 @@ mod by_skipped_number {
     /// reads as missing on a server, where no remote is in reach. A walk
     /// that needs it fails the request as internal, and one that does not
     /// answers the page: never `NotFound` or another page.
-    #[tokio::test]
+    ///
+    /// The clock is paused, so the store's back-off between retries passes at once.
+    #[tokio::test(start_paused = true)]
     async fn a_state_the_store_slows_down_for_fails_only_the_walk_that_needs_it() {
         let slowed = |line: &Line, number: u64| -> Arc<dyn lore_storage::ImmutableStore> {
             let slowed = line.line[&number];

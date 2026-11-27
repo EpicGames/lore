@@ -7126,7 +7126,10 @@ mod tests {
     /// and its tree holds no node that keeps a staged or dirty mark, no file with a zero hash and
     /// a nonzero size, no directory whose address is not its children's rehash, and no file at the
     /// path a move took it from, where no unstage reached the move.
-    #[tokio::test]
+    ///
+    /// The cases run on a multi-threaded runtime, so that they run in parallel rather than one
+    /// core taking them in turn.
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_merge_commit_holds_what_the_user_made_of_the_merge() {
         let changes = [
             TableChange::None,

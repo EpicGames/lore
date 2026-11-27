@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from time import sleep
+from time import monotonic, sleep
 
 import pytest
 from cleanup_util import remove_tree, remove_tree_contents
@@ -477,6 +477,10 @@ def generate_server_config(
             "LORE__SERVER__GRPC__HOST": "127.0.0.1",
             "LORE__SERVER__GRPC_INTERNAL__HOST": "127.0.0.1",
             "LORE__SERVER__HTTP__HOST": "127.0.0.1",
+            # A test server is stopped with clients and peers still connected,
+            # so its shutdown would otherwise wait out the shipped five seconds
+            # for their connections to close before it exits.
+            "LORE__SERVER__CONNECTION_CLOSE_TIMEOUT_SECONDS": "1",
             "LORE_ENV": "gha",
         }
     )
@@ -678,7 +682,7 @@ def _kill_server_by_pid_unix(
         except (ProcessLookupError, PermissionError):
             pass
 
-    sleep(5)
+    _wait_for_group_exit(pid, timeout=5)
 
     try:
         os.killpg(pid, signal.SIGKILL)
@@ -691,6 +695,27 @@ def _kill_server_by_pid_unix(
     if log_path and log_path.exists():
         print("Server log:")
         print(log_path.read_text(encoding="utf-8", errors="ignore"))
+
+
+def _wait_for_group_exit(pid: int, timeout: float) -> None:
+    """Waits up to `timeout` seconds for the process group `pid` leads to exit.
+
+    Reaps the leader when it is this process's child, since a zombie still
+    counts as a member of its group.
+    """
+    deadline = monotonic() + timeout
+    while monotonic() < deadline:
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass  # not our child, or already reaped
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            pass
+        sleep(0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -756,7 +781,7 @@ def _check_port_free(host, port, label="", udp=False):
         probe.close()
 
 
-def _wait_for_health_check(host, port, retries=10, delay=1):
+def _wait_for_health_check(host, port, retries=100, delay=0.1):
     """Poll the server's /health_check endpoint until it responds 200.
 
     Raises ServerException if the server does not become healthy within the
@@ -790,7 +815,7 @@ def _wait_for_health_check(host, port, retries=10, delay=1):
     )
 
 
-def _wait_for_quic_port(host, port, retries=10, delay=0.5):
+def _wait_for_quic_port(host, port, retries=50, delay=0.1):
     """Poll until the QUIC (UDP) port is bound and listening.
 
     The HTTP health check can pass before the QUIC listener is ready,
@@ -798,7 +823,9 @@ def _wait_for_quic_port(host, port, retries=10, delay=0.5):
     """
     for attempt in range(retries):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(1)
+        # The ICMP reject for an unbound loopback port is already queued when
+        # recvfrom starts, so a short wait tells the two cases apart.
+        sock.settimeout(0.2)
         try:
             # Send a dummy datagram — if the port is not bound the OS
             # replies with ICMP port-unreachable, which surfaces as a
@@ -826,7 +853,7 @@ def _wait_for_quic_port(host, port, retries=10, delay=0.5):
     )
 
 
-def _wait_for_grpc_port(host, port, retries=20, delay=0.5):
+def _wait_for_grpc_port(host, port, retries=100, delay=0.1):
     """Poll until the gRPC (TCP) port accepts connections.
 
     gRPC shares the QUIC port number but listens over TCP, so it is a separate
