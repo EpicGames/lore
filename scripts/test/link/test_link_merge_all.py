@@ -16,21 +16,28 @@ from link_helpers import (
     MERGE_LINKS,
     NESTED_LINK,
     SUBTREE_LINK,
+    add_a_link,
+    assert_conflict_marked,
     assert_files_hold,
     assert_link_holds,
     assert_linked_main_merged_settings,
     assert_merge_settled,
+    assert_pinned_alike,
     build_link_chain,
     build_nested_link_repos_at,
     change_through_both_links,
+    diverge_both_mounts,
     diverge_one_repository_two_links_reach,
+    diverge_pins_of_both_mounts,
     diverged_link_branches,
     link_pin,
     link_pin_at,
     link_pins,
     link_removed_on_feature_and_changed_on_main,
+    link_row_conflicts,
     links_to_one_repository,
     make_parent_with_link,
+    mapped_links_in_mapped_links,
     make_repo,
     merge_a_branch_moving_a_link,
     merge_a_branch_removing_a_link,
@@ -40,6 +47,7 @@ from link_helpers import (
     mount_part_inside_the_second_link_on_feature,
     mounted_files,
     parent_with_a_link_merging_into_a_failure,
+    remove_link,
     repo_holding_links,
     resolve_the_conflict_inside_the_removed_link,
     resolve_the_only_conflict,
@@ -47,6 +55,7 @@ from link_helpers import (
     start_the_merge_failing_at_the_second_link,
     subtree_link_with_outside_change,
     unmount_the_part_inside_the_second_link,
+    update_link,
 )
 from lore_parsers import parse_status_json
 from test_utils import read_text, registered_links, revision_metadata_keys
@@ -3072,15 +3081,13 @@ def test_link_merge_abort_of_a_repository_two_links_reach(new_lore_repo):
     [
         ("nested", "pins"),
         ("nested", "conflict"),
-        ("subtrees", "conflict"),
     ],
 )
 def test_link_merge_all_refuses_a_repository_two_links_reach_unless_it_merges_alike(
     new_lore_repo, shape, refused
 ):
-    """A merge of a repository two links reach at different pins, or whose merge conflicts, inside
-    one mount or in each, is refused before anything is written: nothing is staged and no branch
-    moves."""
+    """A merge of a repository links in two repositories reach at different pins, or whose merge
+    conflicts, is refused before anything is written: nothing is staged and no branch moves."""
     urc, d, holders = links_to_one_repository(new_lore_repo, shape)
     first, _ = LINKS_TO_ONE_REPOSITORY[shape]
     urc.branch_create("feature")
@@ -3101,6 +3108,49 @@ def test_link_merge_all_refuses_a_repository_two_links_reach_unless_it_merges_al
     assert [
         repo.branch_info(b).remote_latest for repo in repos for b in ("main", "feature")
     ] == latests
+
+
+@pytest.mark.smoke
+def test_link_merge_all_of_a_repository_moving_from_one_mount_to_another(new_lore_repo):
+    """A merged branch replacing one of two mounts of a repository both branches changed with a
+    third mounts the merge at the two mounts left, which its repository's main takes once."""
+    urc, d, _ = links_to_one_repository(new_lore_repo, "subtrees")
+    urc.branch_create("feature")
+    urc.write_commit_push("Change d on feature", {"libs/b/d.txt": "feature\n"})
+    remove_link(urc, "libs/a")
+    add_a_link(urc, d, "c", "libs/c")
+    urc.branch_switch("main")
+    urc.write_commit_push("Change d on main", {"libs/b/main.txt": "main\n"})
+
+    urc.branch_merge_start("feature", message="Merge feature")
+    urc.push()
+
+    d.branch_switch("main")
+    assert {link_pin_at(urc, mount) for mount in ("libs/b", "libs/c")} == {
+        d.revision_info().signature
+    }
+    assert not os.path.exists(os.path.join(urc.path, "libs/a"))
+    assert_link_holds(urc.clone(), "libs/b", {"d.txt": "feature\n", "main.txt": "main\n"})
+
+
+@pytest.mark.smoke
+def test_link_merge_all_refuses_a_link_the_merged_branch_adds_on_another_branch(new_lore_repo):
+    """A link the merged branch adds to a repository two mounts pin on another branch is refused
+    before anything is written."""
+    urc, d, _ = links_to_one_repository(new_lore_repo, "subtrees")
+    urc.branch_create("feature")
+    urc.write_commit_push("Change d on feature", {"libs/a/d.txt": "feature\n"})
+    add_a_link(urc, d, "c", "libs/c", message="Link d a third time")
+    d.branch_switch("feature")
+    urc.branch_switch("main")
+    update_link(urc, "libs/a", pin=d.revision_info().signature)
+    latests = [d.branch_info(b).remote_latest for b in ("main", "feature")]
+
+    with pytest.raises(ImproperArgumentsError):
+        urc.branch_merge_start("feature", message="Merge feature")
+
+    assert parse_status_json(urc.status(json=True)) == []
+    assert [d.branch_info(b).remote_latest for b in ("main", "feature")] == latests
 
 
 @pytest.mark.smoke
@@ -3145,3 +3195,347 @@ def test_link_commit_of_one_link_to_a_repository_two_links_reach_commits_both(ne
     merged = d.revision_info()
     assert merged.merge.split()[0] == d_main
     assert [link_pin_at(urc, first), link_pin_at(urc, second)] == [merged.signature] * 2
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "conflicted, resolution",
+    [
+        (["libs/a"], "mine"),
+        (["libs/a"], "theirs"),
+        (["libs/a"], "in-place"),
+        (["libs/a", "libs/b"], "theirs"),
+    ],
+    ids=["mine", "theirs", "in-place", "both-mounts"],
+)
+def test_link_merge_all_conflict_in_a_repository_two_mounts_reach(
+    new_lore_repo, conflicted, resolution
+):
+    """A repository two mounts in one repository reach, whose merge conflicts, is merged once:
+    each conflict is marked at the mount that holds it, every resolve keeps both mounts at one
+    pin, and the commit gives one merge revision of the repository, which both mounts pin, in a
+    clone too. A second merge leaves it as it is."""
+    shape = "subtrees"
+    urc, d, _ = links_to_one_repository(new_lore_repo, shape)
+    first, second = LINKS_TO_ONE_REPOSITORY[shape]
+    paths = diverge_both_mounts(urc, conflicted)
+    d_main = d.branch_info("main").remote_latest
+
+    urc.branch_merge_start("feature", message="Merge feature")
+    assert urc.unresolved_paths() == set(paths)
+    for path in paths:
+        assert_conflict_marked(urc, path)
+    assert_pinned_alike(urc)
+
+    if resolution == "in-place":
+        urc.write_files(dict.fromkeys(paths, "resolved\n"))
+        urc.branch_merge_resolve(".")
+    else:
+        getattr(urc, f"branch_merge_resolve_{resolution}")(paths)
+    assert urc.unresolved_paths() == set()
+    assert_pinned_alike(urc)
+    urc.commit("Merge feature")
+    urc.push()
+
+    d.branch_switch("main")
+    merged = d.revision_info()
+    assert merged.merge.split()[0] == d_main
+    assert assert_pinned_alike(urc) == merged.signature
+    resolved = {"mine": "main\n", "theirs": "feature\n", "in-place": "resolved\n"}[
+        resolution
+    ]
+    holds = {
+        first: {"d.txt": resolved, "feature.txt": "feature\n"},
+        second: {"d.txt": resolved if second in conflicted else "base\n"},
+    }
+    for repo in [urc, urc.clone()]:
+        for mount, files in holds.items():
+            assert_link_holds(repo, mount, files)
+    urc.branch_merge_start("feature", message="Merge feature again")
+    assert d.branch_info("main").remote_latest == merged.signature
+    assert assert_pinned_alike(urc) == merged.signature
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "abort_link", [None, "libs/a", "libs/b"], ids=["all", "conflicted-link", "other-link"]
+)
+def test_link_merge_abort_and_resume_of_a_conflict_in_a_repository_two_mounts_reach(
+    new_lore_repo, abort_link
+):
+    """An abort of a merge whose repository, reached by two mounts, conflicts restores both
+    mounts' pins and contents, aborting all or through either mount. A merge started again and
+    resolved keeps both mounts at one pin."""
+    shape = "subtrees"
+    urc, _, _ = links_to_one_repository(new_lore_repo, shape)
+    first, second = LINKS_TO_ONE_REPOSITORY[shape]
+    paths = diverge_both_mounts(urc, [first])
+    pins = [link_pin_at(urc, mount) for mount in (first, second)]
+
+    urc.branch_merge_start("feature", message="Merge feature")
+    urc.branch_merge_abort(link=abort_link)
+
+    assert [link_pin_at(urc, mount) for mount in (first, second)] == pins
+    assert_link_holds(urc, first, {"d.txt": "main\n"})
+    assert_link_holds(urc, second, {"d.txt": "base\n"})
+
+    urc.branch_merge_start("feature", message="Merge feature")
+    urc.branch_merge_resolve_theirs(paths)
+    assert assert_pinned_alike(urc) not in pins
+    urc.commit("Merge feature")
+    assert_link_holds(urc, first, {"d.txt": "feature\n", "feature.txt": "feature\n"})
+
+
+@pytest.mark.smoke
+def test_link_merge_link_of_a_repository_two_mounts_reach(new_lore_repo):
+    """A merge through one of two mounts of a repository merges it once for both, which pin the
+    merge, and a merge of every link afterwards leaves it as it is."""
+    shape = "subtrees"
+    urc, d, _ = links_to_one_repository(new_lore_repo, shape)
+    first, second = LINKS_TO_ONE_REPOSITORY[shape]
+    paths = diverge_both_mounts(urc, [first])
+
+    urc.branch_merge_start("feature", message="Merge feature", link=first)
+    assert urc.unresolved_paths() == set(paths)
+    assert_pinned_alike(urc)
+    urc.branch_merge_resolve_theirs(paths)
+    urc.commit("Merge d", link=second)
+    urc.commit("Pin the merge of d")
+    urc.push()
+
+    d.branch_switch("main")
+    merged = d.revision_info()
+    assert assert_pinned_alike(urc) == merged.signature
+    urc.branch_merge_start("feature", message="Merge feature")
+    assert d.branch_info("main").remote_latest == merged.signature
+    assert assert_pinned_alike(urc) == merged.signature
+
+
+@pytest.mark.smoke
+def test_link_merge_all_commit_link_of_one_of_two_mounts_of_a_conflicting_repository(
+    new_lore_repo,
+):
+    """A commit through one mount of a repository two mounts reach, whose merge conflicted, while
+    the merge of every link goes on, commits the merge once, which both mounts pin, and the
+    merge's commit keeps."""
+    urc, d, _ = links_to_one_repository(new_lore_repo, "subtrees")
+    first, second = LINKS_TO_ONE_REPOSITORY["subtrees"]
+    paths = diverge_both_mounts(urc, [first])
+
+    urc.branch_merge_start("feature", message="Merge feature")
+    urc.branch_merge_resolve_theirs(paths)
+    urc.commit("Merge d", link=second)
+    committed = assert_pinned_alike(urc)
+    urc.commit("Merge feature")
+    urc.push()
+
+    d.branch_switch("main")
+    assert assert_pinned_alike(urc) == committed == d.revision_info().signature
+    assert_link_holds(urc.clone(), first, {"d.txt": "feature\n", "feature.txt": "feature\n"})
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("second_on_main", [False, True], ids=["both-branches", "added-on-main"])
+def test_link_merge_all_pin_conflict_of_a_repository_two_mounts_reach(
+    new_lore_repo, second_on_main
+):
+    """Both branches moving the pin of a fixed repository two mounts reach list a link conflict at
+    each mount, the one main adds too, which one resolve through either mount settles for both,
+    and the commit pins both at the side it took."""
+    urc, pins = diverge_pins_of_both_mounts(new_lore_repo, second_on_main)
+    first, second = LINKS_TO_ONE_REPOSITORY["subtrees"]
+
+    urc.branch_merge_start("feature", message="Merge feature")
+    assert sorted(link_row_conflicts(urc)) == [first, second]
+    urc.branch_merge_resolve_theirs(second)
+    assert assert_pinned_alike(urc) == pins["three"]
+    urc.commit("Merge feature")
+    urc.push()
+
+    assert assert_pinned_alike(urc.clone()) == pins["three"]
+    assert_link_holds(urc, first, {"d.txt": "three\n"})
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("through", LINKS_TO_ONE_REPOSITORY["subtrees"])
+def test_link_merge_abort_link_of_a_pin_conflict_of_a_repository_two_mounts_reach(
+    new_lore_repo, through
+):
+    """An abort through either mount of a fixed repository whose pin both branches moved settles
+    the link conflict at both mounts, which keep the pin they had."""
+    urc, pins = diverge_pins_of_both_mounts(new_lore_repo)
+
+    urc.branch_merge_start("feature", message="Merge feature")
+    urc.branch_merge_abort(link=through)
+
+    assert link_row_conflicts(urc) == []
+    assert assert_pinned_alike(urc) == pins["two"]
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("abort", [False, True], ids=["commit", "abort-link"])
+def test_link_merge_all_of_a_repository_two_mounts_reach_adding_a_third(new_lore_repo, abort):
+    """A link the merged branch adds to a repository two mounts reach, while that repository
+    merges, lands at the merge both mounts pin, which its repository's main takes once. An abort
+    through one mount rolls all three back to the pin the mounts had."""
+    shape = "subtrees"
+    urc, d, _ = links_to_one_repository(new_lore_repo, shape)
+    diverge_one_repository_two_links_reach(urc, shape)
+    urc.branch_switch("feature")
+    add_a_link(urc, d, "c", "libs/c", message="Link d a third time")
+    urc.branch_switch("main")
+    pinned = link_pin_at(urc, "libs/a")
+
+    urc.branch_merge_start("feature", message="Merge feature", no_commit=True)
+    staged = {link_pin_at(urc, mount) for mount in ("libs/a", "libs/b", "libs/c")}
+    assert len(staged) == 1
+    if abort:
+        urc.branch_merge_abort(link="libs/a")
+        assert {link_pin_at(urc, mount) for mount in ("libs/a", "libs/b", "libs/c")} == {
+            pinned
+        }
+        return
+    urc.commit("Merge feature")
+    urc.push()
+
+    d.branch_switch("main")
+    merged = d.revision_info()
+    assert {link_pin_at(urc, mount) for mount in ("libs/a", "libs/b", "libs/c")} == {
+        merged.signature
+    }
+    assert_link_holds(urc.clone(), "libs/c", {"d.txt": "base\n"})
+
+
+@pytest.mark.smoke
+def test_link_merge_all_of_an_unchanged_repository_two_mounts_reach_adding_a_third(
+    new_lore_repo,
+):
+    """A link the merged branch adds to a repository two mounts reach, which neither branch
+    changed, lands at the pin the mounts keep."""
+    urc, d, _ = links_to_one_repository(new_lore_repo, "subtrees")
+    pinned = link_pin_at(urc, "libs/a")
+    urc.branch_create("feature")
+    add_a_link(urc, d, "c", "libs/c", message="Link d a third time")
+    urc.branch_switch("main")
+    urc.write_commit_push("Change urc on main", {"main.txt": "main\n"})
+
+    urc.branch_merge_start("feature", message="Merge feature")
+    urc.push()
+
+    assert {link_pin_at(urc, mount) for mount in ("libs/a", "libs/b", "libs/c")} == {pinned}
+    assert_link_holds(urc.clone(), "libs/c", {"d.txt": "base\n"})
+
+
+@pytest.mark.smoke
+def test_link_merge_all_conflict_in_mapped_links_of_a_mapped_link(new_lore_repo):
+    """A repository two mounts of a repository itself mounted twice reach is merged once: each
+    conflict is marked at the mount that holds it, one resolve settles both, and the commit pins
+    the merge at both of its rows and the merge of the repository holding them at both of its
+    own, in a clone too."""
+    urc, n, pn = mapped_links_in_mapped_links(new_lore_repo)
+    paths = ["n1/pn/pn.txt", "n2/pn/pn.txt"]
+    urc.branch_create("feature")
+    urc.write_commit_push("Change pn on feature", dict.fromkeys(paths, "feature\n"))
+    urc.branch_switch("main")
+    urc.write_commit_push("Change pn on main", dict.fromkeys(paths, "main\n"))
+
+    urc.branch_merge_start("feature", message="Merge feature")
+    assert urc.unresolved_paths() == set(paths)
+    urc.write_files(dict.fromkeys(paths, "resolved\n"))
+    urc.branch_merge_resolve(".")
+    assert urc.unresolved_paths() == set()
+    urc.commit("Merge feature")
+    urc.push()
+
+    n.branch_switch("main")
+    pn.branch_switch("main")
+    assert {link_pin_at(urc, mount) for mount in ("n1", "n2")} == {n.revision_info().signature}
+    assert {link_pin_at(n, mount) for mount in ("f1/pn", "f2/pn")} == {
+        pn.revision_info().signature
+    }
+    assert len(pn.revision_info().merge.split()) == 2
+    for mount in ("n1/pn", "n2/pn"):
+        assert_link_holds(urc.clone(), mount, {"pn.txt": "resolved\n"})
+
+
+@pytest.mark.smoke
+def test_link_merge_link_through_a_repository_mounted_twice_is_refused(new_lore_repo):
+    """A merge of a link alone through a repository mounted twice, which would repin one of its
+    mounts, is refused before anything is written, and the merge of every link merges it."""
+    urc, _, pn = mapped_links_in_mapped_links(new_lore_repo)
+    urc.branch_create("feature")
+    urc.write_commit_push("Change pn on feature", {"n1/pn/pn.txt": "feature\n"})
+    urc.branch_switch("main")
+    urc.write_commit_push("Change pn on main", {"n2/pn/pn.txt": "main\n"})
+
+    with pytest.raises(NotSupportedError):
+        urc.branch_merge_start("feature", message="Merge feature", link="n1/pn")
+    assert parse_status_json(urc.status(json=True)) == []
+
+    urc.branch_merge_start("feature", message="Merge feature")
+    urc.push()
+    pn.branch_switch("main")
+    assert len(pn.revision_info().merge.split()) == 2
+    assert_link_holds(urc, "n1/pn", {"pn.txt": "feature\n"})
+    assert_link_holds(urc, "n2/pn", {"pn.txt": "main\n"})
+
+
+@pytest.mark.smoke
+def test_link_merge_all_refuses_a_conflicting_repository_another_holder_brings_in(
+    new_lore_repo,
+):
+    """A link the merged branch adds to a repository a link in another repository reaches, whose
+    merge conflicts, is refused before anything is written."""
+    d = make_repo(new_lore_repo, {"d.txt": "base\n"})
+    holder = make_repo(new_lore_repo, {"holder.txt": "base\n"})
+    urc = make_repo(new_lore_repo, {"a.txt": "base\n"})
+    add_a_link(urc, holder, link_path="vendor/h")
+    add_a_link(urc, d, link_path="vendor/h/deps/d")
+    urc.branch_create("feature")
+    urc.write_commit_push("Change d on feature", {"vendor/h/deps/d/d.txt": "feature\n"})
+    add_a_link(urc, d, link_path="libs/d", pin=link_pin_at(urc, "vendor/h/deps/d"))
+    urc.branch_switch("main")
+    urc.write_commit_push("Change d on main", {"vendor/h/deps/d/d.txt": "main\n"})
+    latests = [
+        repo.branch_info(b).remote_latest
+        for repo in (d, holder)
+        for b in ("main", "feature")
+    ]
+
+    with pytest.raises(NotSupportedError):
+        urc.branch_merge_start("feature", message="Merge feature")
+
+    assert parse_status_json(urc.status(json=True)) == []
+    assert [
+        repo.branch_info(b).remote_latest
+        for repo in (d, holder)
+        for b in ("main", "feature")
+    ] == latests
+
+
+@pytest.mark.smoke
+def test_link_merge_all_pin_conflict_in_mapped_links_of_a_mapped_link(new_lore_repo):
+    """Both branches moving the pin of a fixed repository mounted twice inside a repository itself
+    mounted twice list a link conflict at each mount, which one resolve through either mount
+    settles for both rows, realized at both mounts."""
+    urc, n, pn = mapped_links_in_mapped_links(new_lore_repo, fixed=True)
+    pins = {}
+    for content in ("two", "three"):
+        pn.write_commit_push(content, {"x/pn.txt": f"{content}\n", "y/pn.txt": f"{content}\n"})
+        pins[content] = pn.branch_info().local_latest
+    urc.branch_create("feature")
+    update_link(urc, "n1/pn", pin=pins["three"])
+    urc.branch_switch("main")
+    update_link(urc, "n1/pn", pin=pins["two"])
+
+    started = urc.branch_merge_start("feature", message="Merge feature")
+    assert "Link conflict: n1/pn" in started and "Link conflict: n2/pn" in started
+    assert sorted(link_row_conflicts(urc)) == ["n1/pn", "n2/pn"]
+    urc.branch_merge_resolve_theirs("n1/pn")
+    for mount in ("n1/pn", "n2/pn"):
+        assert_link_holds(urc, mount, {"pn.txt": "three\n"})
+    urc.commit("Merge feature")
+    urc.push()
+
+    n.branch_switch("main")
+    assert {link_pin_at(n, mount) for mount in ("f1/pn", "f2/pn")} == {pins["three"]}

@@ -3673,9 +3673,22 @@ pub struct PlannedLinkPin {
     incoming: LinkReference,
     /// The path the merged branch mounts and its node at the pin the link lands on, for a remount.
     remount: Option<(RelativePath, NodeID)>,
+    /// The merged branch's row as this branch would store it, with the node it mounts.
+    source: (LinkReference, NodeID),
 }
 
 impl PlannedLinkPin {
+    /// The row left to the user, as a sibling row of its repository is.
+    fn into_conflict(self) -> LinkPinConflict {
+        LinkPinConflict {
+            link_path: self.link_path,
+            source: self.source.0,
+            source_mount: self.source.1,
+            target: self.target,
+            target_mount: self.link_node.child,
+        }
+    }
+
     /// Where the link's mount lands at the pin it moves to.
     fn mount_source(&self) -> LinkMountSource {
         match &self.remount {
@@ -4193,13 +4206,92 @@ async fn classify_link_pins_except(
     .await?;
 
     let mut classification = LinkPinClassification::default();
-    for class in classes.into_iter().flatten() {
+    let mut unchanged = Vec::new();
+    for (link_reference, class) in link_list.iter().zip(classes) {
         match class {
-            LinkPinClass::Planned(planned) => classification.planned.push(planned),
-            LinkPinClass::Conflict(conflict) => classification.conflicts.push(conflict),
+            Some(LinkPinClass::Planned(planned)) => classification.planned.push(planned),
+            Some(LinkPinClass::Conflict(conflict)) => classification.conflicts.push(conflict),
+            None => unchanged.push(link_reference),
         }
     }
+    // One pin holds every link of a repository, so a row carried or kept beside a sibling left to
+    // the user is left to the user with it.
+    let conflicted: HashMap<RepositoryId, Hash> = classification
+        .conflicts
+        .iter()
+        .map(|conflict| (conflict.target.repository, conflict.source.signature))
+        .collect();
+    if conflicted.is_empty() {
+        return Ok(classification);
+    }
+    let (siblings, planned) = std::mem::take(&mut classification.planned)
+        .into_iter()
+        .partition(|planned| conflicted.contains_key(&planned.target.repository));
+    classification.planned = planned;
+    classification
+        .conflicts
+        .extend(siblings.into_iter().map(PlannedLinkPin::into_conflict));
+    let kept = try_join_links(
+        unchanged
+            .into_iter()
+            .filter_map(|link_reference| {
+                let pin = *conflicted.get(&link_reference.repository)?;
+                Some(kept_beside_a_conflict(
+                    &repository,
+                    state_staged,
+                    link_reference,
+                    pin,
+                ))
+            })
+            .collect(),
+    )
+    .await?;
+    classification.conflicts.extend(kept.into_iter().flatten());
     Ok(classification)
+}
+
+/// The row `link_reference` keeps beside a conflicting row of its repository whose merged branch
+/// pins `source_pin`, as the conflict between the two, or `None` where it pins that already or
+/// `source_pin` lacks the subtree it mounts.
+async fn kept_beside_a_conflict(
+    repository: &Arc<RepositoryContext>,
+    state_staged: &Arc<State>,
+    link_reference: &LinkReference,
+    source_pin: Hash,
+) -> Result<Option<LinkPinConflict>, LinkError> {
+    let (link_path, link_node) = tokio::try_join!(
+        state_staged.node_path(repository.clone(), link_reference.local_node),
+        state_staged.node(repository.clone(), link_reference.local_node),
+    )
+    .forward::<LinkError>("Failed resolving link node")?;
+    let target = link_reference.with_signature(link_node.address.hash);
+    if target.signature == source_pin {
+        return Ok(None);
+    }
+    let link_context = repository.to_link_context(link_reference.repository).await;
+    let (state_target, state_source) = tokio::try_join!(
+        State::deserialize(link_context.clone(), target.signature),
+        State::deserialize(link_context.clone(), source_pin),
+    )
+    .forward::<LinkError>("Failed deserializing state")?;
+    let mount = link_source_path(link_context.clone(), &state_target, link_node.child)
+        .await
+        .forward::<LinkError>("Failed resolving the subtree a link exposes")?;
+    let Some(source_mount) = state_source
+        .locate_node(link_context, mount.as_str())
+        .await
+        .ok()
+        .and_then(|found| found.own_node())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(LinkPinConflict {
+        link_path,
+        source: target.with_signature(source_pin),
+        source_mount,
+        target,
+        target_mount: link_node.child,
+    }))
 }
 
 /// [`classify_link_pins`] for one link.
@@ -4449,6 +4541,7 @@ async fn classify_link_pin(
         target,
         incoming: if adopt_row { carried } else { target },
         remount,
+        source: (carried, incoming_node.child),
     })))
 }
 
@@ -4468,6 +4561,7 @@ pub async fn apply_link_pins(
             target,
             incoming,
             remount,
+            ..
         } = planned_pin;
 
         let link_context = repository

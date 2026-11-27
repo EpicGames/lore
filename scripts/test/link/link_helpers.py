@@ -957,7 +957,9 @@ def links_to_one_repository(new_lore_repo, shape: str) -> tuple[Lore, Lore, list
     subtrees = shape == "subtrees"
     d = make_repo(
         new_lore_repo,
-        {"a/d.txt": "base\n", "b/d.txt": "base\n"} if subtrees else {"d.txt": "base\n"},
+        {"a/d.txt": "base\n", "b/d.txt": "base\n", "c/d.txt": "base\n"}
+        if subtrees
+        else {"d.txt": "base\n"},
     )
     urc = make_repo(new_lore_repo, {"a.txt": "base\n"})
     holders = []
@@ -973,6 +975,27 @@ def links_to_one_repository(new_lore_repo, shape: str) -> tuple[Lore, Lore, list
     urc.commit("Link d twice")
     urc.push()
     return urc, d, holders
+
+
+def mapped_links_in_mapped_links(
+    new_lore_repo, fixed: bool = False
+) -> tuple[Lore, Lore, Lore]:
+    """Returns (urc, n, pn): `urc` links `n` at `n1`, exposing `f1`, and at `n2`, exposing `f2`,
+    and `n` links `pn` at `f1/pn`, exposing `x`, and at `f2/pn`, exposing `y`, branching disabled
+    where `fixed`, so the working tree holds `pn.txt` of each of `pn`'s folders at `n1/pn` and
+    `n2/pn`."""
+    pn = make_repo(new_lore_repo, {"x/pn.txt": "base\n", "y/pn.txt": "base\n"})
+    n = make_repo(new_lore_repo, {"f1/n.txt": "base\n", "f2/n.txt": "base\n"})
+    for folder, source in (("f1", "x"), ("f2", "y")):
+        n.link_add(f"{folder}/pn", pn.get_id(), source, disable_branching=fixed)
+    n.commit("Link pn twice")
+    n.push()
+    urc = make_repo(new_lore_repo, {"a.txt": "base\n"})
+    for mount, source in (("n1", "f1"), ("n2", "f2")):
+        urc.link_add(mount, n.get_id(), source)
+    urc.commit("Link n twice")
+    urc.push()
+    return urc, n, pn
 
 
 def change_through_both_links(urc: Lore, shape: str, files: dict[str, str]):
@@ -1000,6 +1023,53 @@ def diverge_one_repository_two_links_reach(urc, shape: str, a_conflict: bool = F
     change_through_both_links(urc, shape, {"main.txt": "main\n"})
     if a_conflict:
         urc.write_commit_push("Main changes a", {"a.txt": "main\n"})
+
+
+def diverge_both_mounts(urc: Lore, conflicted: list[str]) -> list[str]:
+    """Changes `d.txt` under each of `conflicted`, mounts of the "subtrees" shape, differently on
+    `feature` and on main, and `feature.txt` under the first mount on `feature`, leaving main
+    checked out. Returns the conflicted paths."""
+    first, _ = LINKS_TO_ONE_REPOSITORY["subtrees"]
+    urc.branch_create("feature")
+    urc.write_commit_push(
+        "Change d on feature",
+        {f"{first}/feature.txt": "feature\n"}
+        | {f"{mount}/d.txt": "feature\n" for mount in conflicted},
+    )
+    urc.branch_switch("main")
+    urc.write_commit_push(
+        "Change d on main", {f"{mount}/d.txt": "main\n" for mount in conflicted}
+    )
+    return [f"{mount}/d.txt" for mount in conflicted]
+
+
+def assert_pinned_alike(urc: Lore) -> str:
+    """Both mounts of the "subtrees" shape pin one revision, which is returned."""
+    pins = {link_pin_at(urc, mount) for mount in LINKS_TO_ONE_REPOSITORY["subtrees"]}
+    assert len(pins) == 1, f"the mounts must pin one revision, got {pins}"
+    return pins.pop()
+
+
+def diverge_pins_of_both_mounts(new_lore_repo, second_on_main: bool = False) -> tuple[Lore, dict]:
+    """Returns (urc, pins): `urc` links a fixed repository at both mounts of the "subtrees" shape,
+    pinned at `pins["three"]` on `feature` and at `pins["two"]` on main, which adds the second
+    mount where `second_on_main`, leaving main checked out."""
+    d = make_repo(new_lore_repo, {"a/d.txt": "one\n", "b/d.txt": "one\n"})
+    urc = make_repo(new_lore_repo, {"a.txt": "base\n"})
+    first, second = LINKS_TO_ONE_REPOSITORY["subtrees"]
+    for mount in (first,) if second_on_main else (first, second):
+        add_a_link(urc, d, mount.rsplit("/", 1)[1], mount, disable_branching=True)
+    pins = {}
+    for content in ("two", "three"):
+        d.write_commit_push(content, {"a/d.txt": f"{content}\n"})
+        pins[content] = d.branch_info().local_latest
+    urc.branch_create("feature")
+    update_link(urc, first, pin=pins["three"])
+    urc.branch_switch("main")
+    update_link(urc, first, pin=pins["two"])
+    if second_on_main:
+        add_a_link(urc, d, "b", second, pin=pins["two"], disable_branching=True)
+    return urc, pins
 
 
 SAME_SIZE_LINK_FILES = {

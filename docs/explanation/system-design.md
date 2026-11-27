@@ -2708,9 +2708,11 @@ linked repository treats the links that repository holds by the same rules, so a
 nested links up to the link depth limit of 8, and the link holding them pins the result. A link
 back to a repository the merge is already inside is left out. A repository several links reach
 is merged once, and every one of them pins the result. That needs the links to pin it at one
-revision on one branch, and its merge to be free of conflicts; otherwise the merge is refused
-before it writes anything. A link the merged branch adds to such a repository is still merged on
-its own. A commit commits a staged linked revision once for all the links pinning it, which
+revision on one branch, and, where links held by different repositories reach it, its merge to be
+free of conflicts; otherwise the merge is refused before it writes anything. Each conflict is
+marked at every mount exposing it, and a resolve through any mount settles the state every mount
+pinning the merge shares, and repins them all. A link the merged branch adds to such a repository
+lands at its merge. A commit commits a staged linked revision once for all the links pinning it, which
 therefore take one per-link message, reading the working tree under every mount of it the
 repository holding them has. Before it writes anything, it refuses two staged revisions of one
 repository on one branch, and changes made in the working tree under links to one repository that
@@ -2751,7 +2753,9 @@ repositories that have changes. Two operations are scoped to a single link:
   the links above it stay staged. `commit --link` of a link commits it and each repository on
   the way to it whole, the merges they hold included, and an abort of the link after it leaves the pin the
   commit made. A merge of links alone ends with its last link, aborted or committed, and
-  leaves the parent's own staged changes in place.
+  leaves the parent's own staged changes in place. The other mounts of the link's repository
+  in the repository holding it take the same merge, abort and commit. A link reached through a
+  repository mounted several times is refused, and the merge of every link handles it.
 
 Both operations exist because the cascading default isn't always what the user wants.
 Working on a single linked repository at a time, with the parent quiet, matches the

@@ -1757,10 +1757,11 @@ async fn repin_mounts_of_committed(
 }
 
 /// Settles the link merge rows `state_staged` keeps for the link `local_node`, linking
-/// `link_repository`, whose merge a link's commit committed: an abort is to leave the pin the
-/// commit made. Where the main repository is merged, whose abort but for the links restages each
-/// link with a row, one row rolls the link back to that pin. Otherwise the rows go, and a merge
-/// of links alone ends with its last row, which it says.
+/// `link_repository`, and for the other links to that repository one merge pinned, whose merge a
+/// link's commit committed: an abort is to leave the pin the commit made. Where the main
+/// repository is merged, whose abort but for the links restages each link with a row, one row
+/// rolls each link back to that pin. Otherwise the rows go, and a merge of links alone ends with
+/// its last row, which it says.
 async fn settle_committed_link_rows(
     repository: &Arc<RepositoryContext>,
     state_staged: &State,
@@ -1770,20 +1771,33 @@ async fn settle_committed_link_rows(
         .deserialize_link_merge_state(repository.clone())
         .await
         .forward::<CommitError>("Failed to deserialize link merge state")?;
+    let committed_by = |row: &LinkMergeEntry| {
+        row.local_node == local_node
+            || (!row.is_conflict() && row.base.repository == link_repository)
+    };
     let mut remaining: Vec<_> = rows
         .iter()
-        .filter(|row| row.local_node != local_node)
+        .filter(|row| !committed_by(row))
         .copied()
         .collect();
     if remaining.len() == rows.len() {
         return Ok(false);
     }
     if !state_staged.parent_other().is_zero() {
-        let committed = state_staged
-            .link_find(repository.clone(), link_repository, local_node)
-            .await
-            .forward::<CommitError>("Failed to read the committed link's row")?;
-        remaining.push(LinkMergeEntry::rollback(committed));
+        let mut committed_nodes: Vec<NodeID> = rows
+            .iter()
+            .filter(|row| committed_by(row))
+            .map(|row| row.local_node)
+            .collect();
+        committed_nodes.sort_unstable();
+        committed_nodes.dedup();
+        for node in committed_nodes {
+            let committed = state_staged
+                .link_find(repository.clone(), link_repository, node)
+                .await
+                .forward::<CommitError>("Failed to read the committed link's row")?;
+            remaining.push(LinkMergeEntry::rollback(committed));
+        }
     }
     state_staged
         .serialize_link_merge_state(repository.clone(), &remaining)

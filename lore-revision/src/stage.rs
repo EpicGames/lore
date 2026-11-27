@@ -5894,6 +5894,8 @@ async fn emit_named_path_ignore(named: Option<&LoreString>) {
 
 /// A file a resolve restores inside a linked repository.
 struct LinkFile {
+    /// The index of the mount holding it among its group's.
+    mount: usize,
     /// The path from the parent's root.
     user: RelativePath,
     below_mount: RelativePath,
@@ -5903,15 +5905,11 @@ struct LinkFile {
     target: NodeID,
 }
 
-/// The files a resolve restores inside one linked repository, from one of the link's merge
-/// parents (Mine = `parent_self`, Theirs = `parent_other`).
+/// The files a resolve restores inside one linked repository, which every mount pinning its merge
+/// shares, from one of the merge's parents (Mine = `parent_self`, Theirs = `parent_other`).
 struct LinkGroup {
-    local_node: NodeID,
     link_context: Arc<RepositoryContext>,
-    link_path_rel: RelativePath,
-    /// The node of `link_state_staged` mounted at `link_path_rel`.
-    mounted: NodeID,
-    source_path: RelativePath,
+    mounts: Vec<LinkGroupMount>,
     link_state_staged: Arc<State>,
     link_state_target: Arc<State>,
     link_state_current: Arc<State>,
@@ -5919,17 +5917,27 @@ struct LinkGroup {
     link_branch: BranchId,
 }
 
-/// Whether the link mounted at `mount` inside `group`'s link, mounting `node_link`, was merged with
-/// it and holds something its merge left to resolve.
+/// A mount of a [`LinkGroup`]'s linked repository.
+struct LinkGroupMount {
+    local_node: NodeID,
+    link_path_rel: RelativePath,
+    /// The node of the group's staged state mounted at `link_path_rel`.
+    mounted: NodeID,
+    source_path: RelativePath,
+}
+
+/// Whether the link mounted at `mount` inside `group`'s link, which `group_mount` mounts, mounting
+/// `node_link`, was merged with it and holds something its merge left to resolve.
 async fn nested_link_holds_a_merge(
     group: &LinkGroup,
+    group_mount: &LinkGroupMount,
     mount: &RelativePath,
     node_link: NodeLink,
 ) -> Result<bool, StageError> {
-    let Some(below) = mount.below(&group.link_path_rel) else {
+    let Some(below) = mount.below(&group_mount.link_path_rel) else {
         return Ok(false);
     };
-    let in_link = group.source_path.join(below);
+    let in_link = group_mount.source_path.join(below);
     let Some((local_node, link_node)) = crate::link::link_node_to(
         &group.link_state_staged,
         &group.link_context,
@@ -5977,8 +5985,9 @@ async fn nested_link_holds_a_merge(
     Ok(!unresolved.files.is_empty())
 }
 
-/// Groups `paths`, which lie inside linked repositories, by link, and checks each against
-/// `refusal` without staging anything. A link the merge did not merge holds nothing to resolve.
+/// Groups `paths`, which lie inside linked repositories, by linked repository and the revision its
+/// mounts pin, and checks each against `refusal` without staging anything. A link the merge did
+/// not merge holds nothing to resolve.
 async fn collect_link_groups(
     repository: &Arc<RepositoryContext>,
     state: &Arc<State>,
@@ -6023,18 +6032,26 @@ async fn collect_link_groups(
             continue;
         };
 
-        let group_index = groups
-            .iter()
-            .position(|g| g.local_node == link_ref.local_node);
+        let group_index = groups.iter().position(|g| {
+            g.link_context.id == link_ref.repository
+                && g.link_state_staged.revision() == link_ref.signature
+        });
+        let entering = group_index.is_none_or(|idx| {
+            !groups[idx]
+                .mounts
+                .iter()
+                .any(|m| m.local_node == link_ref.local_node)
+        });
+        if entering
+            && let Some(refused) = refusal
+                .entering_link(link_ref.local_node as NodeID, mount)
+                .await?
+        {
+            return Err(refused.into());
+        }
         let group = if let Some(idx) = group_index {
             &mut groups[idx]
         } else {
-            if let Some(refused) = refusal
-                .entering_link(link_ref.local_node as NodeID, mount)
-                .await?
-            {
-                return Err(refused.into());
-            }
             if !merged {
                 emit_named_path_ignore(named.as_ref()).await;
                 lore_debug!("Ignoring path, the link holding it is not merged: {relative_path}");
@@ -6056,15 +6073,10 @@ async fn collect_link_groups(
                     link_state_staged.parent_other()
                 }
             };
-            let mounted = state
-                .node(repository.clone(), link_ref.local_node)
-                .await
-                .forward::<StageError>("Failed to load the link node")?
-                .child;
             // `link_state_current` is approximated by `parent_self` — only
             // used for `determine_merge_action` so a precise distinction
             // (an actual pre-merge HEAD) isn't needed.
-            let (link_state_target, link_state_current, source_path) = tokio::try_join!(
+            let (link_state_target, link_state_current) = tokio::try_join!(
                 async {
                     state::State::deserialize(link_context.clone(), target_hash)
                         .await
@@ -6075,19 +6087,11 @@ async fn collect_link_groups(
                         .await
                         .forward::<StageError>("Failed to deserialize link current state")
                 },
-                async {
-                    crate::link::link_source_path(link_context.clone(), &link_state_staged, mounted)
-                        .await
-                        .forward::<StageError>("Failed to resolve the link source path")
-                },
             )?;
 
             groups.push(LinkGroup {
-                local_node: link_ref.local_node,
                 link_context,
-                link_path_rel: mount.clone(),
-                mounted,
-                source_path,
+                mounts: Vec::new(),
                 link_state_staged,
                 link_state_target,
                 link_state_current,
@@ -6096,10 +6100,39 @@ async fn collect_link_groups(
             });
             groups.last_mut().expect("just pushed")
         };
+        let mount_index = if let Some(index) = group
+            .mounts
+            .iter()
+            .position(|m| m.local_node == link_ref.local_node)
+        {
+            index
+        } else {
+            let mounted = state
+                .node(repository.clone(), link_ref.local_node)
+                .await
+                .forward::<StageError>("Failed to load the link node")?
+                .child;
+            let source_path = crate::link::link_source_path(
+                group.link_context.clone(),
+                &group.link_state_staged,
+                mounted,
+            )
+            .await
+            .forward::<StageError>("Failed to resolve the link source path")?;
+            group.mounts.push(LinkGroupMount {
+                local_node: link_ref.local_node,
+                link_path_rel: mount.clone(),
+                mounted,
+                source_path,
+            });
+            group.mounts.len() - 1
+        };
+        let group_mount = &group.mounts[mount_index];
 
         let in_group = |user: RelativePath| {
-            let below_mount = RelativePath::from_str(user.below(&group.link_path_rel)?).ok()?;
-            let in_link = group.source_path.join(below_mount.as_str());
+            let below_mount =
+                RelativePath::from_str(user.below(&group_mount.link_path_rel)?).ok()?;
+            let in_link = group_mount.source_path.join(below_mount.as_str());
             Some((user, below_mount, in_link))
         };
         let Some((user, below_mount, in_link)) = in_group(relative_path) else {
@@ -6145,7 +6178,7 @@ async fn collect_link_groups(
             )
             .await?;
             for (nested, node_link) in collected.links {
-                if nested_link_holds_a_merge(group, &nested, node_link).await? {
+                if nested_link_holds_a_merge(group, group_mount, &nested, node_link).await? {
                     return Err(resolve_inside_nested_link(&nested));
                 }
             }
@@ -6177,6 +6210,7 @@ async fn collect_link_groups(
                 }
             }
             group.files.push(LinkFile {
+                mount: mount_index,
                 user,
                 below_mount,
                 in_link,
@@ -6196,7 +6230,7 @@ fn resolve_inside_nested_link(path: &RelativePath) -> StageError {
 }
 
 /// Stages the files of `groups` from the merge parent `merge_parent` names, then re-serializes
-/// each link's state and updates the parent's pin via `link::update_link_pin_by_path`.
+/// each group's state once and pins every mount that pinned it at the result.
 async fn stage_link_groups(
     operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
@@ -6213,6 +6247,7 @@ async fn stage_link_groups(
 
     for group in groups.iter().filter(|group| !group.files.is_empty()) {
         for LinkFile {
+            mount,
             user: mount_path,
             below_mount,
             in_link: link_relative,
@@ -6298,8 +6333,8 @@ async fn stage_link_groups(
                     NodeMapping {
                         repository: group.link_context.clone(),
                         state: group.link_state_staged.clone(),
-                        path: group.link_path_rel.clone(),
-                        node: group.mounted,
+                        path: group.mounts[*mount].link_path_rel.clone(),
+                        node: group.mounts[*mount].mounted,
                     },
                     below_mount.clone(),
                     KnownChild::Unresolved,
@@ -6343,8 +6378,8 @@ async fn stage_link_groups(
                     NodeMapping {
                         repository: group.link_context.clone(),
                         state: group.link_state_staged.clone(),
-                        path: group.link_path_rel.clone(),
-                        node: group.mounted,
+                        path: group.mounts[*mount].link_path_rel.clone(),
+                        node: group.mounts[*mount].mounted,
                     },
                     below_mount.clone(),
                     KnownChild::Unresolved,
@@ -6368,17 +6403,19 @@ async fn stage_link_groups(
             }
         }
 
+        let pinned = group.link_state_staged.revision();
         let new_link_sig = group
             .link_state_staged
             .serialize(group.link_context.clone(), token)
             .await
             .forward::<StageError>("Failed to serialize link state")?;
-        crate::link::update_link_pin_by_path(
+        crate::link::repin_staged_mounts(
             &state,
-            repository.clone(),
-            group.link_path_rel.as_str(),
+            &repository,
+            group.link_context.id,
             group.link_branch,
             new_link_sig,
+            |row| row.signature == pinned,
         )
         .await
         .forward::<StageError>("Failed to update link pin")?;

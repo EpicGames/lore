@@ -1320,10 +1320,29 @@ async fn mounting_foo_and_bar(
     linked: &Arc<RepositoryContext>,
     pin: Hash,
 ) -> (Arc<State>, NodeID, NodeID) {
+    mounting(
+        repository,
+        linked,
+        pin,
+        [("a", "foo"), ("b", "bar")],
+        LinkFlags::NoFlags,
+    )
+    .await
+}
+
+/// A State linking `linked` at each of `mounts`, a link's name and the folder it exposes, all of
+/// the revision `pin` with `flags`, with the nodes of the two mounts.
+async fn mounting(
+    repository: &Arc<RepositoryContext>,
+    linked: &Arc<RepositoryContext>,
+    pin: Hash,
+    mounts: [(&str, &str); 2],
+    flags: LinkFlags,
+) -> (Arc<State>, NodeID, NodeID) {
     let pinned = in_memory::revision_state(linked, pin).await;
     let state = State::new();
-    let mut mounts = Vec::new();
-    for (name, source) in [("a", "foo"), ("b", "bar")] {
+    let mut nodes = Vec::new();
+    for (name, source) in mounts {
         let child = node_at(linked, &pinned, source).await;
         let node = add(
             &state,
@@ -1343,13 +1362,139 @@ async fn mounting_foo_and_bar(
                 BranchId::default(),
                 pin,
                 node,
-                LinkFlags::NoFlags,
+                flags,
             )
             .await
             .expect("registering the mount");
-        mounts.push(node);
+        nodes.push(node);
     }
-    (state, mounts[0], mounts[1])
+    (state, nodes[0], nodes[1])
+}
+
+/// One row of a repository left to the user leaves every row of it to the user: the merged branch
+/// moves the pin of both mounts, and this branch remounts `a` at a folder the new pin lacks, so
+/// `a` conflicts, and `b`, which only the merged branch changed, conflicts with it rather than
+/// take a pin `a` does not.
+#[tokio::test]
+async fn a_conflicting_row_leaves_its_sibling_rows_to_the_user() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let linked = repository
+                .to_link_context(RepositoryId::from(uuid::Uuid::now_v7()))
+                .await;
+            let old = revision_with_directories(&linked, &["foo", "bar", "qux"]).await;
+            let new = revision_with_directories(&linked, &["foo", "bar"]).await;
+            let fixed = LinkFlags::DisableAutoFollow;
+            let (base, _, _) = mounting(
+                &repository,
+                &linked,
+                old,
+                [("a", "foo"), ("b", "bar")],
+                fixed,
+            )
+            .await;
+            let (current, a, b) = mounting(
+                &repository,
+                &linked,
+                old,
+                [("a", "qux"), ("b", "bar")],
+                fixed,
+            )
+            .await;
+            let (incoming, _, _) = mounting(
+                &repository,
+                &linked,
+                new,
+                [("a", "foo"), ("b", "bar")],
+                fixed,
+            )
+            .await;
+
+            let LinkPinClassification { planned, conflicts } = classify_link_pins(
+                repository.clone(),
+                &current,
+                BranchId::default(),
+                &incoming,
+                LinkPinResolution::ThreeWay(base),
+                &[],
+            )
+            .await
+            .expect("classifying the rows");
+
+            assert!(planned.is_empty());
+            let mut rows: Vec<_> = conflicts
+                .iter()
+                .map(|conflict| {
+                    (
+                        conflict.target.local_node,
+                        conflict.target.signature,
+                        conflict.source.signature,
+                    )
+                })
+                .collect();
+            rows.sort();
+            assert_eq!(rows, [(a, old, new), (b, old, new)]);
+        })
+        .await;
+}
+
+/// `a` conflicts, and `b`, which only this branch holds, conflicts with it rather than keep a pin
+/// `a` may leave.
+#[tokio::test]
+async fn a_conflicting_row_leaves_a_sibling_row_only_this_branch_holds_to_the_user() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let linked = repository
+                .to_link_context(RepositoryId::from(uuid::Uuid::now_v7()))
+                .await;
+            let old = revision_with_directories(&linked, &["foo", "bar", "old"]).await;
+            let mine = revision_with_directories(&linked, &["foo", "bar", "mine"]).await;
+            let theirs = revision_with_directories(&linked, &["foo", "bar"]).await;
+            let fixed = LinkFlags::DisableAutoFollow;
+            let shared = [("a", "foo"), ("c", "bar")];
+            let (base, _, _) = mounting(&repository, &linked, old, shared, fixed).await;
+            let (incoming, _, _) = mounting(&repository, &linked, theirs, shared, fixed).await;
+            let (current, a, b) = mounting(
+                &repository,
+                &linked,
+                mine,
+                [("a", "foo"), ("b", "bar")],
+                fixed,
+            )
+            .await;
+
+            let LinkPinClassification { planned, conflicts } = classify_link_pins(
+                repository.clone(),
+                &current,
+                BranchId::default(),
+                &incoming,
+                LinkPinResolution::ThreeWay(base),
+                &[],
+            )
+            .await
+            .expect("classifying the rows");
+
+            assert!(planned.is_empty());
+            let mut rows: Vec<_> = conflicts
+                .iter()
+                .map(|conflict| {
+                    (
+                        conflict.target.local_node,
+                        conflict.target.signature,
+                        conflict.source.signature,
+                    )
+                })
+                .collect();
+            rows.sort();
+            assert_eq!(rows, [(a, mine, theirs), (b, mine, theirs)]);
+        })
+        .await;
 }
 
 /// Repinning a repository rewrites the row and the node of every mount: a mount whose folder keeps
