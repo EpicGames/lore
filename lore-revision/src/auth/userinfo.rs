@@ -151,7 +151,7 @@ async fn open_user_service(
 ///
 /// Emits an [`LoreEvent::AuthUserInfo`] event per resolved user. The event's
 /// `id` field always echoes the requested id; the `name` field comes from
-/// the decoded token's `preferred_username` (falling back to `name`, then
+/// the decoded token's `name` (falling back to `preferred_username`, then
 /// `id`) for the local fast path, or from the service for the remote path.
 /// Because the local path reads a cached token captured at login, a name
 /// change made server-side since then is not reflected until the token is
@@ -461,10 +461,10 @@ pub fn token_session_valid(info: &lore_credential::UserInfo, refresh_expires: Op
 }
 
 fn display_name(info: &lore_credential::UserInfo) -> String {
-    if !info.preferred_username.is_empty() {
-        info.preferred_username.clone()
-    } else if !info.name.is_empty() {
+    if !info.name.is_empty() {
         info.name.clone()
+    } else if !info.preferred_username.is_empty() {
+        info.preferred_username.clone()
     } else {
         info.id.clone()
     }
