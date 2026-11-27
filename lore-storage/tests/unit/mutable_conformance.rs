@@ -10,6 +10,7 @@ use futures::StreamExt;
 use lore_storage::FlushOptions;
 use lore_storage::Hash;
 use lore_storage::Partition;
+use lore_storage::ReadConsistency;
 use lore_storage::immutable_store::StoreError;
 use lore_storage::local::store_lock::StoreGuard;
 use lore_storage::mutable_conformance::Capabilities;
@@ -142,6 +143,10 @@ impl MutableStore for UnreadSwapToExpected {
         self.base.clone().hold_for_command().await
     }
 
+    fn stored_typed_key(&self, key: Hash, key_type: KeyType) -> Hash {
+        self.base.stored_typed_key(key, key_type)
+    }
+
     async fn load(
         self: Arc<Self>,
         partition: Partition,
@@ -186,8 +191,12 @@ impl MutableStore for UnreadSwapToExpected {
         self: Arc<Self>,
         partition: Partition,
         key_type: KeyType,
+        consistency: ReadConsistency,
     ) -> Result<KeyValueStream, StoreError> {
-        self.base.clone().list(partition, key_type).await
+        self.base
+            .clone()
+            .list(partition, key_type, consistency)
+            .await
     }
 
     async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
@@ -235,6 +244,10 @@ impl ListsRemovedKeys {
 impl MutableStore for ListsRemovedKeys {
     async fn hold_for_command(self: Arc<Self>) -> Result<Option<StoreGuard>, StoreError> {
         self.base.clone().hold_for_command().await
+    }
+
+    fn stored_typed_key(&self, key: Hash, key_type: KeyType) -> Hash {
+        self.base.stored_typed_key(key, key_type)
     }
 
     async fn load(
@@ -286,8 +299,13 @@ impl MutableStore for ListsRemovedKeys {
         self: Arc<Self>,
         partition: Partition,
         key_type: KeyType,
+        consistency: ReadConsistency,
     ) -> Result<KeyValueStream, StoreError> {
-        let mut listed = self.base.clone().list(partition, key_type).await?;
+        let mut listed = self
+            .base
+            .clone()
+            .list(partition, key_type, consistency)
+            .await?;
         if key_type == KeyType::Untyped {
             return Ok(listed);
         }
@@ -355,6 +373,10 @@ impl MutableStore for SwapReadThenWritten {
         self.base.clone().hold_for_command().await
     }
 
+    fn stored_typed_key(&self, key: Hash, key_type: KeyType) -> Hash {
+        self.base.stored_typed_key(key, key_type)
+    }
+
     async fn load(
         self: Arc<Self>,
         partition: Partition,
@@ -404,8 +426,12 @@ impl MutableStore for SwapReadThenWritten {
         self: Arc<Self>,
         partition: Partition,
         key_type: KeyType,
+        consistency: ReadConsistency,
     ) -> Result<KeyValueStream, StoreError> {
-        self.base.clone().list(partition, key_type).await
+        self.base
+            .clone()
+            .list(partition, key_type, consistency)
+            .await
     }
 
     async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
@@ -431,4 +457,87 @@ async fn the_race_fails_a_store_whose_swap_reads_and_writes_apart() {
     )
     .await;
     assert!(raced.is_err(), "{raced:?}");
+}
+
+/// A mutable store whose `stored_typed_key` answers the key it is given, without the key type
+/// `base` marks in it. It passes every other call to `base`.
+struct StoredKeyUnmarked {
+    base: Arc<dyn MutableStore>,
+}
+
+#[async_trait]
+impl MutableStore for StoredKeyUnmarked {
+    async fn hold_for_command(self: Arc<Self>) -> Result<Option<StoreGuard>, StoreError> {
+        self.base.clone().hold_for_command().await
+    }
+
+    fn stored_typed_key(&self, key: Hash, _key_type: KeyType) -> Hash {
+        key
+    }
+
+    async fn load(
+        self: Arc<Self>,
+        partition: Partition,
+        key: Hash,
+        key_type: KeyType,
+    ) -> Result<Hash, StoreError> {
+        self.base.clone().load(partition, key, key_type).await
+    }
+
+    async fn store(
+        self: Arc<Self>,
+        partition: Partition,
+        key: Hash,
+        value: Hash,
+        key_type: KeyType,
+    ) -> Result<(), StoreError> {
+        self.base
+            .clone()
+            .store(partition, key, value, key_type)
+            .await
+    }
+
+    async fn compare_and_swap(
+        self: Arc<Self>,
+        partition: Partition,
+        key: Hash,
+        expected: Hash,
+        value: Hash,
+        key_type: KeyType,
+    ) -> Result<Hash, StoreError> {
+        self.base
+            .clone()
+            .compare_and_swap(partition, key, expected, value, key_type)
+            .await
+    }
+
+    async fn list(
+        self: Arc<Self>,
+        partition: Partition,
+        key_type: KeyType,
+        consistency: ReadConsistency,
+    ) -> Result<KeyValueStream, StoreError> {
+        self.base
+            .clone()
+            .list(partition, key_type, consistency)
+            .await
+    }
+
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
+        self.base.clone().flush(options).await
+    }
+}
+
+/// The battery fails a store whose `stored_typed_key` is not the key its list reports, and fails
+/// it at that check alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_battery_fails_a_store_whose_stored_typed_key_is_not_the_listed_key() {
+    verify_mutable_store(
+        Arc::new(StoredKeyUnmarked {
+            base: make_in_memory_mutable().await,
+        }),
+        Capabilities::new("StoredKeyUnmarked")
+            .known_violations(&[Check::StoredTypedKeyIsListedKey]),
+    )
+    .await;
 }

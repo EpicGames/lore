@@ -84,6 +84,8 @@ use crate::grpc::GrpcTimeouts;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::forwarded_requests::GrpcForwardedRequests;
 use crate::grpc::notification_service::NotificationService;
+use crate::grpc::revision::v1::branch_list::BranchListReads;
+use crate::grpc::revision::v1::service::RevisionServiceInstrumentProvider;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookRegistrationContext;
 use crate::hooks::HookRegistry;
@@ -520,6 +522,7 @@ async fn launch_grpc_server(
     hook_dispatcher: Arc<HookDispatcher>,
     user_agent_filter: Arc<UserAgentFilter>,
     forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
+    branch_list_reads: Arc<BranchListReads>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let grpc_settings = settings
@@ -569,7 +572,7 @@ async fn launch_grpc_server(
 
     GrpcServerBuilder::new()
         .with_environment(environment)
-        .with_feature(feature)
+        .with_feature(feature, branch_list_reads)
         .with_immutable_store(immutable_store, local_store, local_tier)
         .with_mutable_store(mutable_store)
         .with_lock_store(lock_store)
@@ -666,6 +669,7 @@ async fn launch_grpc_internal_server(
     hook_dispatcher: Arc<HookDispatcher>,
     jwt_verifier: Option<JwtVerifier>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    branch_list_reads: Arc<BranchListReads>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let grpc_settings = settings
@@ -708,6 +712,7 @@ async fn launch_grpc_internal_server(
                 crate::grpc::revision::v1::branch_list::DEFAULT_BRANCH_LIST_CONCURRENCY,
                 crate::grpc::server::FeatureSettings::branch_list_concurrency,
             ),
+            branch_list_reads,
         )?
         .with_tls_config(cert_path, key_path, cert_chain_path)?
         .with_http2_config(
@@ -2362,6 +2367,14 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             .expect("Failed to create hooks from configuration");
 
         let hook_dispatcher = Arc::new(HookDispatcher::from_hooks_default(enabled_hooks));
+        // One for the process, so that direct and forwarded calls share reads.
+        let branch_list_reads = BranchListReads::new(
+            settings.feature.as_ref().map_or(
+                crate::grpc::revision::v1::branch_list::DEFAULT_BRANCH_LIST_SHARE_WINDOW,
+                crate::grpc::server::FeatureSettings::branch_list_share_window,
+            ),
+            &RevisionServiceInstrumentProvider,
+        )?;
 
         lore_spawn!(endpoints, {
             let immutable_store = immutable_store.clone();
@@ -2374,6 +2387,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let notification = notification.clone();
             let user_agent_filter = user_agent_filter.clone();
             let forwarded_requests = forwarded_requests.clone();
+            let branch_list_reads = branch_list_reads.clone();
             let shutdown_rx = _shutdown_rx.clone();
 
             let local_immutable_store = local_store().unwrap_or_else(|| {
@@ -2396,6 +2410,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 hook_dispatcher.clone(),
                 user_agent_filter,
                 forwarded_requests,
+                branch_list_reads,
                 shutdown_rx,
             )
         });
@@ -2425,6 +2440,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 let hook_dispatcher = hook_dispatcher.clone();
                 let jwt_verifier = jwt_verifier.clone();
                 let repository_authorizer = repository_authorizer.clone();
+                let branch_list_reads = branch_list_reads.clone();
                 let shutdown_rx = _shutdown_rx.clone();
                 launch_grpc_internal_server(
                     settings,
@@ -2436,6 +2452,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     hook_dispatcher,
                     jwt_verifier,
                     repository_authorizer,
+                    branch_list_reads,
                     shutdown_rx,
                 )
             });

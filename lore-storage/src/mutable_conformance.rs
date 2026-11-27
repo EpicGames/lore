@@ -30,6 +30,10 @@
 //!    and only entries belonging to the requested partition — unless the partition is null, in
 //!    which case all partitions are included. A key a store or a swap to zero removed is not
 //!    listed.
+//!
+//!    Clauses 6 and 7 hold for a `list` with either [`ReadConsistency`] once the writes it reads
+//!    have settled. The battery lists right after it writes, so it checks an eventual `list` only
+//!    against a store whose writes settle before the call returns, such as a local emulator.
 //! 8. **A swap to zero removes the key.** A compare-and-swap whose expected value matches and
 //!    whose new value is zero leaves the key absent, and one from zero to zero leaves an absent
 //!    key absent. A removed key is created again by a swap from zero.
@@ -39,6 +43,8 @@
 //!    holding what those swaps leave it, see [`race_swaps`]. The key holds zero again each time a
 //!    swap removes it, so swaps from zero succeed once per removal, and a zero answer is not placed
 //!    in time.
+//! 10. **`stored_typed_key` gives the listed key.** For a stored key of each typed key type,
+//!     [`MutableStore::stored_typed_key`] answers the key `list` reports for it.
 //!
 //! # Known violations
 //!
@@ -58,6 +64,7 @@ use crate::Hash;
 use crate::Partition;
 use crate::immutable_store::StoreError;
 use crate::mutable_store::MutableStore;
+use crate::mutable_store::ReadConsistency;
 use crate::store_types::KeyType;
 
 /// One case in the battery. Named so a store can declare which ones it fails.
@@ -125,6 +132,8 @@ pub enum Check {
     ListNullPartitionMatchesAll,
     /// `list` leaves out a key a store of zero removed and one a compare-and-swap to zero removed.
     ListLeavesOutRemovedKeys,
+    /// For a stored key of each typed key type, `stored_typed_key` answers the key `list` reports.
+    StoredTypedKeyIsListedKey,
     /// `flush` completes without error for both `sync_data = false` and `sync_data = true`.
     FlushSucceeds,
 }
@@ -282,37 +291,56 @@ pub async fn verify_mutable_store(store: Arc<dyn MutableStore>, caps: Capabiliti
         Check::ConcurrentSwapsFormOneHistory,
         concurrent_swaps_form_one_history(&store).await,
     );
+    for consistency in [ReadConsistency::Strong, ReadConsistency::Eventual] {
+        verify_list(&store, &caps, consistency).await;
+    }
     settle(
         &caps,
-        Check::ListUntypedIsEmpty,
-        list_untyped_is_empty(&store).await,
-    );
-    settle(
-        &caps,
-        Check::ListReturnsStoredEntries,
-        list_returns_stored_entries(&store).await,
-    );
-    settle(
-        &caps,
-        Check::ListFiltersOtherKeyTypes,
-        list_filters_other_key_types(&store).await,
-    );
-    settle(
-        &caps,
-        Check::ListRespectsPartition,
-        list_respects_partition(&store).await,
-    );
-    settle(
-        &caps,
-        Check::ListNullPartitionMatchesAll,
-        list_null_partition_matches_all(&store).await,
-    );
-    settle(
-        &caps,
-        Check::ListLeavesOutRemovedKeys,
-        list_leaves_out_removed_keys(&store).await,
+        Check::StoredTypedKeyIsListedKey,
+        stored_typed_key_is_listed_key(&store).await,
     );
     settle(&caps, Check::FlushSucceeds, flush_succeeds(&store).await);
+}
+
+/// Run the `list` checks with `consistency`.
+async fn verify_list(
+    store: &Arc<dyn MutableStore>,
+    caps: &Capabilities,
+    consistency: ReadConsistency,
+) {
+    let read_with = |outcome: Result<(), String>| {
+        outcome.map_err(|why| format!("with {consistency:?} consistency: {why}"))
+    };
+    settle(
+        caps,
+        Check::ListUntypedIsEmpty,
+        read_with(list_untyped_is_empty(store, consistency).await),
+    );
+    settle(
+        caps,
+        Check::ListReturnsStoredEntries,
+        read_with(list_returns_stored_entries(store, consistency).await),
+    );
+    settle(
+        caps,
+        Check::ListFiltersOtherKeyTypes,
+        read_with(list_filters_other_key_types(store, consistency).await),
+    );
+    settle(
+        caps,
+        Check::ListRespectsPartition,
+        read_with(list_respects_partition(store, consistency).await),
+    );
+    settle(
+        caps,
+        Check::ListNullPartitionMatchesAll,
+        read_with(list_null_partition_matches_all(store, consistency).await),
+    );
+    settle(
+        caps,
+        Check::ListLeavesOutRemovedKeys,
+        read_with(list_leaves_out_removed_keys(store, consistency).await),
+    );
 }
 
 /// Decide what an outcome means given what the store declared.
@@ -358,10 +386,11 @@ async fn collect_list(
     store: &Arc<dyn MutableStore>,
     partition: Partition,
     key_type: KeyType,
+    consistency: ReadConsistency,
 ) -> Result<Vec<(Hash, Hash)>, String> {
     let mut stream = store
         .clone()
-        .list(partition, key_type)
+        .list(partition, key_type, consistency)
         .await
         .map_err(|e| format!("list({key_type:?}) failed: {e:?}"))?;
     let mut items = Vec::new();
@@ -1105,14 +1134,17 @@ fn answered_while_held(
 
 /// Clause 6: the early-return for `Untyped` produces an empty stream even when typed entries
 /// exist.
-async fn list_untyped_is_empty(store: &Arc<dyn MutableStore>) -> Result<(), String> {
+async fn list_untyped_is_empty(
+    store: &Arc<dyn MutableStore>,
+    consistency: ReadConsistency,
+) -> Result<(), String> {
     let (partition, key, value) = unique_fixture();
     store
         .clone()
         .store(partition, key, value, KeyType::BranchMetadata)
         .await
         .map_err(|e| format!("store failed: {e:?}"))?;
-    let items = collect_list(store, partition, KeyType::Untyped).await?;
+    let items = collect_list(store, partition, KeyType::Untyped, consistency).await?;
     require!(
         items.is_empty(),
         "list with KeyType::Untyped must return an empty stream, got {} item(s)",
@@ -1122,14 +1154,17 @@ async fn list_untyped_is_empty(store: &Arc<dyn MutableStore>) -> Result<(), Stri
 }
 
 /// Clause 7, positive side: a stored entry appears in the list for its key type.
-async fn list_returns_stored_entries(store: &Arc<dyn MutableStore>) -> Result<(), String> {
+async fn list_returns_stored_entries(
+    store: &Arc<dyn MutableStore>,
+    consistency: ReadConsistency,
+) -> Result<(), String> {
     let (partition, key, value) = unique_fixture();
     store
         .clone()
         .store(partition, key, value, KeyType::BranchMetadata)
         .await
         .map_err(|e| format!("store failed: {e:?}"))?;
-    let items = collect_list(store, partition, KeyType::BranchMetadata).await?;
+    let items = collect_list(store, partition, KeyType::BranchMetadata, consistency).await?;
     let values: Vec<Hash> = items.iter().map(|(_, v)| *v).collect();
     require!(
         values.contains(&value),
@@ -1140,7 +1175,10 @@ async fn list_returns_stored_entries(store: &Arc<dyn MutableStore>) -> Result<()
 
 /// Clause 7, negative side: entries stored under one key type do not appear in a list for a
 /// different key type.
-async fn list_filters_other_key_types(store: &Arc<dyn MutableStore>) -> Result<(), String> {
+async fn list_filters_other_key_types(
+    store: &Arc<dyn MutableStore>,
+    consistency: ReadConsistency,
+) -> Result<(), String> {
     let (partition, key, value_metadata) = unique_fixture();
     let value_branch_id = nonzero_hash();
 
@@ -1155,11 +1193,12 @@ async fn list_filters_other_key_types(store: &Arc<dyn MutableStore>) -> Result<(
         .await
         .map_err(|e| format!("store BranchId failed: {e:?}"))?;
 
-    let metadata_values: Vec<Hash> = collect_list(store, partition, KeyType::BranchMetadata)
-        .await?
-        .into_iter()
-        .map(|(_, v)| v)
-        .collect();
+    let metadata_values: Vec<Hash> =
+        collect_list(store, partition, KeyType::BranchMetadata, consistency)
+            .await?
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect();
     require!(
         metadata_values.contains(&value_metadata),
         "list(BranchMetadata) must return the BranchMetadata entry"
@@ -1169,11 +1208,12 @@ async fn list_filters_other_key_types(store: &Arc<dyn MutableStore>) -> Result<(
         "list(BranchMetadata) must not return a BranchId entry"
     );
 
-    let branch_id_values: Vec<Hash> = collect_list(store, partition, KeyType::BranchId)
-        .await?
-        .into_iter()
-        .map(|(_, v)| v)
-        .collect();
+    let branch_id_values: Vec<Hash> =
+        collect_list(store, partition, KeyType::BranchId, consistency)
+            .await?
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect();
     require!(
         branch_id_values.contains(&value_branch_id),
         "list(BranchId) must return the BranchId entry"
@@ -1188,7 +1228,10 @@ async fn list_filters_other_key_types(store: &Arc<dyn MutableStore>) -> Result<(
 
 /// Clause 7, partition filter: entries from another partition are excluded when the caller names
 /// a specific partition.
-async fn list_respects_partition(store: &Arc<dyn MutableStore>) -> Result<(), String> {
+async fn list_respects_partition(
+    store: &Arc<dyn MutableStore>,
+    consistency: ReadConsistency,
+) -> Result<(), String> {
     let (partition_a, key, value_a) = unique_fixture();
     let partition_b = Partition::from(rand::random::<[u8; 16]>());
     let value_b = nonzero_hash();
@@ -1204,11 +1247,12 @@ async fn list_respects_partition(store: &Arc<dyn MutableStore>) -> Result<(), St
         .await
         .map_err(|e| format!("store in partition_b failed: {e:?}"))?;
 
-    let values_a: Vec<Hash> = collect_list(store, partition_a, KeyType::BranchMetadata)
-        .await?
-        .into_iter()
-        .map(|(_, v)| v)
-        .collect();
+    let values_a: Vec<Hash> =
+        collect_list(store, partition_a, KeyType::BranchMetadata, consistency)
+            .await?
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect();
     require!(
         values_a.contains(&value_a),
         "list(partition_a) must return the entry stored in partition_a"
@@ -1222,7 +1266,10 @@ async fn list_respects_partition(store: &Arc<dyn MutableStore>) -> Result<(), St
 
 /// Clause 7, null-partition: a null partition acts as a wildcard and returns entries from every
 /// partition.
-async fn list_null_partition_matches_all(store: &Arc<dyn MutableStore>) -> Result<(), String> {
+async fn list_null_partition_matches_all(
+    store: &Arc<dyn MutableStore>,
+    consistency: ReadConsistency,
+) -> Result<(), String> {
     let (partition_a, key_a, value_a) = unique_fixture();
     let (partition_b, key_b, value_b) = unique_fixture();
 
@@ -1237,11 +1284,16 @@ async fn list_null_partition_matches_all(store: &Arc<dyn MutableStore>) -> Resul
         .await
         .map_err(|e| format!("store in partition_b failed: {e:?}"))?;
 
-    let all_values: Vec<Hash> = collect_list(store, Partition::default(), KeyType::BranchMetadata)
-        .await?
-        .into_iter()
-        .map(|(_, v)| v)
-        .collect();
+    let all_values: Vec<Hash> = collect_list(
+        store,
+        Partition::default(),
+        KeyType::BranchMetadata,
+        consistency,
+    )
+    .await?
+    .into_iter()
+    .map(|(_, v)| v)
+    .collect();
     require!(
         all_values.contains(&value_a),
         "list(null partition) must include entries from partition_a"
@@ -1255,7 +1307,10 @@ async fn list_null_partition_matches_all(store: &Arc<dyn MutableStore>) -> Resul
 
 /// Clause 7, removed keys: a key a store of zero removed, and one a swap to zero removed, are not
 /// listed.
-async fn list_leaves_out_removed_keys(store: &Arc<dyn MutableStore>) -> Result<(), String> {
+async fn list_leaves_out_removed_keys(
+    store: &Arc<dyn MutableStore>,
+    consistency: ReadConsistency,
+) -> Result<(), String> {
     let (partition, stored, value) = unique_fixture();
     let swapped = nonzero_hash();
     for key in [stored, swapped] {
@@ -1271,11 +1326,31 @@ async fn list_leaves_out_removed_keys(store: &Arc<dyn MutableStore>) -> Result<(
         .await
         .map_err(|e| format!("store-zero failed: {e:?}"))?;
     swap(store, partition, swapped, value, Hash::default()).await?;
-    let items = collect_list(store, partition, KeyType::BranchMetadata).await?;
+    let items = collect_list(store, partition, KeyType::BranchMetadata, consistency).await?;
     require!(
         items.is_empty(),
         "list must leave out keys a store or a swap to zero removed, got {items:?}"
     );
+    Ok(())
+}
+
+/// Clause 10: a key stored under each typed key type is listed as `stored_typed_key` gives it.
+async fn stored_typed_key_is_listed_key(store: &Arc<dyn MutableStore>) -> Result<(), String> {
+    let typed_key_types = (1..=u8::MAX).map_while(|number| KeyType::try_from(number).ok());
+    for key_type in typed_key_types {
+        let (partition, key, value) = unique_fixture();
+        store
+            .clone()
+            .store(partition, key, value, key_type)
+            .await
+            .map_err(|e| format!("store({key_type:?}) failed: {e:?}"))?;
+        let items = collect_list(store, partition, key_type, ReadConsistency::Strong).await?;
+        require_eq!(
+            items,
+            vec![(store.stored_typed_key(key, key_type), value)],
+            "list({key_type:?}) must report the stored key as stored_typed_key gives it"
+        );
+    }
     Ok(())
 }
 

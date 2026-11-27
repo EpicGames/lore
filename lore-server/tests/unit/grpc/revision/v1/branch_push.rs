@@ -1290,7 +1290,7 @@ mod handler {
     use lore_server::hooks::traits::HookResponse;
 
     use super::*;
-    use crate::store::test_support::RecordingLoadStore;
+    use crate::store::test_support::RecordingReadStore;
 
     /// Answers a push with the response context keys it was given, joined by `|`.
     struct EchoResponseContext;
@@ -1415,7 +1415,7 @@ mod handler {
         let repository = random::<RepositoryId>();
         let (immutable_store, inner_mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
-        let recording = RecordingLoadStore::new(inner_mutable_store);
+        let recording = RecordingReadStore::new(inner_mutable_store);
         let mutable_store: Arc<dyn lore_storage::MutableStore> = recording.clone();
 
         let mut notification_sender = MockNotificationSender::new();

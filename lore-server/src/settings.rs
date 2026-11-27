@@ -352,12 +352,25 @@ fn validate_trace_config(settings: &Settings) -> Result<(), config::ConfigError>
     Ok(())
 }
 
-/// A cached revision-list blob is a single `CachedRevisionListHeader`
-/// followed by `history_step_size` packed `CachedRevisionItem`s. The
-/// whole blob is written to the immutable store as one fragment, so it
-/// must fit strictly under `FRAGMENT_SIZE_THRESHOLD` — otherwise pushes
-/// would silently fail to materialize cache entries.
+/// `branch_list_share_window_millis` must not exceed
+/// `MAX_BRANCH_LIST_SHARE_WINDOW`. A cached revision-list blob is a single
+/// `CachedRevisionListHeader` followed by `history_step_size` packed
+/// `CachedRevisionItem`s. The whole blob is written to the immutable store
+/// as one fragment, so it must fit strictly under `FRAGMENT_SIZE_THRESHOLD`
+/// — otherwise pushes would silently fail to materialize cache entries.
+#[lore_macro::test_pub]
 fn validate_feature_config(settings: &Settings) -> Result<(), config::ConfigError> {
+    let share_window = settings
+        .feature
+        .as_ref()
+        .map(crate::grpc::server::FeatureSettings::branch_list_share_window);
+    let max_share_window = crate::grpc::revision::v1::branch_list::MAX_BRANCH_LIST_SHARE_WINDOW;
+    if share_window.is_some_and(|window| window > max_share_window) {
+        return Err(config::ConfigError::Message(format!(
+            "feature.branch_list_share_window_millis must be at most {}",
+            max_share_window.as_millis(),
+        )));
+    }
     let history_step_size = settings
         .feature
         .as_ref()

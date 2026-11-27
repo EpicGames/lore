@@ -18,6 +18,7 @@ use lore_aws::aws_error::AwsError;
 use lore_aws::dynamodb::ConditionParts;
 use lore_aws::dynamodb::DynamoDb;
 use lore_aws::dynamodb::DynamoDbCondition;
+use lore_aws::dynamodb::DynamoDbQuery;
 use lore_aws::dynamodb::DynamoError;
 use lore_aws::dynamodb::MockDynamoDb;
 use lore_aws::store::mutable_store::AwsMutableStore;
@@ -31,6 +32,7 @@ use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::KeyType;
 use lore_storage::MutableStore;
+use lore_storage::ReadConsistency;
 use mockall::predicate::eq;
 use rand::random;
 
@@ -310,7 +312,7 @@ async fn test_list_pages_until_the_cursor_is_exhausted() {
 
     let store = Arc::new(initialize_mutable_store(dynamodb_mock));
     let mut channel = store
-        .list(repository.into(), key_type)
+        .list(repository.into(), key_type, ReadConsistency::Strong)
         .await
         .expect("listing starts")
         .channel();
@@ -356,7 +358,7 @@ async fn a_shed_listing_page_is_retried_rather_than_truncating_the_stream() {
 
     let store = Arc::new(initialize_mutable_store(dynamodb_mock));
     let mut channel = store
-        .list(repository.into(), key_type)
+        .list(repository.into(), key_type, ReadConsistency::Strong)
         .await
         .expect("listing starts")
         .channel();
@@ -398,7 +400,7 @@ async fn a_terminal_listing_failure_ends_the_stream() {
 
     let store = Arc::new(initialize_mutable_store(dynamodb_mock));
     let mut channel = store
-        .list(repository.into(), key_type)
+        .list(repository.into(), key_type, ReadConsistency::Strong)
         .await
         .expect("listing starts")
         .channel();
@@ -437,7 +439,7 @@ async fn a_listing_whose_cursor_stops_advancing_ends() {
                 });
 
             let mut channel = Arc::new(initialize_mutable_store(dynamodb_mock))
-                .list(repository.into(), key_type)
+                .list(repository.into(), key_type, ReadConsistency::Strong)
                 .await
                 .expect("listing starts")
                 .channel();
@@ -499,7 +501,7 @@ async fn a_listing_skips_zero_values_and_rows_it_cannot_decode() {
                 });
 
             let mut channel = Arc::new(initialize_mutable_store(dynamodb_mock))
-                .list(repository.into(), key_type)
+                .list(repository.into(), key_type, ReadConsistency::Strong)
                 .await
                 .expect("listing starts")
                 .channel();
@@ -514,6 +516,119 @@ async fn a_listing_skips_zero_values_and_rows_it_cannot_decode() {
         .await;
 }
 
+/// A key stored under each typed key type falls in the key range `list` asks the table for, and is
+/// listed back, from the row the store wrote, as `stored_typed_key` gives it.
+#[tokio::test]
+async fn a_stored_key_is_listed_as_stored_typed_key_gives_it() {
+    LORE_CONTEXT
+        .scope(crate::store::setup_execution("test".to_string()), async {
+            let typed_key_types = (1..=u8::MAX).map_while(|number| KeyType::try_from(number).ok());
+            for key_type in typed_key_types {
+                let repository = random::<Context>();
+                let key = random::<Hash>();
+                let value = random::<Hash>();
+
+                let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let mut dynamodb_mock = MockDynamoDb::default();
+                let writing = written.clone();
+                dynamodb_mock
+                    .expect_put_item()
+                    .times(1)
+                    .return_once(move |_, item| {
+                        writing.lock().unwrap().push(item);
+                        Ok(WriteOutput::default())
+                    });
+                let reading = written.clone();
+                dynamodb_mock.expect_query_page().times(1).return_once(
+                    move |_, query: ListQuery, _| {
+                        let bound = |name: &str| {
+                            let values = query.expression_attribute_values();
+                            let (_, value) = values
+                                .iter()
+                                .find(|(placeholder, _)| *placeholder == name)
+                                .expect("the query names its key range");
+                            value.as_blob().expect("a key bound is a blob").to_vec()
+                        };
+                        let range = bound(":ks")..=bound(":ke");
+                        let in_range = reading
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|row| {
+                                let key = row.get("key").and_then(AttributeValue::as_blob);
+                                range.contains(&key.expect("a row's key is a blob").to_vec())
+                            })
+                            .cloned()
+                            .collect();
+                        Ok(QueryOutput {
+                            items: Some(in_range),
+                            ..QueryOutput::default()
+                        })
+                    },
+                );
+
+                let store = Arc::new(initialize_mutable_store(dynamodb_mock));
+                store
+                    .clone()
+                    .store(repository.into(), key, value, key_type)
+                    .await
+                    .expect("the store succeeds");
+                let mut channel = store
+                    .clone()
+                    .list(repository.into(), key_type, ReadConsistency::Strong)
+                    .await
+                    .expect("listing starts")
+                    .channel();
+
+                let mut listed = Vec::new();
+                while let Some(row) = channel.recv().await {
+                    listed.push(row);
+                }
+
+                assert_eq!(
+                    listed,
+                    vec![(store.stored_typed_key(key, key_type), value)],
+                    "{key_type:?}"
+                );
+            }
+        })
+        .await;
+}
+
+/// A listing asks the table for the consistency its caller names: `ConsistentRead=true` for a
+/// strong listing, `ConsistentRead=false` for an eventual one.
+#[tokio::test]
+async fn a_listing_reads_with_the_consistency_it_is_given() {
+    for (consistency, consistent_read) in [
+        (ReadConsistency::Strong, true),
+        (ReadConsistency::Eventual, false),
+    ] {
+        let asked = Arc::new(std::sync::Mutex::new(None));
+        let recorded = asked.clone();
+        let mut dynamodb_mock = MockDynamoDb::default();
+        dynamodb_mock
+            .expect_query_page()
+            .times(1)
+            .return_once(move |_, query: ListQuery, _| {
+                *recorded.lock().unwrap() = Some(query.consistent_read());
+                Ok(QueryOutput::default())
+            });
+
+        let mut channel = Arc::new(initialize_mutable_store(dynamodb_mock))
+            .list(random::<Context>().into(), KeyType::BranchId, consistency)
+            .await
+            .expect("listing starts")
+            .channel();
+        assert!(channel.recv().await.is_none());
+
+        assert_eq!(
+            *asked.lock().unwrap(),
+            Some(consistent_read),
+            "a {consistency:?} listing"
+        );
+    }
+}
+
 /// An untyped listing names no key range, so it is empty without asking the table.
 #[tokio::test]
 async fn an_untyped_listing_is_empty() {
@@ -523,7 +638,11 @@ async fn an_untyped_listing_is_empty() {
             dynamodb_mock.expect_query_page::<ListQuery>().never();
 
             let mut channel = Arc::new(initialize_mutable_store(dynamodb_mock))
-                .list(random::<Context>().into(), KeyType::Untyped)
+                .list(
+                    random::<Context>().into(),
+                    KeyType::Untyped,
+                    ReadConsistency::Strong,
+                )
                 .await
                 .expect("listing starts")
                 .channel();

@@ -167,7 +167,14 @@ pub(crate) mod net_common {
             ));
             let outcome = GrpcServerBuilder::new()
                 .with_environment(EnvironmentConfig::default())
-                .with_feature(FeatureSettings::default())
+                .with_feature(
+                    FeatureSettings::default(),
+                    lore_server::grpc::revision::v1::branch_list::BranchListReads::new(
+                        lore_server::grpc::revision::v1::branch_list::DEFAULT_BRANCH_LIST_SHARE_WINDOW,
+                        &lore_server::grpc::revision::v1::service::RevisionServiceInstrumentProvider,
+                    )
+                    .expect("the default window is below the maximum"),
+                )
                 .with_immutable_store(backend_immutable.clone(), backend_immutable, None)
                 .with_mutable_store(backend_mutable)
                 .with_lock_store(None)

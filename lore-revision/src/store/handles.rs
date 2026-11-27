@@ -8,13 +8,14 @@ use lore_base::types::KeyType;
 use lore_base::types::Partition;
 use lore_storage::KeyValueStream;
 use lore_storage::MutableStore;
+use lore_storage::ReadConsistency;
 use lore_storage::StoreError;
 
 use crate::repository::RepositoryWriteToken;
 
 /// Read-only handle to a [`MutableStore`], scoped to the borrow of a [`RepositoryContext`].
 ///
-/// The handle forwards only `load` and `list` — write methods (`store`,
+/// The handle forwards only `load`, `list` and `stored_typed_key` — write methods (`store`,
 /// `compare_and_swap`, `flush`) are deliberately not forwarded so calling them
 /// on a `ReadHandle` is a compile-time error. The handle holds a reference to
 /// the shared `Arc<dyn MutableStore>`; callers cannot extract or clone that
@@ -47,8 +48,17 @@ impl<'a> ReadHandle<'a> {
         &self,
         partition: Partition,
         key_type: KeyType,
+        consistency: ReadConsistency,
     ) -> Result<KeyValueStream, StoreError> {
-        self.store.clone().list(partition, key_type).await
+        self.store
+            .clone()
+            .list(partition, key_type, consistency)
+            .await
+    }
+
+    /// See [`MutableStore::stored_typed_key`].
+    pub fn stored_typed_key(&self, key: Hash, key_type: KeyType) -> Hash {
+        self.store.stored_typed_key(key, key_type)
     }
 }
 
@@ -88,8 +98,17 @@ impl<'a> WriteHandle<'a> {
         &self,
         partition: Partition,
         key_type: KeyType,
+        consistency: ReadConsistency,
     ) -> Result<KeyValueStream, StoreError> {
-        self.store.clone().list(partition, key_type).await
+        self.store
+            .clone()
+            .list(partition, key_type, consistency)
+            .await
+    }
+
+    /// See [`MutableStore::stored_typed_key`].
+    pub fn stored_typed_key(&self, key: Hash, key_type: KeyType) -> Hash {
+        self.store.stored_typed_key(key, key_type)
     }
 
     pub async fn store(

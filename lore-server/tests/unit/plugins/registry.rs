@@ -177,6 +177,10 @@ impl MutableStore for MockMutableStore {
         Ok(None)
     }
 
+    fn stored_typed_key(&self, key: Hash, _key_type: KeyType) -> Hash {
+        key
+    }
+
     async fn load(
         self: Arc<Self>,
         _partition: Partition,
@@ -211,6 +215,7 @@ impl MutableStore for MockMutableStore {
         self: Arc<Self>,
         _partition: Partition,
         _key_type: KeyType,
+        _consistency: lore_storage::ReadConsistency,
     ) -> Result<KeyValueStream, StoreError> {
         Err(StoreError::internal("Not implemented"))
     }

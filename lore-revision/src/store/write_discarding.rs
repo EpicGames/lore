@@ -32,6 +32,10 @@ impl store::MutableStore for WriteDiscardingMutableStore {
         self.base.clone().hold_for_command().await
     }
 
+    fn stored_typed_key(&self, key: Hash, key_type: KeyType) -> Hash {
+        self.base.stored_typed_key(key, key_type)
+    }
+
     fn try_join_claim(&self) -> Option<StoreGuard> {
         self.base.try_join_claim()
     }
@@ -80,8 +84,12 @@ impl store::MutableStore for WriteDiscardingMutableStore {
         self: Arc<Self>,
         partition: Partition,
         key_type: KeyType,
+        consistency: store::ReadConsistency,
     ) -> Result<KeyValueStream, StoreError> {
-        self.base.clone().list(partition, key_type).await
+        self.base
+            .clone()
+            .list(partition, key_type, consistency)
+            .await
     }
 
     async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {

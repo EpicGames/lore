@@ -56,6 +56,10 @@ impl MutableStore for CountingStore {
         self.inner.clone().hold_for_command().await
     }
 
+    fn stored_typed_key(&self, key: Hash, key_type: KeyType) -> Hash {
+        self.inner.stored_typed_key(key, key_type)
+    }
+
     async fn load(
         self: Arc<Self>,
         partition: Partition,
@@ -97,8 +101,12 @@ impl MutableStore for CountingStore {
         self: Arc<Self>,
         partition: Partition,
         key_type: KeyType,
+        consistency: lore_storage::ReadConsistency,
     ) -> Result<KeyValueStream, StoreError> {
-        self.inner.clone().list(partition, key_type).await
+        self.inner
+            .clone()
+            .list(partition, key_type, consistency)
+            .await
     }
 
     async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::BranchPoint;
 use lore_base::types::Hash;
+use lore_base::types::KeyType;
 use lore_proto::lore::revision::v1::BranchListRequest;
 use lore_proto::lore::revision::v1::BranchListResponse;
 use lore_revision::branch;
@@ -19,6 +20,7 @@ use lore_server::grpc::handlers::branch_push;
 use lore_server::grpc::handlers::branch_push::PushHandler;
 use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::grpc::revision::v1::branch_list::*;
+use lore_storage::ReadConsistency;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
 use rand::random;
 use tokio_stream::StreamExt;
@@ -132,6 +134,21 @@ async fn collect_response(
     response.into_inner().collect().await
 }
 
+/// Reads that calls share for `window` after each starts.
+pub fn shared_reads(window: std::time::Duration) -> Arc<BranchListReads> {
+    BranchListReads::new(
+        window,
+        &lore_server::grpc::revision::v1::service::RevisionServiceInstrumentProvider,
+    )
+    .expect("the window is below the maximum")
+}
+
+/// Reads that only calls made while one runs share, so each call made after another has finished
+/// reads the store.
+pub fn unshared_reads() -> Arc<BranchListReads> {
+    shared_reads(std::time::Duration::ZERO)
+}
+
 mod direct_handling {
     use super::*;
 
@@ -158,6 +175,7 @@ mod direct_handling {
                 mutable_store.clone(),
                 &None, /* no forwarded requests */
                 DEFAULT_BRANCH_LIST_CONCURRENCY,
+                &unshared_reads(),
             )
             .await
             .expect("Request failed");
@@ -180,12 +198,53 @@ mod direct_handling {
         .await;
     }
 
-    /// A throttled store must end the stream with `RESOURCE_EXHAUSTED`
-    /// rather than completing successfully with that branch absent: a
-    /// client cannot tell an omitted branch from one that does not exist,
-    /// so a silently short listing is worse than an error.
+    /// The key of the `function` value of `branch_id` in `repository`, in the form `list` of
+    /// `mutable_store` reports it.
+    fn listed_key(
+        mutable_store: &Arc<dyn lore_storage::MutableStore>,
+        function: &str,
+        repository: RepositoryId,
+        branch_id: BranchId,
+    ) -> Hash {
+        let (key, key_type) = branch::mutable_key(
+            lore_revision::repository::SALT_LORE,
+            function,
+            repository,
+            branch_id,
+        );
+        mutable_store.stored_typed_key(key, key_type)
+    }
+
+    /// The items of `response`, each expected to be a branch.
+    async fn collect_branches(
+        response: Response<BranchListStream>,
+    ) -> Vec<lore_proto::lore::model::v1::Branch> {
+        collect_response(response)
+            .await
+            .into_iter()
+            .map(|item| {
+                item.expect("stream item ok")
+                    .branch
+                    .expect("branch response")
+            })
+            .collect()
+    }
+
+    /// The status that ends the stream of `response`.
+    async fn final_status(response: Response<BranchListStream>) -> Status {
+        collect_response(response)
+            .await
+            .into_iter()
+            .find_map(Result::err)
+            .expect("stream must carry an error")
+    }
+
+    /// A throttled range read must end the stream with `RESOURCE_EXHAUSTED`
+    /// rather than completing successfully with branches absent: a client
+    /// cannot tell an omitted branch from one that does not exist, so a
+    /// silently short listing is worse than an error.
     #[tokio::test]
-    async fn throttled_branch_record_ends_the_stream_rather_than_omitting_it() {
+    async fn throttled_range_read_ends_the_stream() {
         let repository = random::<RepositoryId>();
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
@@ -197,49 +256,103 @@ mod direct_handling {
                 repository,
                 allow_all_repositories(),
             ));
-            let main = create_root_branch(&repository_context, "main", "alice").await;
-            let main_latest = seed_revision(&repository_context, main).await;
-            let feature =
-                create_child_branch(&repository_context, "feature", "bob", main, main_latest).await;
+            create_root_branch(&repository_context, "main", "alice").await;
 
-            // Throttle only the branch-latest lookup for `feature`. Listing
-            // the branch ids and reading its metadata still succeed, so the
-            // request reaches the latest lookup.
-            let (latest_key, _key_type) = branch::mutable_key(
-                lore_revision::repository::SALT_LORE,
-                branch::LATEST,
-                repository,
-                feature,
-            );
-            let throttled = crate::store::test_support::FailingLoadStore::for_key(
-                mutable_store,
-                latest_key,
-                lore_storage::StoreError::from(lore_base::error::SlowDown),
-            );
+            for key_type in [
+                KeyType::BranchId,
+                KeyType::BranchMetadata,
+                KeyType::BranchLatestPointer,
+            ] {
+                let throttled = lore_storage::test_util::HookedStore::wrap(
+                    mutable_store.clone(),
+                    move |call, _key, called_type| {
+                        if call == lore_storage::test_util::StoreCall::List
+                            && called_type == key_type
+                        {
+                            return Err(lore_storage::StoreError::from(lore_base::error::SlowDown));
+                        }
+                        Ok(())
+                    },
+                    None,
+                );
+                let response = handler(
+                    make_request(repository, None, false),
+                    immutable_store.clone(),
+                    throttled,
+                    &None, /* no forwarded requests */
+                    DEFAULT_BRANCH_LIST_CONCURRENCY,
+                    &unshared_reads(),
+                )
+                .await
+                .expect("handler returns a stream");
 
-            let response = handler(
-                make_request(repository, None, false),
-                immutable_store,
-                throttled,
-                &None, /* no forwarded requests */
-                DEFAULT_BRANCH_LIST_CONCURRENCY,
-            )
-            .await
-            .expect("handler returns a stream");
-
-            let items = collect_response(response).await;
-            let status = items
-                .iter()
-                .find_map(|item| item.as_ref().err())
-                .expect("stream must carry the backpressure signal");
-            assert_eq!(status.code(), tonic::Code::ResourceExhausted);
-            assert_eq!(status.message(), OVERLOADED);
+                let status = final_status(response).await;
+                assert_eq!(
+                    status.code(),
+                    tonic::Code::ResourceExhausted,
+                    "{key_type:?}"
+                );
+                assert_eq!(status.message(), OVERLOADED);
+            }
         }))
         .await;
     }
 
+    /// A throttled metadata record read skips that branch and lists the others:
+    /// the read layer reports a failed immutable read as not found.
     #[tokio::test]
-    async fn unreadable_latest_preserves_other_branches_and_defaults_to_zero() {
+    async fn throttled_metadata_record_read_skips_the_branch() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+                allow_all_repositories(),
+            ));
+            create_root_branch(&repository_context, "main", "alice").await;
+            let feature = create_root_branch(&repository_context, "feature", "bob").await;
+            let metadata_hash = branch::metadata_hash(repository_context, feature)
+                .await
+                .expect("metadata hash");
+            let throttled = lore_storage::test_util::HookedImmutableStore::wrap(
+                immutable_store,
+                move |call, _partition, address| {
+                    if call == lore_storage::test_util::ImmutableCall::Get
+                        && address.hash == metadata_hash
+                    {
+                        return Err(lore_storage::StoreError::from(lore_base::error::SlowDown));
+                    }
+                    Ok(())
+                },
+            );
+
+            let response = handler(
+                make_request(repository, None, false),
+                throttled,
+                mutable_store,
+                &None, /* no forwarded requests */
+                DEFAULT_BRANCH_LIST_CONCURRENCY,
+                &unshared_reads(),
+            )
+            .await
+            .expect("handler returns a stream");
+
+            assert_eq!(
+                listed_branches(response.into_inner()).await,
+                [("main".to_string(), false)]
+            );
+        }))
+        .await;
+    }
+
+    /// A branch whose latest entry the range read misses is listed with a
+    /// zero latest, and its latest is not read again.
+    #[tokio::test]
+    async fn branch_whose_latest_entry_is_not_listed_has_a_zero_latest() {
         let repository = random::<RepositoryId>();
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
@@ -255,58 +368,49 @@ mod direct_handling {
             let main_latest = seed_revision(&repository_context, main).await;
             let feature =
                 create_child_branch(&repository_context, "feature", "bob", main, main_latest).await;
-
-            // Fail only the branch-latest lookup for `feature`. Listing
-            // the branch ids and reading its metadata still succeed, so the
-            // request reaches the latest lookup.
-            let (latest_key, _key_type) = branch::mutable_key(
-                lore_revision::repository::SALT_LORE,
-                branch::LATEST,
-                repository,
-                feature,
-            );
-            let failing = crate::store::test_support::FailingLoadStore::for_key(
-                mutable_store,
-                latest_key,
-                lore_storage::StoreError::internal("injected latest failure"),
+            let feature_latest = seed_revision(&repository_context, feature).await;
+            assert_ne!(feature_latest, Hash::default());
+            let missing = crate::store::test_support::ListOmittingStore::wrap(
+                mutable_store.clone(),
+                [listed_key(
+                    &mutable_store,
+                    branch::LATEST,
+                    repository,
+                    feature,
+                )],
             );
 
             let response = handler(
                 make_request(repository, None, false),
                 immutable_store,
-                failing,
+                missing,
                 &None, /* no forwarded requests */
                 DEFAULT_BRANCH_LIST_CONCURRENCY,
+                &unshared_reads(),
             )
             .await
             .expect("handler returns a stream");
 
-            let items = collect_response(response).await;
-            let branches: Vec<_> = items
-                .into_iter()
-                .map(|item| {
-                    item.expect("an unreadable latest must not terminate listing")
-                        .branch
-                        .expect("branch response")
-                })
-                .collect();
+            let branches = collect_branches(response).await;
             assert_eq!(branches.len(), 2);
             let main = branches
                 .iter()
                 .find(|branch| branch.name == "main")
-                .expect("healthy branch remains available");
+                .expect("main is listed");
             assert_eq!(Hash::from(main.latest.clone()), main_latest);
             let feature = branches
                 .iter()
                 .find(|branch| branch.name == "feature")
-                .expect("branch metadata remains available despite unreadable latest");
+                .expect("feature is listed without its latest entry");
             assert_eq!(Hash::from(feature.latest.clone()), Hash::default());
         }))
         .await;
     }
 
+    /// A live branch whose metadata entry the range read misses is left out,
+    /// with or without deleted branches, and its metadata is not read again.
     #[tokio::test]
-    async fn unreadable_metadata_hash_omits_only_the_broken_branch() {
+    async fn branch_whose_metadata_entry_is_not_listed_is_left_out() {
         let repository = random::<RepositoryId>();
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
@@ -322,42 +426,81 @@ mod direct_handling {
             let main_latest = seed_revision(&repository_context, main).await;
             let feature =
                 create_child_branch(&repository_context, "feature", "bob", main, main_latest).await;
+            let missing = crate::store::test_support::ListOmittingStore::wrap(
+                mutable_store.clone(),
+                [listed_key(
+                    &mutable_store,
+                    branch::METADATA,
+                    repository,
+                    feature,
+                )],
+            );
 
-            // The branch id is listed, but its metadata hash cannot be read.
-            let (metadata_key, _key_type) = branch::mutable_key(
-                lore_revision::repository::SALT_LORE,
-                branch::METADATA,
+            for include_deleted in [false, true] {
+                let response = handler(
+                    make_request(repository, None, include_deleted),
+                    immutable_store.clone(),
+                    missing.clone(),
+                    &None, /* no forwarded requests */
+                    DEFAULT_BRANCH_LIST_CONCURRENCY,
+                    &unshared_reads(),
+                )
+                .await
+                .expect("handler returns a stream");
+
+                let branches = collect_branches(response).await;
+                assert_eq!(branches.len(), 1);
+                assert_eq!(branches[0].name, "main");
+                assert_eq!(Hash::from(branches[0].latest.clone()), main_latest);
+            }
+        }))
+        .await;
+    }
+
+    /// A branch two names map to is listed once.
+    #[tokio::test]
+    async fn branch_two_names_map_to_is_listed_once() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
                 repository,
-                feature,
-            );
-            let failing = crate::store::test_support::FailingLoadStore::for_key(
-                mutable_store,
-                metadata_key,
-                lore_storage::StoreError::internal("injected metadata failure"),
-            );
+                allow_all_repositories(),
+            ));
+            let main = create_root_branch(&repository_context, "main", "alice").await;
+            // The key of a second name: listing reads the value, not the name it is the key of.
+            mutable_store
+                .clone()
+                .store(
+                    repository,
+                    random::<Hash>(),
+                    Hash::from_context(main),
+                    KeyType::BranchId,
+                )
+                .await
+                .expect("store a second name");
 
-            let response = handler(
-                make_request(repository, None, false),
-                immutable_store,
-                failing,
-                &None, /* no forwarded requests */
-                DEFAULT_BRANCH_LIST_CONCURRENCY,
-            )
-            .await
-            .expect("handler returns a stream");
+            for include_deleted in [false, true] {
+                let response = handler(
+                    make_request(repository, None, include_deleted),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    &None, /* no forwarded requests */
+                    DEFAULT_BRANCH_LIST_CONCURRENCY,
+                    &unshared_reads(),
+                )
+                .await
+                .expect("handler returns a stream");
 
-            let items = collect_response(response).await;
-            let branches: Vec<_> = items
-                .into_iter()
-                .map(|item| {
-                    item.expect("unreadable metadata must not terminate listing")
-                        .branch
-                        .expect("branch response")
-                })
-                .collect();
-            assert_eq!(branches.len(), 1);
-            assert_eq!(branches[0].name, "main");
-            assert_eq!(Hash::from(branches[0].latest.clone()), main_latest);
+                assert_eq!(
+                    listed_branches(response.into_inner()).await,
+                    [("main".to_string(), false)]
+                );
+            }
         }))
         .await;
     }
@@ -391,6 +534,7 @@ mod direct_handling {
                     mutable_store.clone(),
                     &None,
                     DEFAULT_BRANCH_LIST_CONCURRENCY,
+                    &unshared_reads(),
                 )
                 .await
                 .expect("handler returns a stream");
@@ -438,6 +582,7 @@ mod direct_handling {
                 mutable_store.clone(),
                 &None, /* no forwarded requests */
                 DEFAULT_BRANCH_LIST_CONCURRENCY,
+                &unshared_reads(),
             )
             .await
             .expect("Request failed");
@@ -471,6 +616,7 @@ mod direct_handling {
             let main_latest = seed_revision(&repository_context, main).await;
             let to_delete =
                 create_child_branch(&repository_context, "feature", "bob", main, main_latest).await;
+            let deleted_latest = seed_revision(&repository_context, to_delete).await;
             branch::delete(repository_context.clone(), to_delete)
                 .await
                 .expect("delete should succeed");
@@ -481,6 +627,7 @@ mod direct_handling {
                 mutable_store.clone(),
                 &None, /* no forwarded requests */
                 DEFAULT_BRANCH_LIST_CONCURRENCY,
+                &unshared_reads(),
             )
             .await
             .expect("Request failed");
@@ -506,6 +653,8 @@ mod direct_handling {
                 .unwrap();
             assert_eq!(deleted_branch.name, "feature");
             assert_eq!(deleted_branch.creator, "bob");
+            // An archive keeps the latest entry.
+            assert_eq!(Hash::from(deleted_branch.latest.clone()), deleted_latest);
         }))
         .await;
     }
@@ -554,6 +703,7 @@ mod direct_handling {
                 mutable_store.clone(),
                 &None, /* no forwarded requests */
                 DEFAULT_BRANCH_LIST_CONCURRENCY,
+                &unshared_reads(),
             )
             .await
             .expect("Request failed");
@@ -581,6 +731,7 @@ mod direct_handling {
                 mutable_store.clone(),
                 &None, /* no forwarded requests */
                 DEFAULT_BRANCH_LIST_CONCURRENCY,
+                &unshared_reads(),
             )
             .await
             .expect("Request failed");
@@ -627,6 +778,7 @@ mod direct_handling {
                 mutable_store.clone(),
                 &None, /* no forwarded requests */
                 DEFAULT_BRANCH_LIST_CONCURRENCY,
+                &unshared_reads(),
             )
             .await
             .expect("Request failed");
@@ -674,6 +826,7 @@ mod direct_handling {
                 mutable_store.clone(),
                 &None, /* no forwarded requests */
                 DEFAULT_BRANCH_LIST_CONCURRENCY,
+                &unshared_reads(),
             )
             .await
             .expect("Request failed");
@@ -696,7 +849,7 @@ mod direct_handling {
     /// Waits, for a bounded time, until the gated loads in flight satisfy
     /// `predicate`.
     async fn wait_for_in_flight(
-        gated: &crate::store::test_support::GatedLoadStore,
+        gated: &crate::store::test_support::LoadGate,
         predicate: impl FnMut(&usize) -> bool,
         expected: &str,
     ) {
@@ -732,14 +885,14 @@ mod direct_handling {
     }
 
     /// Creates `branch_count` live branches and starts listing them with the
-    /// given concurrency, holding each branch's latest load at the gate.
+    /// given concurrency, holding each branch's metadata record read at the gate.
     async fn start_gated_live_listing(
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         branch_count: usize,
         concurrency: usize,
     ) -> (
-        Arc<crate::store::test_support::GatedLoadStore>,
+        Arc<crate::store::test_support::GatedGetStore>,
         BranchListStream,
     ) {
         let repository = random::<RepositoryId>();
@@ -749,25 +902,24 @@ mod direct_handling {
             repository,
             allow_all_repositories(),
         ));
-        let mut latest_keys = Vec::with_capacity(branch_count);
+        let mut metadata_hashes = Vec::with_capacity(branch_count);
         for index in 0..branch_count {
             let id =
                 create_root_branch(&repository_context, &format!("branch{index}"), "alice").await;
-            let (key, _key_type) = branch::mutable_key(
-                lore_revision::repository::SALT_LORE,
-                branch::LATEST,
-                repository,
-                id,
-            );
-            latest_keys.push(key);
+            let metadata_hash = branch::metadata_hash(repository_context.clone(), id)
+                .await
+                .expect("metadata hash");
+            metadata_hashes.push(metadata_hash);
         }
-        let gated = crate::store::test_support::GatedLoadStore::new(mutable_store, latest_keys);
+        let gated =
+            crate::store::test_support::GatedGetStore::new(immutable_store, metadata_hashes);
         let response = handler(
             make_request(repository, None, false),
-            immutable_store,
             gated.clone(),
+            mutable_store,
             &None, /* no forwarded requests */
             std::num::NonZeroUsize::new(concurrency).expect("nonzero concurrency"),
+            &unshared_reads(),
         )
         .await
         .expect("handler returns a stream");
@@ -794,8 +946,9 @@ mod direct_handling {
         .await;
     }
 
-    /// Each branch makes one gated load: its latest read. The number of gated
-    /// loads in flight therefore equals the number of branches loading at once.
+    /// Each branch makes one gated load: its metadata record read. The number of
+    /// gated loads in flight therefore equals the number of branches loading at
+    /// once.
     #[tokio::test]
     async fn branch_loads_in_flight_never_exceed_the_concurrency_limit() {
         let (immutable_store, mutable_store, execution) =
@@ -842,10 +995,11 @@ mod direct_handling {
         .await;
     }
 
-    /// Without a creator filter, a live branch's latest revision is read while
-    /// its metadata is still loading.
+    /// A listing reads each of the three branch key types with one eventually consistent range
+    /// read, whatever its filter and whether it includes deleted branches, and makes no
+    /// single-item mutable read.
     #[tokio::test]
-    async fn live_branch_latest_loads_alongside_its_metadata() {
+    async fn listing_makes_one_eventual_range_read_per_key_type_and_no_loads() {
         let repository = random::<RepositoryId>();
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
@@ -858,48 +1012,154 @@ mod direct_handling {
                 allow_all_repositories(),
             ));
             let main = create_root_branch(&repository_context, "main", "alice").await;
-            let gated_keys = [branch::METADATA, branch::LATEST].map(|function| {
-                branch::mutable_key(
-                    lore_revision::repository::SALT_LORE,
-                    function,
-                    repository,
-                    main,
+            let main_latest = seed_revision(&repository_context, main).await;
+            for (name, creator) in [("first", "alice"), ("second", "bob"), ("third", "alice")] {
+                create_child_branch(&repository_context, name, creator, main, main_latest).await;
+            }
+            let deleted =
+                create_child_branch(&repository_context, "deleted", "bob", main, main_latest).await;
+            branch::delete(repository_context, deleted)
+                .await
+                .expect("delete should succeed");
+            let recording = crate::store::test_support::RecordingReadStore::new(mutable_store);
+
+            for (creator, include_deleted, listed_count) in [
+                (None, false, 4),
+                (None, true, 5),
+                (Some("alice"), false, 3),
+                (Some("bob"), true, 2),
+            ] {
+                let response = handler(
+                    make_request(repository, creator.map(String::from), include_deleted),
+                    immutable_store.clone(),
+                    recording.clone(),
+                    &None, /* no forwarded requests */
+                    DEFAULT_BRANCH_LIST_CONCURRENCY,
+                    &unshared_reads(),
                 )
-                .0
-            });
-            let gated = crate::store::test_support::GatedLoadStore::new(mutable_store, gated_keys);
-            let response = handler(
-                make_request(repository, None, false),
-                immutable_store,
-                gated.clone(),
-                &None, /* no forwarded requests */
-                std::num::NonZeroUsize::MIN,
-            )
-            .await
-            .expect("handler returns a stream");
+                .await
+                .expect("handler returns a stream");
 
-            wait_for_in_flight(
-                &gated,
-                |count| *count >= 2,
-                "latest and metadata loads at once",
-            )
-            .await;
-            gated.open();
-
-            assert_eq!(
-                listed_branches(response.into_inner()).await,
-                [("main".to_string(), false)]
-            );
+                assert_eq!(
+                    listed_branches(response.into_inner()).await.len(),
+                    listed_count
+                );
+                let mut listed = recording.take_listed();
+                listed.sort_by_key(|(key_type, _consistency)| *key_type as u8);
+                assert_eq!(
+                    listed,
+                    [
+                        (KeyType::BranchMetadata, ReadConsistency::Eventual),
+                        (KeyType::BranchId, ReadConsistency::Eventual),
+                        (KeyType::BranchLatestPointer, ReadConsistency::Eventual),
+                    ]
+                );
+                assert_eq!(recording.take_loaded(), []);
+            }
         }))
         .await;
     }
 
-    /// A throttled latest read ends the stream only for a branch that would be
-    /// listed. Without a creator filter the latest is read alongside the
-    /// metadata, and a branch skipped for unreadable metadata is dropped without
-    /// its latest being used.
+    /// Calls for one repository within the window share one read of its branch entries, whatever
+    /// their filter and whether they include deleted branches.
     #[tokio::test]
-    async fn throttled_latest_of_a_skipped_branch_does_not_end_the_stream() {
+    async fn calls_with_different_filters_share_one_read() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+                allow_all_repositories(),
+            ));
+            let main = create_root_branch(&repository_context, "main", "alice").await;
+            let main_latest = seed_revision(&repository_context, main).await;
+            create_child_branch(&repository_context, "first", "bob", main, main_latest).await;
+            let deleted =
+                create_child_branch(&repository_context, "deleted", "bob", main, main_latest).await;
+            branch::delete(repository_context, deleted)
+                .await
+                .expect("delete should succeed");
+            let recording = crate::store::test_support::RecordingReadStore::new(mutable_store);
+            let reads = shared_reads(std::time::Duration::from_secs(3600));
+
+            for (creator, include_deleted, listed_count) in [
+                (None, false, 2),
+                (Some("bob"), true, 2),
+                (None, true, 3),
+                (Some("alice"), false, 1),
+            ] {
+                let response = handler(
+                    make_request(repository, creator.map(String::from), include_deleted),
+                    immutable_store.clone(),
+                    recording.clone(),
+                    &None, /* no forwarded requests */
+                    DEFAULT_BRANCH_LIST_CONCURRENCY,
+                    &reads,
+                )
+                .await
+                .expect("handler returns a stream");
+                assert_eq!(
+                    listed_branches(response.into_inner()).await.len(),
+                    listed_count
+                );
+            }
+
+            assert_eq!(
+                recording.take_listed().len(),
+                3,
+                "one read of each key type"
+            );
+            assert_eq!(recording.take_loaded(), []);
+        }))
+        .await;
+    }
+
+    /// The shared read joins the listed entries once: a call that reuses it computes no keys.
+    #[tokio::test]
+    async fn a_call_that_reuses_a_read_computes_no_keys() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+                allow_all_repositories(),
+            ));
+            let main = create_root_branch(&repository_context, "main", "alice").await;
+            let main_latest = seed_revision(&repository_context, main).await;
+            create_child_branch(&repository_context, "first", "bob", main, main_latest).await;
+            let recording = crate::store::test_support::RecordingReadStore::new(mutable_store);
+            let reads = shared_reads(std::time::Duration::from_secs(3600));
+
+            for computes_keys in [true, false] {
+                let response = handler(
+                    make_request(repository, None, true),
+                    immutable_store.clone(),
+                    recording.clone(),
+                    &None, /* no forwarded requests */
+                    DEFAULT_BRANCH_LIST_CONCURRENCY,
+                    &reads,
+                )
+                .await
+                .expect("handler returns a stream");
+                assert_eq!(listed_branches(response.into_inner()).await.len(), 2);
+                assert_eq!(recording.take_stored_key_count() > 0, computes_keys);
+            }
+        }))
+        .await;
+    }
+
+    /// The error of a read the store throttled ends every call in the window, though the store
+    /// would answer the later calls.
+    #[tokio::test]
+    async fn a_throttled_read_s_error_ends_the_calls_in_the_window() {
         let repository = random::<RepositoryId>();
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
@@ -912,90 +1172,44 @@ mod direct_handling {
                 allow_all_repositories(),
             ));
             create_root_branch(&repository_context, "main", "alice").await;
-            let other = create_root_branch(&repository_context, "other", "bob").await;
-            let key = |function| {
-                branch::mutable_key(
-                    lore_revision::repository::SALT_LORE,
-                    function,
-                    repository,
-                    other,
+            let lists = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let throttled_once = {
+                let lists = lists.clone();
+                lore_storage::test_util::HookedStore::wrap(
+                    mutable_store.clone(),
+                    move |call, _key, _key_type| {
+                        if call == lore_storage::test_util::StoreCall::List
+                            && lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+                        {
+                            return Err(lore_storage::StoreError::from(lore_base::error::SlowDown));
+                        }
+                        Ok(())
+                    },
+                    None,
                 )
-                .0
             };
-            let unreadable_metadata = crate::store::test_support::FailingLoadStore::for_key(
-                mutable_store,
-                key(branch::METADATA),
-                lore_storage::StoreError::internal("injected metadata hash failure"),
-            );
-            let throttled = crate::store::test_support::FailingLoadStore::for_key(
-                unreadable_metadata,
-                key(branch::LATEST),
-                lore_storage::StoreError::from(lore_base::error::SlowDown),
-            );
+            let reads = shared_reads(std::time::Duration::from_secs(3600));
 
-            let response = handler(
-                make_request(repository, None, false),
-                immutable_store,
-                throttled,
-                &None, /* no forwarded requests */
-                DEFAULT_BRANCH_LIST_CONCURRENCY,
-            )
-            .await
-            .expect("handler returns a stream");
-
-            assert_eq!(
-                listed_branches(response.into_inner()).await,
-                [("main".to_string(), false)]
-            );
-        }))
-        .await;
-    }
-
-    /// With a creator filter, only the branches that pass it have their latest
-    /// revision read.
-    #[tokio::test]
-    async fn filtered_listing_reads_latest_only_for_matching_branches() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                repository,
-                allow_all_repositories(),
-            ));
-            let main = create_root_branch(&repository_context, "main", "alice").await;
-            let other = create_root_branch(&repository_context, "other", "bob").await;
-            let latest_key = |branch_id| {
-                branch::mutable_key(
-                    lore_revision::repository::SALT_LORE,
-                    branch::LATEST,
-                    repository,
-                    branch_id,
+            for include_deleted in [false, true] {
+                let response = handler(
+                    make_request(repository, None, include_deleted),
+                    immutable_store.clone(),
+                    throttled_once.clone(),
+                    &None, /* no forwarded requests */
+                    DEFAULT_BRANCH_LIST_CONCURRENCY,
+                    &reads,
                 )
-                .0
-            };
-            let recording = crate::store::test_support::RecordingLoadStore::new(mutable_store);
+                .await
+                .expect("handler returns a stream");
 
-            let response = handler(
-                make_request(repository, Some("alice".into()), false),
-                immutable_store,
-                recording.clone(),
-                &None, /* no forwarded requests */
-                DEFAULT_BRANCH_LIST_CONCURRENCY,
-            )
-            .await
-            .expect("handler returns a stream");
-
-            assert_eq!(
-                listed_branches(response.into_inner()).await,
-                [("main".to_string(), false)]
+                let status = final_status(response).await;
+                assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+                assert_eq!(status.message(), OVERLOADED);
+            }
+            assert!(
+                lists.load(std::sync::atomic::Ordering::SeqCst) <= 3,
+                "only the first call reads"
             );
-            let loaded = recording.take_loaded();
-            assert!(loaded.contains(&latest_key(main)));
-            assert!(!loaded.contains(&latest_key(other)));
         }))
         .await;
     }
@@ -1020,7 +1234,7 @@ mod direct_handling {
             let main = create_root_branch(&repository_context, "main", "alice").await;
             let main_latest = seed_revision(&repository_context, main).await;
             create_child_branch(&repository_context, "kept", "alice", main, main_latest).await;
-            let mut latest_keys = Vec::with_capacity(DELETED);
+            let mut metadata_hashes = Vec::with_capacity(DELETED);
             for index in 0..DELETED {
                 let id = create_child_branch(
                     &repository_context,
@@ -1033,22 +1247,21 @@ mod direct_handling {
                 branch::delete(repository_context.clone(), id)
                     .await
                     .expect("delete should succeed");
-                let (key, _key_type) = branch::mutable_key(
-                    lore_revision::repository::SALT_LORE,
-                    branch::LATEST,
-                    repository,
-                    id,
-                );
-                latest_keys.push(key);
+                let metadata_hash = branch::metadata_hash(repository_context.clone(), id)
+                    .await
+                    .expect("metadata hash");
+                metadata_hashes.push(metadata_hash);
             }
-            // Only the deleted pass reads these keys.
-            let gated = crate::store::test_support::GatedLoadStore::new(mutable_store, latest_keys);
+            // Only the deleted pass reads these records.
+            let gated =
+                crate::store::test_support::GatedGetStore::new(immutable_store, metadata_hashes);
             let response = handler(
                 make_request(repository, None, true),
-                immutable_store,
                 gated.clone(),
+                mutable_store,
                 &None, /* no forwarded requests */
                 std::num::NonZeroUsize::new(LIMIT).expect("nonzero concurrency"),
+                &unshared_reads(),
             )
             .await
             .expect("handler returns a stream");
@@ -1087,6 +1300,7 @@ mod direct_handling {
                 mutable_store.clone(),
                 &None, /* no forwarded requests */
                 DEFAULT_BRANCH_LIST_CONCURRENCY,
+                &unshared_reads(),
             )
             .await
             .expect("Request failed");
@@ -1235,6 +1449,7 @@ mod forwarded_request {
                 mutable_store,
                 &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
                 DEFAULT_BRANCH_LIST_CONCURRENCY,
+                &unshared_reads(),
             )
             .await
             .expect("should succeed");
@@ -1273,6 +1488,7 @@ mod forwarded_request {
                 mutable_store,
                 &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
                 DEFAULT_BRANCH_LIST_CONCURRENCY,
+                &unshared_reads(),
             )
             .await
             .map(|_| ())
@@ -1301,6 +1517,7 @@ mod forwarded_request {
                 mutable_store,
                 &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
                 DEFAULT_BRANCH_LIST_CONCURRENCY,
+                &unshared_reads(),
             )
             .await
             .map(|_| ())
@@ -1340,6 +1557,7 @@ mod forwarded_request {
                 mutable_store,
                 &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
                 DEFAULT_BRANCH_LIST_CONCURRENCY,
+                &unshared_reads(),
             )
             .await
             .expect("local execution should succeed");

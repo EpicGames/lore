@@ -22,6 +22,7 @@ use lore_storage::LocalImmutableStore;
 use lore_storage::LocalMutableStore;
 use lore_storage::MutableStore;
 use lore_storage::Partition;
+use lore_storage::ReadConsistency;
 use lore_storage::StoreError;
 use parking_lot::Mutex;
 
@@ -123,7 +124,7 @@ impl Read {
 pub async fn list(store: &Arc<dyn MutableStore>) -> Result<Vec<(Hash, Hash)>, String> {
     let mut listed = store
         .clone()
-        .list(partition(), KEY_TYPE)
+        .list(partition(), KEY_TYPE, ReadConsistency::Strong)
         .await
         .map_err(|err| err.to_string())?
         .channel();

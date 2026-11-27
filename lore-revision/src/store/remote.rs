@@ -581,6 +581,12 @@ impl store::MutableStore for RemoteMutableStore {
         Some(Box::new(self.pools.hold(correlation_id)))
     }
 
+    /// Answers `key` unchanged. This store's `list` is unsupported and reports no key, so every
+    /// answer agrees with it, and the form the server's store keeps does not reach this client.
+    fn stored_typed_key(&self, key: Hash, _key_type: KeyType) -> Hash {
+        key
+    }
+
     async fn load(
         self: Arc<Self>,
         partition: Partition,
@@ -602,6 +608,7 @@ impl store::MutableStore for RemoteMutableStore {
         self: Arc<Self>,
         _repository: Partition,
         _key_type: KeyType,
+        _consistency: store::ReadConsistency,
     ) -> Result<KeyValueStream, StoreError> {
         Err(StoreError::internal("Store does not support operation"))
     }

@@ -3,6 +3,7 @@
 pub mod cert_metrics;
 pub mod core_hop;
 pub mod local_store_monitor;
+pub mod shared_read;
 
 use lore_revision::interface::LoreGlobalArgs;
 

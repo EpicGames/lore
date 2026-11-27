@@ -16,6 +16,16 @@ use crate::local::store_lock::StoreGuard;
 use crate::store_types::KeyType;
 use crate::store_types::KeyValueStream;
 
+/// How up to date a read of a [`MutableStore`] must be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadConsistency {
+    /// The read reflects every write that completed before it started.
+    Strong,
+    /// The read can miss writes that completed shortly before it started, and costs less where a
+    /// store offers it. A store that cannot read this way reads strongly.
+    Eventual,
+}
+
 /// Values held by keys of a [`KeyType`] within a [`Partition`].
 ///
 /// A key holds zero when it is absent, and a stored zero is an absent key: every method treats it
@@ -58,6 +68,14 @@ pub trait MutableStore: Send + Sync {
     fn hold_correlation(&self, _correlation_id: &str) -> Option<CorrelationHold> {
         None
     }
+
+    /// Returns `key` of the type `key_type` in the form [`Self::list`] reports it. Each store
+    /// marks the key type in the key it keeps, in a place of its own, so the key `list` reports for
+    /// a stored key can differ from the key its caller passed.
+    ///
+    /// There is no default answer, as for [`Self::hold_for_command`]: every store decides for
+    /// itself, and a wrapper delegates to the store it wraps.
+    fn stored_typed_key(&self, key: Hash, key_type: KeyType) -> Hash;
 
     /// Returns the mutable value stored for `key` with the type `key_type` within `partition`.
     ///
@@ -110,12 +128,13 @@ pub trait MutableStore: Send + Sync {
     ) -> Result<Hash, StoreError>;
 
     /// List all the key-value pairs of a given type for the given partition, leaving out the keys
-    /// that hold zero.
+    /// that hold zero, read with `consistency`.
     /// If the partition is null, it must match all partitions the user have access to
     async fn list(
         self: Arc<Self>,
         partition: Partition,
         key_type: KeyType,
+        consistency: ReadConsistency,
     ) -> Result<KeyValueStream, StoreError>;
 
     /// Flush any pending writes to durable storage, as `options` asks.

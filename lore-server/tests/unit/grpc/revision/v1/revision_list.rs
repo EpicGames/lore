@@ -2265,6 +2265,10 @@ impl lore_storage::MutableStore for FailingMutableStore {
         lore_storage::MutableStore::hold_for_command(self.inner.clone()).await
     }
 
+    fn stored_typed_key(&self, key: Hash, key_type: lore_storage::KeyType) -> Hash {
+        self.inner.stored_typed_key(key, key_type)
+    }
+
     async fn load(
         self: Arc<Self>,
         partition: lore_storage::Partition,
@@ -2310,8 +2314,12 @@ impl lore_storage::MutableStore for FailingMutableStore {
         self: Arc<Self>,
         partition: lore_storage::Partition,
         key_type: lore_storage::KeyType,
+        consistency: lore_storage::ReadConsistency,
     ) -> Result<lore_storage::KeyValueStream, lore_storage::StoreError> {
-        self.inner.clone().list(partition, key_type).await
+        self.inner
+            .clone()
+            .list(partition, key_type, consistency)
+            .await
     }
 
     async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), lore_storage::StoreError> {

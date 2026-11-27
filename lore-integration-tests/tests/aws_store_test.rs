@@ -37,6 +37,7 @@ mod aws_store_tests {
     use lore_storage::FRAGMENT_COMPRESS_SIZE_LIMIT;
     use lore_storage::ImmutableStore;
     use lore_storage::MutableStore;
+    use lore_storage::ReadConsistency;
     use lore_storage::StoreError;
     use lore_storage::StoreGetData;
     use lore_storage::StoreMatch;
@@ -1366,7 +1367,7 @@ mod aws_store_tests {
 
                 let stream = mutable_store
                     .clone()
-                    .list(repository, KeyType::BranchId)
+                    .list(repository, KeyType::BranchId, ReadConsistency::Strong)
                     .await?;
 
                 let mut channel = stream.channel();
@@ -1401,7 +1402,7 @@ mod aws_store_tests {
             .scope(execution.clone(), async move {
                 let stream = mutable_store
                     .clone()
-                    .list(repository, KeyType::BranchId)
+                    .list(repository, KeyType::BranchId, ReadConsistency::Strong)
                     .await?;
 
                 let mut channel = stream.channel();
@@ -1444,7 +1445,7 @@ mod aws_store_tests {
 
                 let mut branch_channel = mutable_store
                     .clone()
-                    .list(repository, KeyType::BranchId)
+                    .list(repository, KeyType::BranchId, ReadConsistency::Strong)
                     .await?
                     .channel();
                 let mut branch_results = Vec::new();
@@ -1457,7 +1458,7 @@ mod aws_store_tests {
 
                 let mut metadata_channel = mutable_store
                     .clone()
-                    .list(repository, KeyType::BranchMetadata)
+                    .list(repository, KeyType::BranchMetadata, ReadConsistency::Strong)
                     .await?
                     .channel();
                 let mut metadata_results = Vec::new();
@@ -1498,7 +1499,7 @@ mod aws_store_tests {
 
                 let mut channel = mutable_store
                     .clone()
-                    .list(repository, KeyType::BranchId)
+                    .list(repository, KeyType::BranchId, ReadConsistency::Strong)
                     .await?
                     .channel();
                 let mut results = Vec::new();

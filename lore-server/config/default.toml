@@ -186,3 +186,9 @@ history_step_size = 100
 
 # Branches a v1 BranchList request loads from the store at once. Must be at least 1.
 # branch_list_concurrency = 100
+
+# Milliseconds after it starts that a read of a repository's branch entries serves the other v1
+# BranchList calls of this process for that repository. A call made while a read runs always joins
+# it. A read's error, or the short listing of a list the store cuts short, is served like its
+# result. 0 shares only running reads. At most 60000.
+# branch_list_share_window_millis = 1000

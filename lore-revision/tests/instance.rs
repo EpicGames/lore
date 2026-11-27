@@ -54,6 +54,7 @@ mod tests {
     use lore_revision::repository::SALT_LORE;
     use lore_revision::repository::SharedStoreToUseConfig;
     use lore_storage::Hash;
+    use lore_storage::ReadConsistency;
     use lore_storage::ReadOptions;
     use lore_storage::StoreError;
     use lore_storage::WriteOptions;
@@ -409,7 +410,7 @@ mod tests {
                 // per instance and unmodified.
                 let mut stream = mutable_store
                     .clone()
-                    .list(repository.id, KeyType::Instance)
+                    .list(repository.id, KeyType::Instance, ReadConsistency::Strong)
                     .await
                     .expect("list instances failed");
 

@@ -13,6 +13,7 @@ use lore_base::types::Partition;
 use lore_storage::FlushOptions;
 use lore_storage::KeyValueStream;
 use lore_storage::MutableStore as MutableStoreTrait;
+use lore_storage::ReadConsistency;
 use lore_storage::StoreError;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::LabelArray;
@@ -177,6 +178,7 @@ impl DynamoDbCondition for CompareAndSwapCondition {
 struct ListQuery {
     repository: Context,
     key_type: KeyType,
+    consistency: ReadConsistency,
 }
 
 impl DynamoDbQuery for ListQuery {
@@ -203,7 +205,7 @@ impl DynamoDbQuery for ListQuery {
     }
 
     fn consistent_read(&self) -> bool {
-        true
+        self.consistency == ReadConsistency::Strong
     }
 }
 
@@ -380,6 +382,7 @@ impl AwsMutableStore {
         self: Arc<Self>,
         repository: Context,
         key_type: KeyType,
+        consistency: ReadConsistency,
     ) -> Result<KeyValueStream, StoreError> {
         let (stream, sender) = KeyValueStream::new();
 
@@ -390,6 +393,7 @@ impl AwsMutableStore {
         let query = ListQuery {
             repository,
             key_type,
+            consistency,
         };
         let table_name = self.mutable_store_table_name.clone();
         let store = self.clone();
@@ -541,18 +545,24 @@ impl MutableStoreTrait for AwsMutableStore {
         Ok(None)
     }
 
+    /// Marks the key type in byte 0, so the keys of one type form one range of the table's sort key.
+    fn stored_typed_key(&self, key: Hash, key_type: KeyType) -> Hash {
+        Self::typed_key(key, key_type)
+    }
+
     #[lore_macro::lore_instrument]
     #[tracing::instrument(name= "AwsMutableStore::list" skip(self))]
     async fn list(
         self: Arc<Self>,
         partition: Partition,
         key_type: KeyType,
+        consistency: ReadConsistency,
     ) -> Result<KeyValueStream, StoreError> {
         let repository: Context = partition.into();
         timed!(
             self.latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME),
             &self.get_labels_for_operation_context("list"),
-            { self.clone().list_typed(repository, key_type) }
+            { self.clone().list_typed(repository, key_type, consistency) }
         )
         .into()
     }

@@ -60,6 +60,7 @@ use crate::grpc::notification_service::NotificationService;
 use crate::grpc::repository::LoreRepositoryV1Service;
 use crate::grpc::repository_service::LoreRepositoryService;
 use crate::grpc::revision::LoreRevisionV1Service;
+use crate::grpc::revision::v1::branch_list::BranchListReads;
 use crate::grpc::revision_service::LoreRevisionService;
 use crate::grpc::storage_service::LoreStorageService;
 use crate::grpc::thinclient::LoreThinClientV1Service;
@@ -220,6 +221,9 @@ pub struct FeatureSettings {
     /// Number of branches the v1 `BranchList` handler loads at once.
     /// Defaults to 100.
     pub branch_list_concurrency: Option<NonZeroUsize>,
+    /// Milliseconds after it starts that a read of a repository's branch entries serves other v1
+    /// `BranchList` calls of the process. A running read always serves them. Defaults to 1,000.
+    pub branch_list_share_window_millis: Option<u64>,
 }
 
 impl FeatureSettings {
@@ -227,6 +231,14 @@ impl FeatureSettings {
     pub fn branch_list_concurrency(&self) -> NonZeroUsize {
         self.branch_list_concurrency
             .unwrap_or(crate::grpc::revision::v1::branch_list::DEFAULT_BRANCH_LIST_CONCURRENCY)
+    }
+
+    /// The configured `branch_list_share_window_millis`, or its default when unset.
+    pub fn branch_list_share_window(&self) -> Duration {
+        self.branch_list_share_window_millis.map_or(
+            crate::grpc::revision::v1::branch_list::DEFAULT_BRANCH_LIST_SHARE_WINDOW,
+            Duration::from_millis,
+        )
     }
 }
 
@@ -317,10 +329,17 @@ pub struct WantsFeature {
 }
 
 impl GrpcServerBuilder<WantsFeature> {
-    pub fn with_feature(self, feature: FeatureSettings) -> GrpcServerBuilder<WantsImmutableStore> {
+    /// `branch_list_reads` serves the `BranchList` calls of this server, and of every other server
+    /// of the process given the same reads.
+    pub fn with_feature(
+        self,
+        feature: FeatureSettings,
+        branch_list_reads: Arc<BranchListReads>,
+    ) -> GrpcServerBuilder<WantsImmutableStore> {
         GrpcServerBuilder(WantsImmutableStore {
             environment: self.0.environment,
             feature,
+            branch_list_reads,
         })
     }
 }
@@ -328,6 +347,7 @@ impl GrpcServerBuilder<WantsFeature> {
 pub struct WantsImmutableStore {
     environment: EnvironmentConfig,
     feature: FeatureSettings,
+    branch_list_reads: Arc<BranchListReads>,
 }
 
 impl GrpcServerBuilder<WantsImmutableStore> {
@@ -343,6 +363,7 @@ impl GrpcServerBuilder<WantsImmutableStore> {
         GrpcServerBuilder(WantsMutableStore {
             environment: self.0.environment,
             feature: self.0.feature,
+            branch_list_reads: self.0.branch_list_reads,
             immutable_store,
             local_store,
             local_tier,
@@ -353,6 +374,7 @@ impl GrpcServerBuilder<WantsImmutableStore> {
 pub struct WantsMutableStore {
     environment: EnvironmentConfig,
     feature: FeatureSettings,
+    branch_list_reads: Arc<BranchListReads>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
     local_tier: Option<Arc<dyn ImmutableStore>>,
@@ -366,6 +388,7 @@ impl GrpcServerBuilder<WantsMutableStore> {
         GrpcServerBuilder(MaybeLockStore {
             environment: self.0.environment,
             feature: self.0.feature,
+            branch_list_reads: self.0.branch_list_reads,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
             local_tier: self.0.local_tier,
@@ -377,6 +400,7 @@ impl GrpcServerBuilder<WantsMutableStore> {
 pub struct MaybeLockStore {
     environment: EnvironmentConfig,
     feature: FeatureSettings,
+    branch_list_reads: Arc<BranchListReads>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
     local_tier: Option<Arc<dyn ImmutableStore>>,
@@ -391,6 +415,7 @@ impl GrpcServerBuilder<MaybeLockStore> {
         GrpcServerBuilder(WantsNotification {
             environment: self.0.environment,
             feature: self.0.feature,
+            branch_list_reads: self.0.branch_list_reads,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
             local_tier: self.0.local_tier,
@@ -403,6 +428,7 @@ impl GrpcServerBuilder<MaybeLockStore> {
 pub struct WantsNotification {
     environment: EnvironmentConfig,
     feature: FeatureSettings,
+    branch_list_reads: Arc<BranchListReads>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
     local_tier: Option<Arc<dyn ImmutableStore>>,
@@ -419,6 +445,7 @@ impl GrpcServerBuilder<WantsNotification> {
         GrpcServerBuilder(MaybeHookDispatcher {
             environment: self.0.environment,
             feature: self.0.feature,
+            branch_list_reads: self.0.branch_list_reads,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
             local_tier: self.0.local_tier,
@@ -433,6 +460,7 @@ impl GrpcServerBuilder<WantsNotification> {
 pub struct MaybeHookDispatcher {
     environment: EnvironmentConfig,
     feature: FeatureSettings,
+    branch_list_reads: Arc<BranchListReads>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
     local_tier: Option<Arc<dyn ImmutableStore>>,
@@ -450,6 +478,7 @@ impl GrpcServerBuilder<MaybeHookDispatcher> {
         GrpcServerBuilder(WantsTlsConfig {
             environment: self.0.environment,
             feature: self.0.feature,
+            branch_list_reads: self.0.branch_list_reads,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
             local_tier: self.0.local_tier,
@@ -465,6 +494,7 @@ impl GrpcServerBuilder<MaybeHookDispatcher> {
 pub struct WantsTlsConfig {
     environment: EnvironmentConfig,
     feature: FeatureSettings,
+    branch_list_reads: Arc<BranchListReads>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
     local_tier: Option<Arc<dyn ImmutableStore>>,
@@ -499,6 +529,7 @@ impl GrpcServerBuilder<WantsTlsConfig> {
         Ok(GrpcServerBuilder(WantsAdminEndpoints {
             environment: self.0.environment,
             feature: self.0.feature,
+            branch_list_reads: self.0.branch_list_reads,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
             local_tier: self.0.local_tier,
@@ -515,6 +546,7 @@ impl GrpcServerBuilder<WantsTlsConfig> {
 pub struct WantsAdminEndpoints {
     environment: EnvironmentConfig,
     feature: FeatureSettings,
+    branch_list_reads: Arc<BranchListReads>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
     local_tier: Option<Arc<dyn ImmutableStore>>,
@@ -543,6 +575,7 @@ impl GrpcServerBuilder<WantsAdminEndpoints> {
         GrpcServerBuilder(WantsHttp2Config {
             environment: self.0.environment,
             feature: self.0.feature,
+            branch_list_reads: self.0.branch_list_reads,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
             local_tier: self.0.local_tier,
@@ -560,6 +593,7 @@ impl GrpcServerBuilder<WantsAdminEndpoints> {
 pub struct WantsHttp2Config {
     environment: EnvironmentConfig,
     feature: FeatureSettings,
+    branch_list_reads: Arc<BranchListReads>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
     local_tier: Option<Arc<dyn ImmutableStore>>,
@@ -601,6 +635,7 @@ impl GrpcServerBuilder<WantsHttp2Config> {
         GrpcServerBuilder(MaybeJwtVerifier {
             environment: self.0.environment,
             feature: self.0.feature,
+            branch_list_reads: self.0.branch_list_reads,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
             local_tier: self.0.local_tier,
@@ -625,6 +660,7 @@ impl GrpcServerBuilder<WantsHttp2Config> {
 pub struct MaybeJwtVerifier {
     environment: EnvironmentConfig,
     feature: FeatureSettings,
+    branch_list_reads: Arc<BranchListReads>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
     local_tier: Option<Arc<dyn ImmutableStore>>,
@@ -798,6 +834,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             self.0.forwarded_requests.clone(),
             rpc_timeout,
             self.0.feature.branch_list_concurrency(),
+            self.0.branch_list_reads,
         );
         let repository_svc = LoreRepositoryService::new(
             self.0.environment.clone(),

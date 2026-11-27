@@ -2322,10 +2322,13 @@ The check has time and work limits and reports when it cannot complete. Remote e
 stops when it encounters more than 10,000 branches, before collecting the rest of the listing. It covers the target
 repository's active branches, not archived branches or every other repository that links into
 it. Offline checks cannot establish remote impact. Branch listing deliberately omits unreadable
-branch metadata and reports a zero latest revision when that pointer cannot be read. The remote
-inspection warns that impact for omitted branches is unknown, and reports unknown impact for
-branches with a zero latest revision because it cannot distinguish an empty branch from a read
-failure. Concurrent pushes can change latest pointers after inspection; absence of a known
+branch metadata and reports a zero latest revision when that pointer cannot be read. The server
+reads a listing eventually consistently, so a branch created or archived about a second before
+the listing can be missing from it or still in it, and a latest revision can be out of date. With
+`include_deleted`, a live branch whose name entry the read missed is listed as deleted. The
+remote inspection warns that impact for omitted branches is unknown, and reports unknown impact
+for branches with a zero latest revision because it cannot distinguish an empty branch from a
+read failure. Concurrent pushes can change latest pointers after inspection; absence of a known
 impact warning is not a guarantee of cloneability. Zero-context structural targets report
 unknown impact instead of being classified as unreferenced. Direct storage/admin RPC callers
 do not run this revision-layer check.
@@ -2396,7 +2399,9 @@ The `MutableStore` trait exposes a narrow API: `load`, `store`, `cas`, `list`, e
 taking a typed key. The `cas` (compare-and-swap) operation is what gives Lore atomic
 state transitions (§9.4); every backend must implement it correctly. A key holds zero
 when it's absent: a `cas` from zero creates the key, and a `cas` or `store` to zero
-removes it and leaves no entry behind.
+removes it and leaves no entry behind. Each backend marks the key type in the key it
+keeps, in a place of its own, and `stored_typed_key` returns a key in the form that
+backend's `list` reports it.
 
 Lore ships with:
 

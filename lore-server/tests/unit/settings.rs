@@ -2649,3 +2649,48 @@ mod quic_settings_slow_send_threshold {
         );
     }
 }
+
+/// Settings with the given `[feature]` keys.
+fn settings_with_feature_keys(feature_keys: &str) -> Settings {
+    let config = format!(
+        r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+
+            [feature]
+            {feature_keys}
+        "#
+    );
+    toml::from_str(Box::leak(config.into_boxed_str())).expect("the settings parse")
+}
+
+#[test]
+fn a_branch_list_share_window_up_to_its_maximum_passes_validation() {
+    for keys in [
+        "",
+        "branch_list_share_window_millis = 0",
+        "branch_list_share_window_millis = 60000",
+    ] {
+        validate_feature_config(&settings_with_feature_keys(keys))
+            .unwrap_or_else(|error| panic!("{keys} must validate: {error}"));
+    }
+}
+
+#[test]
+fn a_branch_list_share_window_above_its_maximum_fails_validation() {
+    for keys in [
+        "branch_list_share_window_millis = 60001",
+        "branch_list_share_window_millis = 9223372036854775807",
+    ] {
+        assert!(
+            validate_feature_config(&settings_with_feature_keys(keys)).is_err(),
+            "{keys}"
+        );
+    }
+}

@@ -22,6 +22,7 @@ use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
 use lore_revision::store::event::LoreStorageMutableListEntryEventData;
 use lore_revision::store::event::LoreStorageMutableListItemCompleteEventData;
+use lore_storage::ReadConsistency;
 use lore_storage::StorageError;
 
 use crate::call_delegation::dispatch_call;
@@ -126,7 +127,7 @@ async fn list_item(
     match store
         .mutable
         .clone()
-        .list(item.partition, item.key_type)
+        .list(item.partition, item.key_type, ReadConsistency::Strong)
         .await
     {
         Ok(stream) => {

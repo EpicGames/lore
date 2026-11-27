@@ -63,6 +63,7 @@ use crate::metadata::MetadataError;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryContextCreationArgs;
 use crate::repository::VfsType;
+use crate::store::ReadConsistency;
 use crate::util::in_use::is_free;
 use crate::util::in_use::is_in_use;
 use crate::util::in_use::rename_is_retryable;
@@ -677,7 +678,7 @@ pub(crate) async fn registrations(
 
     let mut stream = repository
         .read_mutable_store()
-        .list(repository.id, KeyType::Instance)
+        .list(repository.id, KeyType::Instance, ReadConsistency::Strong)
         .await
         .forward::<InstanceRegistryError>("failed to list instances")?;
 
@@ -856,7 +857,7 @@ fn visit_records<'a>(
 
         let mut registrations = repository
             .read_mutable_store()
-            .list(repository.id, KeyType::Instance)
+            .list(repository.id, KeyType::Instance, ReadConsistency::Strong)
             .await
             .forward::<InstanceError>("listing registered instances")?;
         let state = resolve().forward::<InstanceError>("resolving the external root")?;

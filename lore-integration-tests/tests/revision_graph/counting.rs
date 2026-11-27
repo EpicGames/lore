@@ -19,6 +19,7 @@ use lore_base::types::Hash;
 use lore_base::types::KeyType;
 use lore_revision::event::LoreEvent;
 use lore_revision::protocol::RemoteEndpoint;
+use lore_storage::ReadConsistency;
 use lore_storage::StoreError;
 use lore_storage::fragment_flags::FragmentFlags;
 use lore_storage::hash;
@@ -297,7 +298,7 @@ async fn a_counted_handle_counts_each_call_on_its_stores() {
             .await
             .expect("loads a key");
         mutable
-            .list(f.repository, KeyType::Instance)
+            .list(f.repository, KeyType::Instance, ReadConsistency::Strong)
             .await
             .expect("lists keys");
         let immutable_store = state.immutable.clone();

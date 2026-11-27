@@ -5955,6 +5955,10 @@ impl MutableStore for FailingMutableStore {
         Ok(None)
     }
 
+    fn stored_typed_key(&self, key: Hash, _key_type: KeyType) -> Hash {
+        key
+    }
+
     async fn load(self: Arc<Self>, _: Partition, _: Hash, _: KeyType) -> Result<Hash, StoreError> {
         Err(StoreError::from(Disconnected))
     }
@@ -5984,6 +5988,7 @@ impl MutableStore for FailingMutableStore {
         self: Arc<Self>,
         _: Partition,
         _: KeyType,
+        _: lore_storage::ReadConsistency,
     ) -> Result<lore_storage::store_types::KeyValueStream, StoreError> {
         Err(StoreError::from(Disconnected))
     }

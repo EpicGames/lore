@@ -174,6 +174,14 @@ impl lore_storage::MutableStore for FailingLoadStore {
         lore_storage::MutableStore::hold_for_command(self.inner.clone()).await
     }
 
+    fn stored_typed_key(
+        &self,
+        key: lore_base::types::Hash,
+        key_type: lore_base::types::KeyType,
+    ) -> lore_base::types::Hash {
+        self.inner.stored_typed_key(key, key_type)
+    }
+
     /// Joins the claim of the store this one wraps.
     fn try_join_claim(&self) -> Option<lore_storage::local::store_lock::StoreGuard> {
         self.inner.try_join_claim()
@@ -222,8 +230,12 @@ impl lore_storage::MutableStore for FailingLoadStore {
         self: Arc<Self>,
         partition: lore_base::types::Partition,
         key_type: lore_base::types::KeyType,
+        consistency: lore_storage::ReadConsistency,
     ) -> Result<lore_storage::KeyValueStream, StoreError> {
-        self.inner.clone().list(partition, key_type).await
+        self.inner
+            .clone()
+            .list(partition, key_type, consistency)
+            .await
     }
 
     async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
@@ -231,12 +243,10 @@ impl lore_storage::MutableStore for FailingLoadStore {
     }
 }
 
-/// A [`lore_storage::MutableStore`] that holds each `load` of a gated key, after
-/// the first loads it lets through, until the test calls [`GatedLoadStore::open`].
-/// A held load counts as in flight until it returns or is cancelled, so a test can
-/// see how many loads run at once and whether cancelled loads are released.
-pub struct GatedLoadStore {
-    inner: Arc<dyn lore_storage::MutableStore>,
+/// Holds each load of a gated key, after the first loads it lets through, until the test calls
+/// [`LoadGate::open`]. A held load counts as in flight until it returns or is cancelled, so a test
+/// can see how many loads run at once and whether cancelled loads are released.
+pub struct LoadGate {
     gated: std::collections::HashSet<lore_base::types::Hash>,
     passing: std::sync::atomic::AtomicUsize,
     open: tokio::sync::watch::Sender<bool>,
@@ -244,29 +254,17 @@ pub struct GatedLoadStore {
     max_in_flight: std::sync::atomic::AtomicUsize,
 }
 
-impl GatedLoadStore {
-    pub fn new(
-        inner: Arc<dyn lore_storage::MutableStore>,
-        gated: impl IntoIterator<Item = lore_base::types::Hash>,
-    ) -> Arc<Self> {
-        Self::passing_first(inner, gated, 0)
-    }
-
-    /// A store that lets the first `passing` loads of its gated keys through, and
-    /// holds the loads after them.
-    pub fn passing_first(
-        inner: Arc<dyn lore_storage::MutableStore>,
-        gated: impl IntoIterator<Item = lore_base::types::Hash>,
-        passing: usize,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            inner,
+impl LoadGate {
+    /// A gate that lets the first `passing` loads of its gated keys through, and holds the loads
+    /// after them.
+    fn new(gated: impl IntoIterator<Item = lore_base::types::Hash>, passing: usize) -> Self {
+        Self {
             gated: gated.into_iter().collect(),
             passing: std::sync::atomic::AtomicUsize::new(passing),
             open: tokio::sync::watch::Sender::new(false),
             in_flight: tokio::sync::watch::Sender::new(0),
             max_in_flight: Default::default(),
-        })
+        }
     }
 
     /// Releases every held load, and lets later gated loads through at once.
@@ -288,28 +286,79 @@ impl GatedLoadStore {
             .subscribe()
             .wait_for(predicate)
             .await
-            .expect("the store owns the sender");
+            .expect("the gate owns the sender");
+    }
+
+    /// Returns once a load of `key` may go on: at once for a key that is not gated or is let
+    /// through, and once the gate opens otherwise.
+    async fn pass(&self, key: lore_base::types::Hash) {
+        if !self.gated.contains(&key)
+            || self
+                .passing
+                .try_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |left| left.checked_sub(1),
+                )
+                .is_ok()
+        {
+            return;
+        }
+        let _in_flight = InFlight::enter(self);
+        self.open
+            .subscribe()
+            .wait_for(|open| *open)
+            .await
+            .expect("the gate owns the sender");
     }
 }
 
 /// Counts a gated load as in flight for as long as it lives.
-struct InFlight<'a>(&'a GatedLoadStore);
+struct InFlight<'a>(&'a LoadGate);
 
 impl<'a> InFlight<'a> {
-    fn enter(store: &'a GatedLoadStore) -> Self {
-        store.in_flight.send_modify(|count| {
+    fn enter(gate: &'a LoadGate) -> Self {
+        gate.in_flight.send_modify(|count| {
             *count += 1;
-            store
-                .max_in_flight
+            gate.max_in_flight
                 .fetch_max(*count, std::sync::atomic::Ordering::SeqCst);
         });
-        Self(store)
+        Self(gate)
     }
 }
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
         self.0.in_flight.send_modify(|count| *count -= 1);
+    }
+}
+
+/// A [`lore_storage::MutableStore`] that holds each `load` of a gated key at its [`LoadGate`].
+pub struct GatedLoadStore {
+    inner: Arc<dyn lore_storage::MutableStore>,
+    gate: LoadGate,
+}
+
+impl GatedLoadStore {
+    /// A store that lets the first `passing` loads of its gated keys through, and holds the loads
+    /// after them.
+    pub fn passing_first(
+        inner: Arc<dyn lore_storage::MutableStore>,
+        gated: impl IntoIterator<Item = lore_base::types::Hash>,
+        passing: usize,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            gate: LoadGate::new(gated, passing),
+        })
+    }
+}
+
+impl std::ops::Deref for GatedLoadStore {
+    type Target = LoadGate;
+
+    fn deref(&self) -> &LoadGate {
+        &self.gate
     }
 }
 
@@ -325,6 +374,14 @@ impl lore_storage::MutableStore for GatedLoadStore {
         lore_storage::MutableStore::hold_for_command(self.inner.clone()).await
     }
 
+    fn stored_typed_key(
+        &self,
+        key: lore_base::types::Hash,
+        key_type: lore_base::types::KeyType,
+    ) -> lore_base::types::Hash {
+        self.inner.stored_typed_key(key, key_type)
+    }
+
     /// Joins the claim of the store this one wraps.
     fn try_join_claim(&self) -> Option<lore_storage::local::store_lock::StoreGuard> {
         self.inner.try_join_claim()
@@ -336,24 +393,7 @@ impl lore_storage::MutableStore for GatedLoadStore {
         key: lore_base::types::Hash,
         key_type: lore_base::types::KeyType,
     ) -> Result<lore_base::types::Hash, StoreError> {
-        if !self.gated.contains(&key)
-            || self
-                .passing
-                .try_update(
-                    std::sync::atomic::Ordering::SeqCst,
-                    std::sync::atomic::Ordering::SeqCst,
-                    |left| left.checked_sub(1),
-                )
-                .is_ok()
-        {
-            return self.inner.clone().load(partition, key, key_type).await;
-        }
-        let _in_flight = InFlight::enter(&self);
-        self.open
-            .subscribe()
-            .wait_for(|open| *open)
-            .await
-            .expect("the store owns the sender");
+        self.gate.pass(key).await;
         self.inner.clone().load(partition, key, key_type).await
     }
 
@@ -388,8 +428,12 @@ impl lore_storage::MutableStore for GatedLoadStore {
         self: Arc<Self>,
         partition: lore_base::types::Partition,
         key_type: lore_base::types::KeyType,
+        consistency: lore_storage::ReadConsistency,
     ) -> Result<lore_storage::KeyValueStream, StoreError> {
-        self.inner.clone().list(partition, key_type).await
+        self.inner
+            .clone()
+            .list(partition, key_type, consistency)
+            .await
     }
 
     async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
@@ -397,29 +441,202 @@ impl lore_storage::MutableStore for GatedLoadStore {
     }
 }
 
-/// A [`lore_storage::MutableStore`] that records the key of every `load` while
-/// delegating every operation to the wrapped store.
-pub struct RecordingLoadStore {
-    inner: Arc<dyn lore_storage::MutableStore>,
-    loaded: parking_lot::Mutex<Vec<lore_base::types::Hash>>,
+/// An [`ImmutableStore`] that holds each payload read of a gated hash at its [`LoadGate`], while
+/// every other operation delegates to the wrapped store.
+pub struct GatedGetStore {
+    inner: Arc<dyn ImmutableStore>,
+    gate: LoadGate,
 }
 
-impl RecordingLoadStore {
-    pub fn new(inner: Arc<dyn lore_storage::MutableStore>) -> Arc<Self> {
+impl GatedGetStore {
+    pub fn new(
+        inner: Arc<dyn ImmutableStore>,
+        gated: impl IntoIterator<Item = lore_base::types::Hash>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner,
-            loaded: Default::default(),
+            gate: LoadGate::new(gated, 0),
         })
     }
+}
 
-    /// The keys loaded since the last call, in the order they were loaded.
-    pub fn take_loaded(&self) -> Vec<lore_base::types::Hash> {
-        std::mem::take(&mut *self.loaded.lock())
+impl std::ops::Deref for GatedGetStore {
+    type Target = LoadGate;
+
+    fn deref(&self) -> &LoadGate {
+        &self.gate
+    }
+}
+
+#[async_trait]
+impl ImmutableStore for GatedGetStore {
+    fn is_local(&self) -> bool {
+        self.inner.is_local()
+    }
+
+    /// Joins the claim of the store this one wraps.
+    async fn hold_for_command(
+        self: Arc<Self>,
+    ) -> Result<Option<lore_storage::local::store_lock::StoreGuard>, StoreError> {
+        self.inner.clone().hold_for_command().await
+    }
+
+    fn try_join_claim(&self) -> Option<lore_storage::local::store_lock::StoreGuard> {
+        self.inner.try_join_claim()
+    }
+
+    fn isolates_partitions(&self) -> bool {
+        self.inner.isolates_partitions()
+    }
+
+    fn read_scope(&self) -> lore_storage::StoreMatch {
+        self.inner.read_scope()
+    }
+
+    fn query_scope(&self) -> lore_storage::StoreMatch {
+        self.inner.query_scope()
+    }
+
+    /// Payload reads through `get_into` reach this through its default implementation.
+    async fn get(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+    ) -> Result<StoreGetData, StoreError> {
+        self.gate.pass(address.hash).await;
+        self.inner.clone().get(partition, address).await
+    }
+
+    async fn query(
+        self: Arc<Self>,
+        partition: Partition,
+        addresses: &[Address],
+        results: &mut [lore_storage::StoreMatchResult],
+    ) -> Result<(), StoreError> {
+        self.inner
+            .clone()
+            .query(partition, addresses, results)
+            .await
+    }
+
+    async fn get_metadata(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+    ) -> Result<StoreGetData, StoreError> {
+        self.inner.clone().get_metadata(partition, address).await
+    }
+
+    async fn put(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+        force: bool,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .clone()
+            .put(partition, address, fragment, payload, force)
+            .await
+    }
+
+    async fn obliterate(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+        stats: Arc<StoreObliterateStats>,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .clone()
+            .obliterate(partition, address, stats)
+            .await
+    }
+
+    async fn evict(
+        self: Arc<Self>,
+        max_capacity: usize,
+        sync_data: bool,
+        sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+    ) -> Result<usize, StoreError> {
+        self.inner
+            .clone()
+            .evict(max_capacity, sync_data, sink)
+            .await
+    }
+
+    async fn compact(
+        self: Arc<Self>,
+        max_size: usize,
+        at: Option<usize>,
+        sync_data: bool,
+        sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+    ) -> Result<Option<usize>, StoreError> {
+        self.inner
+            .clone()
+            .compact(max_size, at, sync_data, sink)
+            .await
+    }
+
+    async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
+        self.inner.clone().compact_resume_at().await
+    }
+
+    fn max_query_batch(&self) -> Option<usize> {
+        self.inner.max_query_batch()
+    }
+
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
+        self.inner.clone().flush(options).await
+    }
+
+    async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
+        self.inner.clone().verify(heal).await
+    }
+
+    async fn copy(
+        self: Arc<Self>,
+        source_partition: Partition,
+        source_address: Address,
+        destination_partition: Partition,
+        destination_context: Context,
+        behavior: CopyBehavior,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .clone()
+            .copy(
+                source_partition,
+                source_address,
+                destination_partition,
+                destination_context,
+                behavior,
+            )
+            .await
+    }
+}
+
+/// A [`lore_storage::MutableStore`] whose `list` leaves out chosen keys, as a range read that misses
+/// entries does, while every other operation delegates to the wrapped store.
+pub struct ListOmittingStore {
+    inner: Arc<dyn lore_storage::MutableStore>,
+    omitted: Vec<lore_base::types::Hash>,
+}
+
+impl ListOmittingStore {
+    /// `inner`, leaving each of `keys`, given as `list` reports them, out of every `list`.
+    pub fn wrap(
+        inner: Arc<dyn lore_storage::MutableStore>,
+        keys: impl IntoIterator<Item = lore_base::types::Hash>,
+    ) -> Arc<dyn lore_storage::MutableStore> {
+        Arc::new(Self {
+            inner,
+            omitted: keys.into_iter().collect(),
+        })
     }
 }
 
 #[async_trait::async_trait]
-impl lore_storage::MutableStore for RecordingLoadStore {
+impl lore_storage::MutableStore for ListOmittingStore {
     /// Joins the claim of the store this one wraps.
     async fn hold_for_command(
         self: std::sync::Arc<Self>,
@@ -428,6 +645,142 @@ impl lore_storage::MutableStore for RecordingLoadStore {
         lore_storage::StoreError,
     > {
         lore_storage::MutableStore::hold_for_command(self.inner.clone()).await
+    }
+
+    fn stored_typed_key(
+        &self,
+        key: lore_base::types::Hash,
+        key_type: lore_base::types::KeyType,
+    ) -> lore_base::types::Hash {
+        self.inner.stored_typed_key(key, key_type)
+    }
+
+    /// Joins the claim of the store this one wraps.
+    fn try_join_claim(&self) -> Option<lore_storage::local::store_lock::StoreGuard> {
+        self.inner.try_join_claim()
+    }
+
+    async fn load(
+        self: Arc<Self>,
+        partition: lore_base::types::Partition,
+        key: lore_base::types::Hash,
+        key_type: lore_base::types::KeyType,
+    ) -> Result<lore_base::types::Hash, StoreError> {
+        self.inner.clone().load(partition, key, key_type).await
+    }
+
+    async fn store(
+        self: Arc<Self>,
+        partition: lore_base::types::Partition,
+        key: lore_base::types::Hash,
+        value: lore_base::types::Hash,
+        key_type: lore_base::types::KeyType,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .clone()
+            .store(partition, key, value, key_type)
+            .await
+    }
+
+    async fn compare_and_swap(
+        self: Arc<Self>,
+        partition: lore_base::types::Partition,
+        key: lore_base::types::Hash,
+        expected: lore_base::types::Hash,
+        value: lore_base::types::Hash,
+        key_type: lore_base::types::KeyType,
+    ) -> Result<lore_base::types::Hash, StoreError> {
+        self.inner
+            .clone()
+            .compare_and_swap(partition, key, expected, value, key_type)
+            .await
+    }
+
+    async fn list(
+        self: Arc<Self>,
+        partition: lore_base::types::Partition,
+        key_type: lore_base::types::KeyType,
+        consistency: lore_storage::ReadConsistency,
+    ) -> Result<lore_storage::KeyValueStream, StoreError> {
+        let listed: Vec<_> = futures::StreamExt::collect(
+            self.inner
+                .clone()
+                .list(partition, key_type, consistency)
+                .await?,
+        )
+        .await;
+        let (stream, sender) = lore_storage::KeyValueStream::new();
+        for (key, value) in listed {
+            if !self.omitted.contains(&key) {
+                let _ = sender.send((key, value));
+            }
+        }
+        Ok(stream)
+    }
+
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
+        self.inner.clone().flush(options).await
+    }
+}
+
+/// A [`lore_storage::MutableStore`] that records the key of every `load`, the key type and
+/// consistency of every `list`, and counts the keys it puts in stored form, while delegating every
+/// operation to the wrapped store.
+pub struct RecordingReadStore {
+    inner: Arc<dyn lore_storage::MutableStore>,
+    loaded: parking_lot::Mutex<Vec<lore_base::types::Hash>>,
+    listed: parking_lot::Mutex<Vec<(lore_base::types::KeyType, lore_storage::ReadConsistency)>>,
+    stored_keys: std::sync::atomic::AtomicUsize,
+}
+
+impl RecordingReadStore {
+    pub fn new(inner: Arc<dyn lore_storage::MutableStore>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            loaded: Default::default(),
+            listed: Default::default(),
+            stored_keys: Default::default(),
+        })
+    }
+
+    /// The number of keys put in stored form since the last call.
+    pub fn take_stored_key_count(&self) -> usize {
+        self.stored_keys
+            .swap(0, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The keys loaded since the last call, in the order they were loaded.
+    pub fn take_loaded(&self) -> Vec<lore_base::types::Hash> {
+        std::mem::take(&mut *self.loaded.lock())
+    }
+
+    /// The key type and consistency of each list since the last call, in the order the lists
+    /// were made.
+    pub fn take_listed(&self) -> Vec<(lore_base::types::KeyType, lore_storage::ReadConsistency)> {
+        std::mem::take(&mut *self.listed.lock())
+    }
+}
+
+#[async_trait::async_trait]
+impl lore_storage::MutableStore for RecordingReadStore {
+    /// Joins the claim of the store this one wraps.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        lore_storage::MutableStore::hold_for_command(self.inner.clone()).await
+    }
+
+    fn stored_typed_key(
+        &self,
+        key: lore_base::types::Hash,
+        key_type: lore_base::types::KeyType,
+    ) -> lore_base::types::Hash {
+        self.stored_keys
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.stored_typed_key(key, key_type)
     }
 
     /// Joins the claim of the store this one wraps.
@@ -476,8 +829,13 @@ impl lore_storage::MutableStore for RecordingLoadStore {
         self: Arc<Self>,
         partition: lore_base::types::Partition,
         key_type: lore_base::types::KeyType,
+        consistency: lore_storage::ReadConsistency,
     ) -> Result<lore_storage::KeyValueStream, StoreError> {
-        self.inner.clone().list(partition, key_type).await
+        self.listed.lock().push((key_type, consistency));
+        self.inner
+            .clone()
+            .list(partition, key_type, consistency)
+            .await
     }
 
     async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {

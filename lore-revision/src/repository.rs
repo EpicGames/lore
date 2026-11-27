@@ -88,6 +88,7 @@ use crate::state::allow_all_repositories;
 use crate::store::ImmutableStore;
 use crate::store::KeyType;
 use crate::store::MutableStore;
+use crate::store::ReadConsistency;
 use crate::store::immutable::ImmutableStoreCreateOptions;
 use crate::store::immutable::ImmutableStoreSettings;
 use crate::util;
@@ -5288,7 +5289,11 @@ pub async fn list_local(
 ) -> Result<impl tokio_stream::Stream<Item = Context>, RepositoryError> {
     let stream = repository
         .read_mutable_store()
-        .list(RepositoryId::default(), KeyType::RepositoryId)
+        .list(
+            RepositoryId::default(),
+            KeyType::RepositoryId,
+            ReadConsistency::Strong,
+        )
         .await
         .forward::<RepositoryError>("Failed to store repository metadata")?;
 

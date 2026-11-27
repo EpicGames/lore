@@ -28,6 +28,7 @@ use lore_revision::interface::LoreBranchLocation;
 use lore_revision::interface::LoreString;
 use lore_revision::protocol::RemoteEndpoint;
 use lore_revision::repository::RepositoryContext;
+use lore_storage::ReadConsistency;
 use lore_transport::BranchRecord;
 use tokio::task::JoinError;
 use tokio::task::JoinSet;
@@ -225,7 +226,11 @@ async fn list_local(
     }
     let metadata_keys = ctx
         .read_mutable_store()
-        .list(args.repository, KeyType::BranchMetadata)
+        .list(
+            args.repository,
+            KeyType::BranchMetadata,
+            ReadConsistency::Strong,
+        )
         .await
         .forward_any::<RevisionGraphError>("listing the branch metadata keys")?;
     build_records(

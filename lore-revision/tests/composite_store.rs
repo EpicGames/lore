@@ -162,6 +162,10 @@ mod tests {
             Ok(None)
         }
 
+        fn stored_typed_key(&self, key: Hash, _key_type: KeyType) -> Hash {
+            key
+        }
+
         async fn load(
             self: Arc<Self>,
             _repository: Partition,
@@ -216,6 +220,7 @@ mod tests {
             self: Arc<Self>,
             _repository: Partition,
             _key_type: KeyType,
+            _consistency: lore_storage::ReadConsistency,
         ) -> Result<KeyValueStream, StoreError> {
             self.track_invocation("list");
 

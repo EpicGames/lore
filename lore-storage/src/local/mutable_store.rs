@@ -31,6 +31,7 @@ use crate::Address;
 use crate::FlushOptions;
 use crate::Hash;
 use crate::Partition;
+use crate::ReadConsistency;
 use crate::errors::AddressNotFound;
 use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
@@ -2057,6 +2058,11 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
         self.lock.as_ref()?.try_join(Intent::Read)
     }
 
+    /// Marks the key type in byte 2, as every key this store keeps.
+    fn stored_typed_key(&self, key: Hash, key_type: KeyType) -> Hash {
+        Key::make_typed(key, key_type).hash()
+    }
+
     // Assumes that payload has been validated to match the given hash prior to
     // calling this function to store the content payload - no hash validation done
     async fn store(
@@ -2223,6 +2229,7 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
         self: Arc<Self>,
         partition: Partition,
         key_type: KeyType,
+        _consistency: ReadConsistency,
     ) -> Result<KeyValueStream, StoreError> {
         let (stream, sender) = KeyValueStream::new();
 

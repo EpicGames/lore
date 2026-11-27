@@ -162,6 +162,11 @@ mod replication_service_tests {
                 None,
                 Arc::new(AllowAllRepositoryAuthorizer),
                 lore_server::grpc::revision::v1::branch_list::DEFAULT_BRANCH_LIST_CONCURRENCY,
+                lore_server::grpc::revision::v1::branch_list::BranchListReads::new(
+                    lore_server::grpc::revision::v1::branch_list::DEFAULT_BRANCH_LIST_SHARE_WINDOW,
+                    &lore_server::grpc::revision::v1::service::RevisionServiceInstrumentProvider,
+                )
+                .expect("the default window is below the maximum"),
             )?
             .with_tls_config(
                 Some(certs.server_cert_path.clone()),

@@ -4,6 +4,7 @@ mod cert_metrics;
 mod core_hop;
 pub(crate) mod hook_recorder;
 mod local_store_monitor;
+mod shared_read;
 pub(crate) mod test_support;
 
 use lore_server::util::*;

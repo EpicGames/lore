@@ -17,6 +17,7 @@ use tokio_stream::StreamExt;
 use tonic::Request;
 use tonic::Response;
 
+use crate::grpc::revision::v1::branch_list::unshared_reads;
 use crate::store::test_support::test_store_create;
 
 fn make_forwarded_request(repository: RepositoryId) -> Request<BranchListRequest> {
@@ -56,6 +57,7 @@ async fn missing_user_id_returns_internal_error() {
             immutable_store,
             mutable_store,
             DEFAULT_BRANCH_LIST_CONCURRENCY,
+            &unshared_reads(),
         )
         .await
         .map(|_| ())
@@ -72,6 +74,7 @@ async fn missing_user_id_returns_internal_error() {
 mod base_branch_list_handler {
     use super::*;
     use crate::grpc::revision::v1::branch_list::create_root_branch;
+    use crate::grpc::revision::v1::branch_list::shared_reads;
 
     async fn collect(response: Response<BranchListStream>) -> Vec<String> {
         response
@@ -105,6 +108,7 @@ mod base_branch_list_handler {
                 immutable_store,
                 mutable_store,
                 DEFAULT_BRANCH_LIST_CONCURRENCY,
+                &unshared_reads(),
             )
             .await
             .expect("Request failed");
@@ -113,6 +117,63 @@ mod base_branch_list_handler {
             assert_eq!(names.len(), 2);
             assert!(names.contains(&"main".to_string()));
             assert!(names.contains(&"feature".to_string()));
+        }))
+        .await;
+    }
+
+    /// A forwarded call and a direct call on the server that executes them share one read.
+    #[tokio::test]
+    async fn forwarded_and_direct_calls_share_one_read() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+                allow_all_repositories(),
+            ));
+            create_root_branch(&repository_context, "main", "lily").await;
+            let recording = crate::store::test_support::RecordingReadStore::new(mutable_store);
+            let reads = shared_reads(std::time::Duration::from_secs(3600));
+
+            let forwarded = handler(
+                make_forwarded_request(repository),
+                immutable_store.clone(),
+                recording.clone(),
+                DEFAULT_BRANCH_LIST_CONCURRENCY,
+                &reads,
+            )
+            .await
+            .expect("Request failed");
+            assert_eq!(collect(forwarded).await, ["main"]);
+            let mut direct_request = Request::new(BranchListRequest {
+                creator: None,
+                include_deleted: false,
+            });
+            direct_request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+            let direct = lore_server::grpc::revision::v1::branch_list::handler(
+                direct_request,
+                immutable_store,
+                recording.clone(),
+                &None, /* no forwarded requests */
+                DEFAULT_BRANCH_LIST_CONCURRENCY,
+                &reads,
+            )
+            .await
+            .expect("Request failed");
+            assert_eq!(collect(direct).await, ["main"]);
+
+            assert_eq!(
+                recording.take_listed().len(),
+                3,
+                "one read of each key type"
+            );
         }))
         .await;
     }
@@ -129,6 +190,7 @@ mod base_branch_list_handler {
                 immutable_store,
                 mutable_store,
                 DEFAULT_BRANCH_LIST_CONCURRENCY,
+                &unshared_reads(),
             )
             .await
             .expect("Request failed");

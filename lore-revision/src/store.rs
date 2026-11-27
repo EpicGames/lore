@@ -15,6 +15,7 @@ pub(crate) use lore_base::types::KeyType;
 pub(crate) use lore_storage::ImmutableStore;
 pub(crate) use lore_storage::KeyValueStream;
 pub(crate) use lore_storage::MutableStore;
+pub(crate) use lore_storage::ReadConsistency;
 pub(crate) use lore_storage::StoreError;
 pub(crate) use lore_storage::StoreGetData;
 pub(crate) use lore_storage::StoreMatch;

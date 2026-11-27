@@ -9,6 +9,7 @@ use tonic::Response;
 use tonic::Status;
 
 use crate::grpc::forwarded_requests::CallerContext;
+use crate::grpc::revision::v1::branch_list::BranchListReads;
 use crate::grpc::revision::v1::branch_list::BranchListStream;
 use crate::grpc::revision::v1::branch_list::branch_list_implementation;
 
@@ -21,6 +22,7 @@ pub async fn handler(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     concurrency: NonZeroUsize,
+    reads: &BranchListReads,
 ) -> Result<Response<BranchListStream>, Status> {
     let caller_context = CallerContext::from_forwarded_request(&request)?;
     let req = request.into_inner();
@@ -31,6 +33,7 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         concurrency,
+        reads,
     )
     .await
 }

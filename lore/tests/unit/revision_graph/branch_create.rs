@@ -60,6 +60,7 @@ use lore_revision::repository::RepositoryContext;
 use lore_revision::test_util::BranchStep;
 use lore_revision::test_util::step_branch_writes;
 use lore_revision::test_util::write_state_revision;
+use lore_storage::ReadConsistency;
 use lore_storage::local::store_lock::StoreHold;
 use lore_transport::BranchListResponse;
 use lore_transport::BranchPushError;
@@ -1800,7 +1801,7 @@ async fn a_create_that_loses_its_name_claim_reports_it_at_the_local_store_and_ro
         let mut listed = store
             .mutable
             .clone()
-            .list(repository, KeyType::BranchMetadata)
+            .list(repository, KeyType::BranchMetadata, ReadConsistency::Strong)
             .await
             .expect("lists the metadata keys")
             .channel();

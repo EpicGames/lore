@@ -28,6 +28,7 @@ use lore_revision::branch;
 use lore_revision::branch::BranchLatestStatus;
 use lore_revision::interface::LoreBranchLocation;
 use lore_revision::repository::SALT_LORE;
+use lore_storage::ReadConsistency;
 use lore_storage::local::store_lock::StoreHold;
 
 use super::counting::open_counted_handle;
@@ -116,7 +117,11 @@ async fn two_concurrent_local_creates_leave_one_winner_on_a_shared_store() {
         let mut listed = disk
             .mutable
             .clone()
-            .list(f.repository, KeyType::BranchMetadata)
+            .list(
+                f.repository,
+                KeyType::BranchMetadata,
+                ReadConsistency::Strong,
+            )
             .await
             .expect("lists the metadata keys")
             .channel();

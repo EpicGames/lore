@@ -87,6 +87,7 @@ use crate::state::StateData;
 use crate::state::StateError;
 use crate::store::KeyType;
 use crate::store::MatchedStoreError;
+use crate::store::ReadConsistency;
 use crate::util;
 use crate::util::path::RelativePath;
 use crate::util::serde::u8_as_bool;
@@ -4554,7 +4555,7 @@ pub async fn list(
 ) -> Result<impl tokio_stream::Stream<Item = Context>, BranchError> {
     let stream = repository
         .read_mutable_store()
-        .list(repository.id, KeyType::BranchId)
+        .list(repository.id, KeyType::BranchId, ReadConsistency::Strong)
         .await
         .forward::<BranchError>("Failed to list branches from store")?;
 
@@ -4569,7 +4570,7 @@ pub async fn list(
 pub async fn purge_mapped_branches(repository: Arc<RepositoryContext>) {
     let listed = match repository
         .read_mutable_store()
-        .list(repository.id, KeyType::BranchId)
+        .list(repository.id, KeyType::BranchId, ReadConsistency::Strong)
         .await
     {
         Ok(listed) => listed,
@@ -4734,7 +4735,11 @@ pub async fn list_output(
 
         let all_metadata_stream = repository
             .read_mutable_store()
-            .list(repository.id, KeyType::BranchMetadata)
+            .list(
+                repository.id,
+                KeyType::BranchMetadata,
+                ReadConsistency::Strong,
+            )
             .await
             .forward::<BranchError>("Failed to list branch metadata from store")?;
 

@@ -35,6 +35,7 @@ use crate::grpc::forwarded_lock_service::LoreForwardedLockService;
 use crate::grpc::forwarded_repository::v1::service::LoreForwardedRepositoryV1Service;
 use crate::grpc::forwarded_revision::v1::service::LoreForwardedRevisionV1Service;
 use crate::grpc::replication_service::LoreReplicationService;
+use crate::grpc::revision::v1::branch_list::BranchListReads;
 use crate::grpc::tower::grpc_response_trace::GrpcResponseTraceLayer;
 use crate::grpc::tower::tracing::LoreTracingLayer;
 use crate::hooks::HookDispatcher;
@@ -97,6 +98,7 @@ impl GrpcInternalServerBuilder<WantsComponents> {
         jwt_verifier: Option<JwtVerifier>,
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         branch_list_concurrency: NonZeroUsize,
+        branch_list_reads: Arc<BranchListReads>,
     ) -> anyhow::Result<GrpcInternalServerBuilder<WantsTlsConfig>> {
         if !local_immutable_store.is_local() {
             return Err(anyhow!("Immutable store must be a local store"));
@@ -113,6 +115,7 @@ impl GrpcInternalServerBuilder<WantsComponents> {
             jwt_verifier,
             repository_authorizer,
             branch_list_concurrency,
+            branch_list_reads,
         }))
     }
 }
@@ -128,6 +131,7 @@ pub struct WantsTlsConfig {
     jwt_verifier: Option<JwtVerifier>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     branch_list_concurrency: NonZeroUsize,
+    branch_list_reads: Arc<BranchListReads>,
 }
 
 impl GrpcInternalServerBuilder<WantsTlsConfig> {
@@ -181,6 +185,7 @@ impl GrpcInternalServerBuilder<WantsTlsConfig> {
             jwt_verifier: self.0.jwt_verifier,
             repository_authorizer: self.0.repository_authorizer,
             branch_list_concurrency: self.0.branch_list_concurrency,
+            branch_list_reads: self.0.branch_list_reads,
             tls_config,
         }))
     }
@@ -197,6 +202,7 @@ pub struct WantsHttp2Config {
     jwt_verifier: Option<JwtVerifier>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     branch_list_concurrency: NonZeroUsize,
+    branch_list_reads: Arc<BranchListReads>,
     tls_config: Option<ServerTlsConfig>,
 }
 
@@ -242,6 +248,7 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
                 self.0.hook_dispatcher.clone(),
                 rpc_timeout,
                 self.0.branch_list_concurrency,
+                self.0.branch_list_reads,
             ),
         ));
 

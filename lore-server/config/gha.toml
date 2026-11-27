@@ -66,3 +66,6 @@ mode = "local"
 
 [feature]
 history_step_size = 10
+# Tests list branches right after they write them, and a finished shared read reused within the
+# window would not hold the write. Share only reads that are still running.
+branch_list_share_window_millis = 0

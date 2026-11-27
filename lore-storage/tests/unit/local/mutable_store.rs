@@ -8,6 +8,7 @@ use std::sync::atomic;
 use lore_storage::FlushOptions;
 use lore_storage::Hash;
 use lore_storage::Partition;
+use lore_storage::ReadConsistency;
 use lore_storage::immutable_store::ImmutableStore;
 use lore_storage::local::immutable_store::format_bucket_path;
 use lore_storage::local::mutable_store::*;
@@ -344,7 +345,11 @@ async fn a_list_that_cannot_read_a_bucket_fails() {
     };
     let listing: Arc<dyn MutableStore> = store(dir.path().to_path_buf()).await;
     let listed = listing
-        .list(Partition::default(), KeyType::BranchMetadata)
+        .list(
+            Partition::default(),
+            KeyType::BranchMetadata,
+            ReadConsistency::Strong,
+        )
         .await
         .expect("lists")
         .collect::<Vec<_>>()
@@ -363,7 +368,11 @@ async fn a_list_that_cannot_read_a_bucket_fails() {
     let listing: Arc<dyn MutableStore> = reopened;
     assert!(
         listing
-            .list(Partition::default(), KeyType::BranchMetadata)
+            .list(
+                Partition::default(),
+                KeyType::BranchMetadata,
+                ReadConsistency::Strong
+            )
             .await
             .is_err(),
         "a list that could not read a bucket handed back a stream leaving its keys out"
@@ -414,7 +423,11 @@ async fn start_listing(
     let listing: Arc<dyn MutableStore> = store.clone();
     let mut listing = lore_base::lore_spawn!(async move {
         listing
-            .list(Partition::default(), KeyType::BranchMetadata)
+            .list(
+                Partition::default(),
+                KeyType::BranchMetadata,
+                ReadConsistency::Strong,
+            )
             .await
     });
     assert!(
@@ -523,7 +536,11 @@ async fn a_list_leaves_out_no_key_a_fan_out_moves() {
         .collect();
     let stream = store
         .clone()
-        .list(Partition::default(), KeyType::BranchMetadata)
+        .list(
+            Partition::default(),
+            KeyType::BranchMetadata,
+            ReadConsistency::Strong,
+        )
         .await
         .expect("lists");
     for pause in &sending {
@@ -603,7 +620,11 @@ async fn a_list_leaves_out_no_key_a_fan_out_moves_while_it_walks() {
     let walking = lore_storage::test_util::pause_at(PausePoint::Walking);
     let stream = store
         .clone()
-        .list(Partition::default(), KeyType::BranchMetadata)
+        .list(
+            Partition::default(),
+            KeyType::BranchMetadata,
+            ReadConsistency::Strong,
+        )
         .await
         .expect("lists");
     walking.reached.notified().await;
@@ -697,7 +718,11 @@ async fn a_list_whose_stream_is_unread_holds_back_no_flush() {
 
     let stream = store
         .clone()
-        .list(Partition::default(), KeyType::BranchMetadata)
+        .list(
+            Partition::default(),
+            KeyType::BranchMetadata,
+            ReadConsistency::Strong,
+        )
         .await
         .expect("lists");
     tokio::time::timeout(
@@ -2491,9 +2516,11 @@ async fn a_listing_keeps_the_store_claimed_while_it_reads() {
     let listing = lore_storage::test_util::pause_at(lore_storage::test_util::PausePoint::Listing);
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        store
-            .clone()
-            .list(Partition::default(), KeyType::BranchMetadata),
+        store.clone().list(
+            Partition::default(),
+            KeyType::BranchMetadata,
+            ReadConsistency::Strong,
+        ),
     )
     .await
     .expect("a listing hands its stream back while its producers wait")
@@ -2539,9 +2566,11 @@ async fn a_listing_keeps_the_store_claimed_past_the_span_it_started_in() {
     let listing = lore_storage::test_util::pause_at(lore_storage::test_util::PausePoint::Listing);
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        store
-            .clone()
-            .list(Partition::default(), KeyType::BranchMetadata),
+        store.clone().list(
+            Partition::default(),
+            KeyType::BranchMetadata,
+            ReadConsistency::Strong,
+        ),
     )
     .await
     .expect("a listing hands its stream back while its producers wait")
@@ -2794,7 +2823,11 @@ async fn an_untyped_listing_takes_no_claim() {
 
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        store.clone().list(Partition::default(), KeyType::Untyped),
+        store.clone().list(
+            Partition::default(),
+            KeyType::Untyped,
+            ReadConsistency::Strong,
+        ),
     )
     .await
     .expect("an untyped listing does not wait for the store")
@@ -3124,7 +3157,7 @@ async fn list_finds_typed_entries_at_each_fan_out_level() {
 
         let mut stream = store
             .clone()
-            .list(partition, KeyType::Instance)
+            .list(partition, KeyType::Instance, ReadConsistency::Strong)
             .await
             .unwrap();
         let mut found_phase1: Vec<(Hash, Hash)> = Vec::new();
@@ -3208,7 +3241,7 @@ async fn list_finds_typed_entries_at_each_fan_out_level() {
         // filler entries scattered through the bucket.
         let mut stream = store
             .clone()
-            .list(partition, KeyType::Instance)
+            .list(partition, KeyType::Instance, ReadConsistency::Strong)
             .await
             .unwrap();
         let mut found_phase3: Vec<Hash> = Vec::new();
@@ -3267,7 +3300,7 @@ async fn list_finds_typed_entries_at_each_fan_out_level() {
 
             let mut stream = store
                 .clone()
-                .list(partition, KeyType::Instance)
+                .list(partition, KeyType::Instance, ReadConsistency::Strong)
                 .await
                 .unwrap();
             let mut found_phase4: Vec<Hash> = Vec::new();

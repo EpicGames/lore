@@ -28,6 +28,7 @@ use tokio::sync::Notify;
 
 use crate::CallerBuffer;
 use crate::FlushOptions;
+use crate::ReadConsistency;
 use crate::gc_event::GcEventSinkRef;
 use crate::immutable_store::CopyBehavior;
 use crate::immutable_store::CorrelationHold;
@@ -966,6 +967,10 @@ impl MutableStore for HookedStore {
         self.inner.clone().hold_for_command().await
     }
 
+    fn stored_typed_key(&self, key: Hash, key_type: KeyType) -> Hash {
+        self.inner.stored_typed_key(key, key_type)
+    }
+
     fn try_join_claim(&self) -> Option<StoreGuard> {
         self.inner.try_join_claim()
     }
@@ -1025,9 +1030,13 @@ impl MutableStore for HookedStore {
         self: Arc<Self>,
         partition: Partition,
         key_type: KeyType,
+        consistency: ReadConsistency,
     ) -> Result<KeyValueStream, StoreError> {
         (self.hook)(StoreCall::List, Hash::default(), key_type)?;
-        self.inner.clone().list(partition, key_type).await
+        self.inner
+            .clone()
+            .list(partition, key_type, consistency)
+            .await
     }
 
     async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {

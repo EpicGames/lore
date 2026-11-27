@@ -23,6 +23,7 @@ use super::branch_create;
 use super::branch_delete;
 use super::branch_get;
 use super::branch_list;
+use crate::grpc::revision::v1::branch_list::BranchListReads;
 use crate::grpc::revision::v1::branch_list::BranchListStream;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
@@ -46,6 +47,7 @@ pub struct LoreForwardedRevisionV1Service {
     instrument_provider: ForwardedRevisionServiceInstrumentProvider,
     rpc_timeout: Duration,
     branch_list_concurrency: NonZeroUsize,
+    branch_list_reads: Arc<BranchListReads>,
 }
 
 impl LoreForwardedRevisionV1Service {
@@ -56,6 +58,7 @@ impl LoreForwardedRevisionV1Service {
         hook_dispatcher: Arc<HookDispatcher>,
         rpc_timeout: Duration,
         branch_list_concurrency: NonZeroUsize,
+        branch_list_reads: Arc<BranchListReads>,
     ) -> Self {
         let instrument_provider = ForwardedRevisionServiceInstrumentProvider;
         Self {
@@ -65,6 +68,7 @@ impl LoreForwardedRevisionV1Service {
             hook_dispatcher,
             rpc_timeout,
             branch_list_concurrency,
+            branch_list_reads,
             instrument_provider,
         }
     }
@@ -134,6 +138,7 @@ impl ForwardedRevisionService for LoreForwardedRevisionV1Service {
             self.immutable_store.clone(),
             self.mutable_store.clone(),
             self.branch_list_concurrency,
+            &self.branch_list_reads,
         )
         .await
     }

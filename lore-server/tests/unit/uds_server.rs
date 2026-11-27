@@ -751,6 +751,10 @@ impl MutableStore for MutableDouble {
         self.store.clone().hold_for_command().await
     }
 
+    fn stored_typed_key(&self, key: Hash, key_type: KeyType) -> Hash {
+        self.store.stored_typed_key(key, key_type)
+    }
+
     fn hold_correlation(&self, _correlation_id: &str) -> Option<CorrelationHold> {
         self.holds.fetch_add(1, Ordering::SeqCst);
         Some(Box::new(CountedHold(self.holds.clone())))
@@ -799,8 +803,12 @@ impl MutableStore for MutableDouble {
         self: Arc<Self>,
         partition: Partition,
         key_type: KeyType,
+        consistency: lore_storage::ReadConsistency,
     ) -> Result<KeyValueStream, StoreError> {
-        self.store.clone().list(partition, key_type).await
+        self.store
+            .clone()
+            .list(partition, key_type, consistency)
+            .await
     }
 
     async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {

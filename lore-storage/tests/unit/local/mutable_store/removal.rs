@@ -14,6 +14,7 @@ use lore_base::test_util::TempDir;
 use lore_storage::FlushOptions;
 use lore_storage::Hash;
 use lore_storage::Partition;
+use lore_storage::ReadConsistency;
 use lore_storage::immutable_store::StoreError;
 use lore_storage::local::fan_out::BucketGroup;
 use lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX;
@@ -97,7 +98,7 @@ async fn load(store: &Arc<LocalMutableStore>, key: Hash) -> Hash {
 async fn listed(store: &Arc<LocalMutableStore>) -> Vec<(Hash, Hash)> {
     let mut stream = store
         .clone()
-        .list(Partition::default(), KEY_TYPE)
+        .list(Partition::default(), KEY_TYPE, ReadConsistency::Strong)
         .await
         .expect("lists");
     let mut pairs = Vec::new();
