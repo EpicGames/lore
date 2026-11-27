@@ -676,6 +676,7 @@ mod tests {
                         no_commit: false,
                         scope: lore_revision::branch::merge::MergeScope::MainOnly,
                         inherit_metadata: Default::default(),
+                        metadata: Default::default(),
                     },
                 ))
                 .await
@@ -770,6 +771,7 @@ mod tests {
                 no_commit,
                 scope: lore_revision::branch::merge::MergeScope::MainOnly,
                 inherit_metadata: Default::default(),
+                metadata: Default::default(),
             },
         ))
         .await
@@ -874,6 +876,7 @@ mod tests {
                 no_commit: true,
                 scope: branch::merge::MergeScope::MainOnly,
                 inherit_metadata: Default::default(),
+                metadata: Default::default(),
             },
         ))
         .await
@@ -2544,6 +2547,7 @@ mod tests {
                         no_commit: false,
                         scope: lore_revision::branch::merge::MergeScope::MainOnly,
                         inherit_metadata: Default::default(),
+                        metadata: Default::default(),
                     },
                 ))
                 .await

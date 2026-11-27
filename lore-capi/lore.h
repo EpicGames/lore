@@ -5027,6 +5027,15 @@ typedef struct lore_branch_merge_restart_args_t {
   struct lore_string_array_t paths;
 } lore_branch_merge_restart_args_t;
 
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_metadata_type_array_t {
+  // Pointer to the first element.
+  const enum lore_metadata_type_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_metadata_type_array_t;
+
 // Arguments for merging a source branch into the current branch.
 typedef struct lore_branch_merge_start_args_t {
   // Name of the source branch to merge into the current branch
@@ -5047,6 +5056,13 @@ typedef struct lore_branch_merge_start_args_t {
   struct lore_string_array_t link_paths;
   // Array of messages corresponding to each link path (parallel array with `link_paths`)
   struct lore_string_array_t link_messages;
+  // The caller's own metadata keys for the auto commit when the merge has
+  // no conflicts; empty leaves that revision as a plain commit would make it
+  struct lore_string_array_t metadata_keys;
+  // Metadata values, one per key
+  struct lore_string_array_t metadata_values;
+  // Metadata formats, one per key
+  struct lore_metadata_type_array_t metadata_formats;
 } lore_branch_merge_start_args_t;
 
 // Arguments for switching the working directory to a different branch or revision.
@@ -5092,15 +5108,6 @@ typedef struct lore_branch_metadata_get_args_t {
   // Metadata key (empty string lists all)
   struct lore_string_t key;
 } lore_branch_metadata_get_args_t;
-
-// A contiguous array of elements described by a pointer and a count.
-// Holds zero or more values of the element type laid out one after another.
-typedef struct lore_metadata_type_array_t {
-  // Pointer to the first element.
-  const enum lore_metadata_type_t *ptr;
-  // Number of elements in the array.
-  uintptr_t count;
-} lore_metadata_type_array_t;
 
 // Arguments for setting one or more key-value pairs on branch metadata.
 typedef struct lore_branch_metadata_set_args_t {
@@ -5814,6 +5821,13 @@ typedef struct lore_revision_sync_args_t {
   // View filter file to leave the working files materialized under; empty to keep the view the
   // instance holds
   struct lore_string_t view;
+  // The caller's own metadata keys for the merge revision a diverged sync
+  // commits; empty leaves that revision as a plain commit would make it
+  struct lore_string_array_t metadata_keys;
+  // Metadata values, one per key
+  struct lore_string_array_t metadata_values;
+  // Metadata formats, one per key
+  struct lore_metadata_type_array_t metadata_formats;
 } lore_revision_sync_args_t;
 
 // Arguments for bisecting the revision range between two revisions.

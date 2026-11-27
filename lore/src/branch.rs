@@ -324,6 +324,13 @@ pub struct LoreBranchMergeStartArgs {
     pub link_paths: LoreArray<LoreString>,
     /// Array of messages corresponding to each link path (parallel array with `link_paths`)
     pub link_messages: LoreArray<LoreString>,
+    /// The caller's own metadata keys for the auto commit when the merge has
+    /// no conflicts; empty leaves that revision as a plain commit would make it
+    pub metadata_keys: LoreArray<LoreString>,
+    /// Metadata values, one per key
+    pub metadata_values: LoreArray<LoreString>,
+    /// Metadata formats, one per key
+    pub metadata_formats: LoreArray<LoreMetadataType>,
 }
 
 /// Begins merging a source branch into the current branch, auto-committing if there are no conflicts.
@@ -397,6 +404,11 @@ fn merge_start_local(
                             .iter()
                             .map(LoreString::as_str),
                     ),
+                    metadata: lore_revision::commit::CommitMetadata {
+                        keys: args.metadata_keys.clone(),
+                        values: args.metadata_values.clone(),
+                        formats: args.metadata_formats.clone(),
+                    },
                 };
 
                 let branch = branch::resolve(repository.clone(), args.branch.as_str())

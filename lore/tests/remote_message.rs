@@ -1026,6 +1026,9 @@ async fn revision_sync_args_survive_the_wire() {
         dependency_recursive: 1,
         dependency_depth_limit: 3,
         view: LoreString::from_str("/tmp/a narrow view.txt"),
+        metadata_keys: LoreArray::from_vec(vec![LoreString::from_str("created-by")]),
+        metadata_values: LoreArray::from_vec(vec![LoreString::from_str("Ada")]),
+        metadata_formats: LoreArray::from_vec(vec![lore::interface::LoreMetadataType::String]),
     };
 
     match relayed(LoreCommand::RevisionSync(args.clone())) {
@@ -1033,6 +1036,18 @@ async fn revision_sync_args_survive_the_wire() {
             assert_eq!(read_back.view, args.view, "must carry the view unchanged");
             assert_eq!(read_back.revision, args.revision);
             assert_eq!(read_back.root_files.as_slice(), args.root_files.as_slice());
+            assert_eq!(
+                read_back.metadata_keys.as_slice(),
+                args.metadata_keys.as_slice()
+            );
+            assert_eq!(
+                read_back.metadata_values.as_slice(),
+                args.metadata_values.as_slice()
+            );
+            assert_eq!(
+                read_back.metadata_formats.as_slice(),
+                args.metadata_formats.as_slice()
+            );
             assert_eq!(
                 read_back.dependency_tags.as_slice(),
                 args.dependency_tags.as_slice()

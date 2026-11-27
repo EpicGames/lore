@@ -239,6 +239,9 @@ pub struct SyncOptions {
     /// View filter file the working tree is to be left materialized under. When absent the
     /// instance keeps the view it holds.
     pub view: Option<PathBuf>,
+    /// The caller's own metadata for the merge revision a diverged sync
+    /// commits, applied as `commit_with_metadata` applies its keys.
+    pub metadata: crate::commit::CommitMetadata,
 }
 
 impl Default for SyncOptions {
@@ -254,6 +257,7 @@ impl Default for SyncOptions {
             dependency_recursive: false,
             dependency_depth_limit: 0,
             view: None,
+            metadata: crate::commit::CommitMetadata::default(),
         }
     }
 }
@@ -938,6 +942,7 @@ pub(crate) async fn sync(
                 no_commit: false,
                 scope: merge::MergeScope::MainOnly,
                 inherit_metadata: crate::metadata::MetadataInherit::default(),
+                metadata: options.metadata.clone(),
             };
             let revision_staged = Box::pin(merge::merge_start(
                 repository.clone(),
