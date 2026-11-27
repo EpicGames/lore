@@ -3,6 +3,8 @@
 //! Smoke test verifying `lore.repository.v1` carries the 7 RPCs' request /
 //! response messages.
 
+use lore_proto::lore::repository::v1::RepositoryCountRequest;
+use lore_proto::lore::repository::v1::RepositoryCountResponse;
 use lore_proto::lore::repository::v1::RepositoryCreateRequest;
 use lore_proto::lore::repository::v1::RepositoryCreateResponse;
 use lore_proto::lore::repository::v1::RepositoryDeleteRequest;
@@ -31,6 +33,8 @@ fn v1_repository_request_response_types_default() {
     let _ = RepositoryGetResponse::default();
     let _ = RepositoryListRequest::default();
     let _ = RepositoryListResponse::default();
+    let _ = RepositoryCountRequest::default();
+    let _ = RepositoryCountResponse::default();
     let _ = RepositoryMetadataGetRequest::default();
     let _ = RepositoryMetadataGetResponse::default();
     let _ = RepositoryMetadataSetRequest::default();
@@ -66,6 +70,9 @@ fn v1_repository_field_shapes() {
 
     let RepositoryListRequest { creator: _ } = RepositoryListRequest::default();
     let RepositoryListResponse { repository: _ } = RepositoryListResponse::default();
+
+    let RepositoryCountRequest { creator: _ } = RepositoryCountRequest::default();
+    let RepositoryCountResponse { count: _ } = RepositoryCountResponse::default();
 
     let RepositoryMetadataGetRequest { id: _ } = RepositoryMetadataGetRequest::default();
     let RepositoryMetadataGetResponse { metadata: _ } = RepositoryMetadataGetResponse::default();
