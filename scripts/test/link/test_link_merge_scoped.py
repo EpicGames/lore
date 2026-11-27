@@ -15,6 +15,7 @@ from link_helpers import (
     setup_link_merge_conflict,
 )
 from lore_parsers import find_status_entry, parse_status_json
+from test_utils import read_text
 
 pytestmark = pytest.mark.own_vfs(
     "links a repository, which a virtual clone does not hold"
@@ -426,8 +427,7 @@ def test_link_merge_file_conflict_resolve(new_lore_repo):
     )
 
     # Verify the resolved content is present
-    with urc.open_file(conflict_file, "r") as f:
-        content = f.read()
+    content = read_text(urc, conflict_file)
     assert "manually resolved content" in content, (
         f"File should have manually resolved content - Got: {content}"
     )
@@ -470,8 +470,7 @@ def test_link_merge_resolve_keeps_the_merged_executable_bit(new_lore_repo, side)
     for instance in (urc, urc.clone()):
         mode = os.stat(os.path.join(instance.path, conflict_file)).st_mode
         assert mode & stat.S_IXUSR, f"{instance.path}: {mode:o}"
-        with instance.open_file(conflict_file, "r") as f:
-            assert f.read() == f"{side}\n"
+        assert read_text(instance, conflict_file) == f"{side}\n"
 
 
 @pytest.mark.smoke
@@ -511,8 +510,7 @@ def test_link_merge_resolve_of_a_recreated_deletion_commits_the_file(new_lore_re
 
     assert link_pin(urc, link_repo.get_id()) != pin_before
     clone = urc.clone()
-    with clone.open_file(conflict_file, "r") as f:
-        assert f.read() == "recreated\n"
+    assert read_text(clone, conflict_file) == "recreated\n"
 
 
 @pytest.mark.smoke
@@ -593,8 +591,7 @@ def test_link_merge_file_conflict_in_subdirectory(new_lore_repo):
     urc.commit("Merge with resolved subdirectory conflict")
     urc.push()
 
-    with urc.open_file(conflict_file, "r") as f:
-        assert "resolved subdirectory content" in f.read()
+    assert "resolved subdirectory content" in read_text(urc, conflict_file)
 
 
 @pytest.mark.smoke
@@ -624,8 +621,7 @@ def test_link_merge_file_conflict_in_nested_subdirectory(new_lore_repo):
     urc.commit("Merge with resolved deep nested conflict")
     urc.push()
 
-    with urc.open_file(conflict_file, "r") as f:
-        assert "resolved deep config" in f.read()
+    assert "resolved deep config" in read_text(urc, conflict_file)
 
 
 @pytest.mark.smoke
@@ -677,12 +673,9 @@ def test_link_merge_multiple_file_conflicts_across_directories(new_lore_repo):
     urc.commit("Merge with multiple resolved conflicts")
     urc.push()
 
-    with urc.open_file(f1, "r") as f:
-        assert "resolved readme" in f.read()
-    with urc.open_file(f2, "r") as f:
-        assert "resolved lib" in f.read()
-    with urc.open_file(f3, "r") as f:
-        assert "resolved helpers" in f.read()
+    assert "resolved readme" in read_text(urc, f1)
+    assert "resolved lib" in read_text(urc, f2)
+    assert "resolved helpers" in read_text(urc, f3)
 
 
 @pytest.mark.smoke
@@ -719,10 +712,8 @@ def test_link_merge_directory_level_resolve(new_lore_repo):
     urc.commit("Merge with directory-level resolve")
     urc.push()
 
-    with urc.open_file(f"{link_path}/src/a.txt", "r") as f:
-        assert "resolved a" in f.read()
-    with urc.open_file(f"{link_path}/src/b.txt", "r") as f:
-        assert "resolved b" in f.read()
+    assert "resolved a" in read_text(urc, f"{link_path}/src/a.txt")
+    assert "resolved b" in read_text(urc, f"{link_path}/src/b.txt")
 
 
 @pytest.mark.smoke
@@ -832,8 +823,7 @@ def test_link_merge_mixed_conflict_and_clean(new_lore_repo):
     urc.branch_merge_start("feature-branch", link=link_path, no_commit=True)
 
     # Clean file should be merged automatically
-    with urc.open_file(f"{link_path}/clean.txt", "r") as f:
-        content = f.read()
+    content = read_text(urc, f"{link_path}/clean.txt")
     assert "clean modified by feature" in content, (
         f"Clean file should have feature branch content after auto-merge - Got: {content}"
     )
@@ -852,10 +842,8 @@ def test_link_merge_mixed_conflict_and_clean(new_lore_repo):
     urc.push()
 
     # Verify all files present and correct
-    with urc.open_file(f"{link_path}/conflict.txt", "r") as f:
-        assert "resolved conflict" in f.read()
-    with urc.open_file(f"{link_path}/clean.txt", "r") as f:
-        assert "clean modified by feature" in f.read()
+    assert "resolved conflict" in read_text(urc, f"{link_path}/conflict.txt")
+    assert "clean modified by feature" in read_text(urc, f"{link_path}/clean.txt")
     assert urc.file_exists(f"{link_path}/new-feature-file.txt")
 
 
@@ -884,8 +872,7 @@ def test_link_merge_file_conflict_resolve_mine(new_lore_repo):
     urc.commit("Merge with mine resolution")
     urc.push()
 
-    with urc.open_file(conflict_file, "r") as f:
-        content = f.read()
+    content = read_text(urc, conflict_file)
     assert "mine content" in content, (
         f"File should have mine content after resolve mine - Got: {content}"
     )
@@ -916,8 +903,7 @@ def test_link_merge_file_conflict_resolve_theirs(new_lore_repo):
     urc.commit("Merge with theirs resolution")
     urc.push()
 
-    with urc.open_file(conflict_file, "r") as f:
-        content = f.read()
+    content = read_text(urc, conflict_file)
     assert "theirs content" in content, (
         f"File should have theirs content after resolve theirs - Got: {content}"
     )

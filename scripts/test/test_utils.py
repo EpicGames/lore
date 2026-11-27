@@ -3,6 +3,7 @@
 """Shared test utility functions."""
 
 import os
+import stat
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -64,8 +65,9 @@ def working_tree_files(
     return sorted(found)
 
 
-def unstaged_entries(repo: "Lore") -> list[dict]:
-    """The entries `status --unstaged` reports that are not also staged, sorted by path.
+def unstaged_entries(repo: "Lore", path: str | None = None) -> list[dict]:
+    """The entries `status --unstaged` reports below `path` that are not also staged, sorted by
+    path.
 
     The command reports both, so the staged ones have to be filtered out to be
     left with what is only on the file system. Its JSON output is the event
@@ -74,11 +76,34 @@ def unstaged_entries(repo: "Lore") -> list[dict]:
     return sorted(
         (
             entry
-            for entry in parse_status_json(repo.status(json=True, unstaged=True))
+            for entry in parse_status_json(repo.status(path, json=True, unstaged=True))
             if not entry.get("flagStaged", False)
         ),
         key=lambda entry: entry["path"],
     )
+
+
+def unstaged_actions(repo: "Lore", path: str) -> list[tuple[str, str]]:
+    """The (path, action) pairs of `unstaged_entries` below `path`."""
+    return [(entry["path"], entry["action"]) for entry in unstaged_entries(repo, path)]
+
+
+def status_paths(repo: "Lore", flag: str) -> list[str]:
+    """The paths `status` reports with `flag` set, sorted."""
+    return sorted(
+        entry["path"]
+        for entry in parse_status_json(repo.status(json=True))
+        if entry.get(flag)
+    )
+
+
+def read_text(repo: "Lore", path: str) -> str:
+    with repo.open_file(path) as f:
+        return f.read()
+
+
+def is_executable(repo: "Lore", path: str) -> bool:
+    return bool(os.stat(os.path.join(repo.path, path)).st_mode & stat.S_IXUSR)
 
 
 def view_file(scratch_dir, name: str, rules: list[str]) -> str:
@@ -110,6 +135,10 @@ def status_revisions(repo: "Lore") -> dict:
     return entries[-1]
 
 
+def current_revision(repo: "Lore") -> str:
+    return status_revisions(repo)["revision"]
+
+
 def staged_revision(repo: "Lore") -> str:
     """The staged state `repo` holds, which is zero while it holds none."""
     return status_revisions(repo)["revisionStaged"]
@@ -133,12 +162,29 @@ def revision_metadata_keys(repo: "Lore") -> set[str]:
     return {event["key"] for event in events}
 
 
+def link_entries(repo: "Lore") -> list[dict]:
+    """The entries `link list` reports for `repo`."""
+    return parse_jsonl(repo.link_list(json=True), "linkEntry")
+
+
+def links_by_path(repo: "Lore", field: str) -> dict[str, str]:
+    """`field` of every `link list` entry of `repo`, by link path."""
+    return {entry["linkPath"]: entry[field] for entry in link_entries(repo)}
+
+
 def registered_links(repo: "Lore") -> dict[str, str]:
     """The link registry of `repo`, as the linked repository each link path names."""
-    return {
-        entry["linkPath"]: entry["link"]
-        for entry in parse_jsonl(repo.link_list(json=True), "linkEntry")
-    }
+    return links_by_path(repo, "link")
+
+
+def pins_by_link_path(repo: "Lore") -> dict[str, str]:
+    """The revision each link of `repo` pins, by link path."""
+    return links_by_path(repo, "revision")
+
+
+def source_paths_by_link_path(repo: "Lore") -> dict[str, str]:
+    """The path of its linked repository each link of `repo` mounts, by link path."""
+    return links_by_path(repo, "sourcePath")
 
 
 def commit_unstaged_below_a_staged_deletion(repo: "Lore", r: str) -> None:

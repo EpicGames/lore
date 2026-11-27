@@ -3,8 +3,14 @@
 import os
 
 import pytest
-from link_helpers import make_parent_with_link, make_repo, parse_revision_diff
-from lore_parsers import parse_status_json
+from link_helpers import (
+    changed_paths,
+    changes_at_mount,
+    make_parent_with_link,
+    make_repo,
+    parse_revision_diff,
+)
+from test_utils import status_by_path, unstaged_actions
 from thin_client import (
     ACTION_ADD,
     ACTION_DELETE,
@@ -58,10 +64,7 @@ def test_link_add_diff_reports_link_only(new_lore_repo):
     # Positive proof: before committing, `lore status` must report the link
     # path itself as a staged addition, and must not list files inside the
     # link as separate staged adds.
-    staged_paths = [
-        entry.get("path", "")
-        for entry in parse_status_json(parent_repo.status(json=True))
-    ]
+    staged_paths = list(status_by_path(parent_repo))
     assert link_path in staged_paths, (
         f"`lore status` must report the link path {link_path!r} as staged "
         f"after `lore link add`. Staged paths: {staged_paths}"
@@ -158,10 +161,7 @@ def test_link_update_diff_reports_link_only(new_lore_repo):
     # Positive proof: before committing, `lore status` must report the link
     # path as a staged change (the link node's pin moved), and must not list
     # files under the link path as separate staged entries.
-    staged_paths = [
-        entry.get("path", "")
-        for entry in parse_status_json(parent_repo.status(json=True))
-    ]
+    staged_paths = list(status_by_path(parent_repo))
     assert link_path in staged_paths, (
         f"`lore status` must report the link path {link_path!r} as staged "
         f"after a `lore link update` pin move. Staged paths: {staged_paths}"
@@ -235,10 +235,7 @@ def test_link_remove_diff_reports_link_only(new_lore_repo):
     # Positive proof: before committing, `lore status` must report the link
     # path as a staged removal, and must not list files that were visible
     # through the link as separate staged deletions.
-    staged_paths = [
-        entry.get("path", "")
-        for entry in parse_status_json(parent_repo.status(json=True))
-    ]
+    staged_paths = list(status_by_path(parent_repo))
     assert link_path in staged_paths, (
         f"`lore status` must report the link path {link_path!r} as staged "
         f"after `lore link remove`. Staged paths: {staged_paths}"
@@ -414,23 +411,6 @@ def test_link_diff_file_removed_in_linked_repo(new_lore_repo):
     )
 
 
-def _changed_paths(diff_output: str) -> list[str]:
-    """The working tree paths `lore file diff` output reports changed, sorted."""
-    return sorted(
-        line[4:]
-        for line in diff_output.splitlines()
-        if line.startswith("+++ ") and line != "+++ /dev/null"
-    )
-
-
-def _status_entries(repo, path: str) -> list[tuple[str, str]]:
-    """The (path, action) pairs of an unstaged `lore status` scoped to `path`, sorted."""
-    return sorted(
-        (entry["path"].replace("\\", "/"), entry["action"])
-        for entry in parse_status_json(repo.status(path, unstaged=True, json=True))
-    )
-
-
 @pytest.mark.smoke
 def test_link_diff_scoped_to_mount_matches_unscoped_over_a_nested_link(
     new_lore_repo,
@@ -452,14 +432,14 @@ def test_link_diff_scoped_to_mount_matches_unscoped_over_a_nested_link(
     parent_repo.link_add(f"{outer_mount}/nested", repo_c.get_id(), "/")
     parent_repo.commit("Link C inside B")
     parent_repo.push()
-    assert _status_entries(parent_repo, outer_mount) == []
+    assert unstaged_actions(parent_repo, outer_mount) == []
 
     parent_repo.write_files({outer_file: "b edited\n"})
 
-    unscoped = _changed_paths(
+    unscoped = changed_paths(
         parent_repo.file_diff(source=pre_nested_revision, no_pager=True)
     )
-    scoped = _changed_paths(
+    scoped = changed_paths(
         parent_repo.file_diff(
             paths=outer_mount, source=pre_nested_revision, no_pager=True
         )
@@ -469,7 +449,7 @@ def test_link_diff_scoped_to_mount_matches_unscoped_over_a_nested_link(
 
     parent_repo.write_files({nested_file: "locally modified\n"})
 
-    assert _status_entries(parent_repo, outer_mount) == [
+    assert unstaged_actions(parent_repo, outer_mount) == [
         (outer_file, "keep"),
         (nested_file, "keep"),
     ]
@@ -663,15 +643,6 @@ def test_link_add_remove_revision_diff_reports_link_only(new_lore_repo):
 # ---------------------------------------------------------------------------
 
 
-def _mount_changes(changes: list, link_path: str) -> list:
-    """Every diff entry describing the link node at `link_path`."""
-    return [
-        change
-        for change in changes
-        if change.path == link_path and change.node_type == NODE_TYPE_LINK
-    ]
-
-
 @pytest.mark.smoke
 def test_thin_client_tree_discriminates_tracking_from_pinned(
     new_lore_repo, lore_grpc_target
@@ -741,7 +712,7 @@ def test_thin_client_diff_reports_tracking_on_added_link(
     _, after = wire_identity(repo)
     changes = revision_diff(lore_grpc_target, repository_id, before, after)
 
-    mount_changes = _mount_changes(changes, link_path)
+    mount_changes = changes_at_mount(changes, link_path)
     assert mount_changes, f"Mount path must be reported as a link entry, got {changes}"
     assert all(change.action == ACTION_ADD for change in mount_changes), (
         f"A newly mounted link must be reported as an add, got {mount_changes}"
@@ -775,7 +746,7 @@ def test_thin_client_diff_reports_tracking_on_removed_link(
     _, after = wire_identity(repo)
     changes = revision_diff(lore_grpc_target, repository_id, before, after)
 
-    mount_changes = _mount_changes(changes, link_path)
+    mount_changes = changes_at_mount(changes, link_path)
     assert mount_changes, f"Mount path must be reported as a link entry, got {changes}"
     assert all(change.action == ACTION_DELETE for change in mount_changes), (
         f"A removed link must be reported as a delete, got {mount_changes}"
@@ -814,7 +785,7 @@ def test_thin_client_diff_reports_tracking_on_moved_pin(
     _, after = wire_identity(repo)
     changes = revision_diff(lore_grpc_target, repository_id, before, after)
 
-    mount_changes = _mount_changes(changes, link_path)
+    mount_changes = changes_at_mount(changes, link_path)
     assert mount_changes, (
         f"Moved pin must be reported as a link entry for the mount path, got {changes}"
     )
@@ -856,7 +827,7 @@ def test_thin_client_diff_partitions_added_link_under_linked_repository(
     _, after = wire_identity(repo)
     changes = revision_diff(lore_grpc_target, repository_id, before, after)
 
-    mount_changes = _mount_changes(changes, link_path)
+    mount_changes = changes_at_mount(changes, link_path)
     assert mount_changes, f"Mount path must be reported as a link entry, got {changes}"
     assert all(change.action == ACTION_ADD for change in mount_changes), (
         f"A newly mounted link must be reported as an add, got {mount_changes}"
@@ -891,7 +862,7 @@ def test_thin_client_diff_partitions_removed_link_under_linked_repository(
     _, after = wire_identity(repo)
     changes = revision_diff(lore_grpc_target, repository_id, before, after)
 
-    mount_changes = _mount_changes(changes, link_path)
+    mount_changes = changes_at_mount(changes, link_path)
     assert mount_changes, f"Mount path must be reported as a link entry, got {changes}"
     assert all(change.action == ACTION_DELETE for change in mount_changes), (
         f"A removed link must be reported as a delete, got {mount_changes}"
@@ -931,7 +902,7 @@ def test_thin_client_diff_partitions_moved_pin_under_linked_repository(
     _, after = wire_identity(repo)
     changes = revision_diff(lore_grpc_target, repository_id, before, after)
 
-    mount_changes = _mount_changes(changes, link_path)
+    mount_changes = changes_at_mount(changes, link_path)
     assert mount_changes, (
         f"Moved pin must be reported as a link entry for the mount path, got {changes}"
     )
@@ -970,7 +941,7 @@ def test_thin_client_diff_partitions_each_link_under_its_own_repository(
     changes = revision_diff(lore_grpc_target, repository_id, before, after)
 
     for link_path, link_repo in (("first", first_repo), ("second", second_repo)):
-        mount_changes = _mount_changes(changes, link_path)
+        mount_changes = changes_at_mount(changes, link_path)
         assert mount_changes, (
             f"Mount path {link_path} must be reported as a link entry, got {changes}"
         )

@@ -15,7 +15,7 @@ from link_helpers import (
     make_parent_with_link,
     make_repo,
 )
-from test_utils import status_by_path
+from test_utils import read_text, status_by_path
 
 pytestmark = pytest.mark.own_vfs(
     "links a repository, which a virtual clone does not hold"
@@ -292,8 +292,9 @@ def test_link_switch_drops_the_dirty_marker_of_a_linked_file_it_restores(
 
     parent_repo.branch_switch("feature")
 
-    with parent_repo.open_file(linked_file, "r") as input_file:
-        assert input_file.read() == "a2\n", "the switch must restore the linked file"
+    assert read_text(parent_repo, linked_file) == "a2\n", (
+        "the switch must restore the linked file"
+    )
     assert status_by_path(parent_repo) == {}, (
         "the restored linked file must stay unmarked"
     )

@@ -11,7 +11,7 @@ import sys
 import pytest
 from error_types import CommitFailed, LocalChanges
 from lore_parsers import parse_status_json
-from test_utils import status_revisions
+from test_utils import is_executable, status_revisions
 
 from lore import Lore
 
@@ -1618,8 +1618,7 @@ def test_a_mode_change_merges_with_an_edit(new_lore_repo, operation, edited):
         repo.push(fast_forward_merge=True)
         joined = repo.clone()
 
-    mode = os.stat(os.path.join(joined.path, "Dir/a.txt")).st_mode
-    assert bool(mode & stat.S_IXUSR) == executable, f"{mode:o}"
+    assert is_executable(joined, "Dir/a.txt") == executable
     with joined.open_file(edited, "r") as f:
         assert f.read() == "edited\n"
     status = parse_status_json(joined.status(scan=True, offline=True, json=True))

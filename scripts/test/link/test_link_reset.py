@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: MIT
 import json
 import os
-import re
 
 import pytest
 from error_types import (
@@ -13,18 +12,20 @@ from error_types import (
 )
 from link_helpers import (
     DEFAULT_LINK_MOUNT,
+    REPLACED_LINK_FILES,
     assert_crr_clean,
-    assert_mount_exposes,
+    assert_link_put_back,
     build_nested_link_repos_at,
+    dumped_id,
     link_entry,
     make_parent_with_link,
     make_repo,
     make_repo_renumbering_folder,
-    mounted_files,
     remount,
+    replace_mount_with_a_file,
 )
 from lore_parsers import parse_status_json
-from test_utils import has_staged_anchor, status_by_path
+from test_utils import has_staged_anchor, read_text, status_by_path
 
 from lore import Lore
 
@@ -103,8 +104,9 @@ def test_link_reset(new_lore_repo):
         assert "link file 1 original" in content, "File1 should have original content"
 
     # Verify other files are unaffected
-    with repo.open_file(expected_file2, "r") as f:
-        assert "link file 2 original" in f.read(), "File2 should be unaffected"
+    assert "link file 2 original" in read_text(repo, expected_file2), (
+        "File2 should be unaffected"
+    )
 
     # Test 2: Reset a modified file in a link subdirectory
     with repo.open_file(expected_subdir_file, "w+") as output_file:
@@ -160,28 +162,24 @@ def test_link_reset(new_lore_repo):
 
     repo.reset(link_path)
 
-    with repo.open_file(expected_file1, "r") as f:
-        assert "link file 1 original" in f.read(), (
-            "File1 should be restored after link reset"
-        )
+    assert "link file 1 original" in read_text(repo, expected_file1), (
+        "File1 should be restored after link reset"
+    )
 
-    with repo.open_file(expected_file2, "r") as f:
-        assert "link file 2 original" in f.read(), (
-            "File2 should be restored after link reset"
-        )
+    assert "link file 2 original" in read_text(repo, expected_file2), (
+        "File2 should be restored after link reset"
+    )
 
-    with repo.open_file(expected_deep_file, "r") as f:
-        assert "link deep file original" in f.read(), (
-            "Deep file should be restored after link reset"
-        )
+    assert "link deep file original" in read_text(repo, expected_deep_file), (
+        "Deep file should be restored after link reset"
+    )
 
     assert repo.file_exists(expected_subdir_file), (
         "Deleted subdir file should be restored after link reset"
     )
-    with repo.open_file(expected_subdir_file, "r") as f:
-        assert "link subdir file original" in f.read(), (
-            "Restored subdir file should have original content"
-        )
+    assert "link subdir file original" in read_text(repo, expected_subdir_file), (
+        "Restored subdir file should have original content"
+    )
 
     # Test 5: Reset entire repository traverses into links
     with repo.open_file(source_file, "w+") as output_file:
@@ -192,15 +190,13 @@ def test_link_reset(new_lore_repo):
 
     repo.reset(".")
 
-    with repo.open_file(source_file, "r") as f:
-        assert "source repository content" in f.read(), (
-            "Source file should be restored after root reset"
-        )
+    assert "source repository content" in read_text(repo, source_file), (
+        "Source file should be restored after root reset"
+    )
 
-    with repo.open_file(expected_file1, "r") as f:
-        assert "link file 1 original" in f.read(), (
-            "Linked file should be restored after root reset"
-        )
+    assert "link file 1 original" in read_text(repo, expected_file1), (
+        "Linked file should be restored after root reset"
+    )
 
     # Test 6: Reset with purge removes untracked files in links
     untracked_link_file = f"{link_path}/untracked-purge.txt"
@@ -246,15 +242,13 @@ def test_link_reset(new_lore_repo):
 
     repo.reset(".")
 
-    with repo.open_file(expected_file1, "r") as f:
-        assert "link file 1 original" in f.read(), (
-            "First link file should be restored after multi-link root reset"
-        )
+    assert "link file 1 original" in read_text(repo, expected_file1), (
+        "First link file should be restored after multi-link root reset"
+    )
 
-    with repo.open_file(expected_second_file, "r") as f:
-        assert "second link file original" in f.read(), (
-            "Second link file should be restored after multi-link root reset"
-        )
+    assert "second link file original" in read_text(repo, expected_second_file), (
+        "Second link file should be restored after multi-link root reset"
+    )
 
 
 @pytest.mark.smoke
@@ -423,12 +417,12 @@ def test_link_reset_purge_ignores_a_directory_rule_naming_the_mount(new_lore_rep
 
     repo.reset(".", purge=True)
 
-    with repo.open_file(outside_file, "r") as f:
-        assert "outside original" in f.read(), "Reset should restore a committed file"
-    with repo.open_file(mounted_file, "r") as f:
-        assert "inside original" in f.read(), (
-            "Reset should restore the committed file mounted at the link"
-        )
+    assert "outside original" in read_text(repo, outside_file), (
+        "Reset should restore a committed file"
+    )
+    assert "inside original" in read_text(repo, mounted_file), (
+        "Reset should restore the committed file mounted at the link"
+    )
     for path in untracked:
         assert not repo.file_exists(path), f"The purge kept the untracked {path}"
 
@@ -674,38 +668,6 @@ def test_link_reset_staged_remove(new_lore_repo):
         ), f"Restored content of {p} must match source repo content"
 
 
-REPLACED_LINK_FILES = {"top.txt": "top\n", "sub/a.txt": "a\n"}
-REPLACED_LINK_EXPOSES = {
-    "/": (["sub", "top.txt"], {"top.txt": "top\n"}),
-    "sub": (["a.txt"], {"a.txt": "a\n"}),
-}
-
-
-def replace_mount_with_a_file(new_lore_repo, source_path: str, staged: bool):
-    """Returns (parent, link_repo) with the link at `shared`, mounting `source_path`, replaced
-    by a file, staged when `staged`."""
-    parent, link_repo = make_parent_with_link(
-        new_lore_repo, "shared", REPLACED_LINK_FILES, source_path=source_path
-    )
-    parent.rmtree("shared")
-    parent.write_files({"shared": "file\n"})
-    if staged:
-        parent.stage("shared", scan=True)
-    return parent, link_repo
-
-
-def assert_link_put_back(parent: Lore, link_repo: Lore, source_path: str):
-    names, files = REPLACED_LINK_EXPOSES[source_path]
-    assert_crr_clean(
-        parent,
-        expected_files_present=[],
-        expected_files_absent=[],
-        expected_link_registry={link_repo.get_id(): True},
-    )
-    assert_mount_exposes(parent, "shared", source_path, names)
-    assert mounted_files(parent, "shared") == files
-
-
 @pytest.mark.smoke
 @pytest.mark.parametrize("source_path", ["/", "sub"], ids=["root", "folder"])
 @pytest.mark.parametrize("staged", [True, False], ids=["staged", "unstaged"])
@@ -714,7 +676,9 @@ def test_link_reset_puts_back_a_link_a_file_replaced(
 ):
     """`reset` of a link whose mount a file replaced puts the link back, in the registry and
     on disk, exposing what the link mounts, whether the file was staged or not."""
-    parent, link_repo = replace_mount_with_a_file(new_lore_repo, source_path, staged)
+    parent, link_repo = replace_mount_with_a_file(
+        new_lore_repo, REPLACED_LINK_FILES, source_path, staged
+    )
 
     parent.reset("shared")
 
@@ -728,7 +692,9 @@ def test_link_forced_unstage_puts_back_a_link_a_staged_file_replaced(
 ):
     """A forced `unstage` of a link whose mount a staged file replaced puts the link back, in the
     registry and on disk, and discards the file's add."""
-    parent, link_repo = replace_mount_with_a_file(new_lore_repo, source_path, True)
+    parent, link_repo = replace_mount_with_a_file(
+        new_lore_repo, REPLACED_LINK_FILES, source_path, True
+    )
 
     parent.unstage("shared", force=True)
 
@@ -792,8 +758,7 @@ def test_link_unstage_keeps_local_work_at_the_mount(new_lore_repo, change, refus
         assert parent.read_files() == files
     else:
         parent.unstage("shared")
-    with parent.open_file(local) as f:
-        assert f.read() == "local\n", f"unstage must keep {local}"
+    assert read_text(parent, local) == "local\n", f"unstage must keep {local}"
 
 
 @pytest.mark.smoke
@@ -863,12 +828,6 @@ def test_link_branching_change_commits(new_lore_repo):
     remount(parent, link_path, link_repo.get_id(), "/", None, disable_branching=True)
     with pytest.raises(NothingStagedError):
         parent.commit("Nothing to commit")
-
-
-def link_branching(repo: Lore, link_path: str) -> tuple:
-    """The branch, tracking and flags of the link at `link_path`."""
-    entry = link_entry(repo, link_path)
-    return entry["branch"], entry["tracking"], entry["flags"]
 
 
 @pytest.mark.smoke
@@ -1054,16 +1013,6 @@ def test_dry_run_unstage_and_reset_keep_a_staged_link_change(new_lore_repo, chan
     repo.unstage("lnk")
 
     assert (repo.link_list(), repo.read_files()) == committed
-
-
-def dumped_id(repo: Lore, path: str) -> str:
-    """The node id `repository dump --path` reports for `path`."""
-    name = re.escape(os.path.basename(path))
-    match = re.search(
-        rf"^{name} id (\d+)\b", repo.repository_dump(path=path), re.MULTILINE
-    )
-    assert match, path
-    return match.group(1)
 
 
 @pytest.mark.smoke

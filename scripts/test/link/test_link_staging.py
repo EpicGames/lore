@@ -7,18 +7,22 @@ import pytest
 from error_types import NotSupportedError
 from link_helpers import (
     DEFAULT_LINK_MOUNT,
+    DEFAULT_LINKED_FILE,
     DEFAULT_PARENT_FILE,
     assert_crr_clean,
     assert_mount_exposes,
     make_parent_with_link,
     make_repo,
     remount,
+    replace_mount_with_a_file,
 )
 from lore_parsers import parse_status_json
 from test_utils import (
     commit_unstaged_below_a_staged_deletion,
     has_staged_anchor,
+    read_text,
     status_by_path,
+    status_paths,
     unstaged_entries,
     working_tree_files,
 )
@@ -646,17 +650,6 @@ def test_link_unstage(new_lore_repo):
     )
 
 
-def _staged_paths(repo: Lore) -> list[str]:
-    """Paths `status` reports as staged, sorted, since its JSON output is the event
-    stream. It reports unstaged changes too, marked with `flagStaged` false, so the
-    flag is what separates the two."""
-    return sorted(
-        entry["path"]
-        for entry in parse_status_json(repo.status(json=True))
-        if entry["flagStaged"]
-    )
-
-
 @pytest.mark.smoke
 def test_link_remount_unstaged_restores_the_committed_mount(new_lore_repo):
     """Unstaging a remount returns the link to the subtree the current revision mounts.
@@ -739,7 +732,7 @@ def test_link_unstage_honours_a_rule_naming_the_mount(new_lore_repo):
 
     restage_everything()
 
-    staged = _staged_paths(repo)
+    staged = status_paths(repo, "flagStaged")
     assert mounted_file in staged, f"{mounted_file} should be staged"
     assert outside_file in staged, f"{outside_file} should be staged"
 
@@ -755,7 +748,7 @@ def test_link_unstage_honours_a_rule_naming_the_mount(new_lore_repo):
     # Dropped so the status below reports the mounted file either way.
     os.remove(view_file)
 
-    staged = _staged_paths(repo)
+    staged = status_paths(repo, "flagStaged")
     assert outside_file not in staged, (
         "Unstage should unstage a file the filter does not exclude"
     )
@@ -774,7 +767,7 @@ def test_link_unstage_honours_a_rule_naming_the_mount(new_lore_repo):
 
     os.remove(view_file)
 
-    staged = _staged_paths(repo)
+    staged = status_paths(repo, "flagStaged")
     assert deep_file in staged, (
         "Unstage should skip content the filter excludes below a resolved link"
     )
@@ -810,8 +803,8 @@ def test_link_scan_keeps_a_mount_missing_from_the_working_tree(new_lore_repo):
     )
 
     clone.stage(scan=True)
-    assert _staged_paths(clone) == [DEFAULT_PARENT_FILE, sibling], (
-        f"A scan stages the edit and the deletion, got {_staged_paths(clone)}"
+    assert status_paths(clone, "flagStaged") == [DEFAULT_PARENT_FILE, sibling], (
+        f"A scan stages the edit and the deletion, got {status_paths(clone, 'flagStaged')}"
     )
 
     clone.commit("Edit one file and delete another")
@@ -836,8 +829,8 @@ def test_link_scan_keeps_a_mount_whose_parent_directory_is_missing(new_lore_repo
     clone.write_files({DEFAULT_PARENT_FILE: "edited\n"})
 
     clone.stage(scan=True)
-    assert _staged_paths(clone) == [DEFAULT_PARENT_FILE], (
-        f"A scan stages the edited file alone, got {_staged_paths(clone)}"
+    assert status_paths(clone, "flagStaged") == [DEFAULT_PARENT_FILE], (
+        f"A scan stages the edited file alone, got {status_paths(clone, 'flagStaged')}"
     )
 
     clone.commit("Edit the parent file")
@@ -877,9 +870,9 @@ def test_link_scan_scoped_to_a_missing_directory_keeps_the_mount(new_lore_repo):
     )
 
     clone.stage("libs", scan=True)
-    assert _staged_paths(clone) == [sibling], (
+    assert status_paths(clone, "flagStaged") == [sibling], (
         f"A scan of the missing path stages the deletion below it, got "
-        f"{_staged_paths(clone)}"
+        f"{status_paths(clone, 'flagStaged')}"
     )
 
     clone.commit("Delete the sibling file")
@@ -904,8 +897,8 @@ def test_link_scan_removes_the_directory_a_removed_link_emptied(new_lore_repo):
     clone.rmtree("libs")
 
     clone.stage(scan=True)
-    assert _staged_paths(clone) == ["libs"], (
-        f"A scan stages the emptied directory, got {_staged_paths(clone)}"
+    assert status_paths(clone, "flagStaged") == ["libs"], (
+        f"A scan stages the emptied directory, got {status_paths(clone, 'flagStaged')}"
     )
 
     clone.commit("Remove the link")
@@ -940,30 +933,19 @@ def test_link_status_lists_staged_changes_below_an_ignored_mount(new_lore_repo):
 def test_link_stage_a_file_written_over_the_mount_replaces_the_link(new_lore_repo):
     """Staging a plain file where the mount was replaces the link with it, and a clone holds the
     file and no link."""
-    parent, _ = make_parent_with_link(new_lore_repo, "shared")
-
-    parent.rmtree("shared")
-    parent.write_files({"shared": "file\n"})
-    parent.stage("shared", scan=True)
+    parent, _ = replace_mount_with_a_file(new_lore_repo)
     parent.commit("Replace the link with a file")
     parent.push()
 
     clone = parent.clone()
-    with clone.open_file("shared") as f:
-        assert f.read() == "file\n", "shared must hold the replacement file"
+    assert read_text(clone, "shared") == "file\n", (
+        "shared must hold the replacement file"
+    )
     assert "No links found" in clone.link_list()
 
 
 _MOVED_FILE = "docs/a.txt"
-_LINKED_FILE = f"{DEFAULT_LINK_MOUNT}/linked.txt"
-
-
-def _make_parent_with_link_and_moved_file(new_lore_repo) -> Lore:
-    parent, _ = make_parent_with_link(
-        new_lore_repo,
-        parent_files={DEFAULT_PARENT_FILE: "baseline\n", _MOVED_FILE: "moved\n"},
-    )
-    return parent
+_PARENT_FILES = {DEFAULT_PARENT_FILE: "baseline\n", _MOVED_FILE: "moved\n"}
 
 
 @pytest.mark.smoke
@@ -971,16 +953,18 @@ def _make_parent_with_link_and_moved_file(new_lore_repo) -> Lore:
     ("from_path", "to_path"),
     [
         pytest.param(_MOVED_FILE, f"{DEFAULT_LINK_MOUNT}/a.txt", id="into"),
-        pytest.param(_MOVED_FILE, _LINKED_FILE, id="onto"),
-        pytest.param(_LINKED_FILE, "docs/linked.txt", id="out-of"),
-        pytest.param(_LINKED_FILE, f"{DEFAULT_LINK_MOUNT}/renamed.txt", id="within"),
+        pytest.param(_MOVED_FILE, DEFAULT_LINKED_FILE, id="onto"),
+        pytest.param(DEFAULT_LINKED_FILE, "docs/linked.txt", id="out-of"),
+        pytest.param(
+            DEFAULT_LINKED_FILE, f"{DEFAULT_LINK_MOUNT}/renamed.txt", id="within"
+        ),
         pytest.param(DEFAULT_LINK_MOUNT, "vendor/moved", id="mount"),
     ],
 )
 def test_link_stage_move_across_a_link_is_not_supported(
     new_lore_repo, from_path, to_path
 ):
-    parent = _make_parent_with_link_and_moved_file(new_lore_repo)
+    parent, _ = make_parent_with_link(new_lore_repo, parent_files=_PARENT_FILES)
     parent.make_dirs(os.path.dirname(to_path))
     parent.move(from_path, to_path)
     before = status_by_path(parent)
@@ -993,7 +977,7 @@ def test_link_stage_move_across_a_link_is_not_supported(
 
 @pytest.mark.smoke
 def test_link_stage_move_outside_links(new_lore_repo):
-    parent = _make_parent_with_link_and_moved_file(new_lore_repo)
+    parent, _ = make_parent_with_link(new_lore_repo, parent_files=_PARENT_FILES)
     to_path = "vendor/a.txt"
     parent.move(_MOVED_FILE, to_path)
 

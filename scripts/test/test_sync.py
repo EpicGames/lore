@@ -3,7 +3,6 @@
 import logging
 import os
 import shutil
-import stat
 import sys
 import time
 
@@ -22,7 +21,7 @@ from lore_parsers import (
     parse_status_json,
     parse_status_summary_json,
 )
-from test_utils import to_posix
+from test_utils import is_executable, to_posix
 
 from lore import Lore
 
@@ -151,9 +150,8 @@ def test_sync(new_lore_repo):
     assert clone.compare_file(repo, added_file)
 
     if sys.platform != "win32":
-        synced_mode = os.stat(os.path.join(repo.path, text_file)).st_mode
-        assert synced_mode & stat.S_IXUSR, (
-            f"the mode change must reach the synced repository: {synced_mode:o}"
+        assert is_executable(repo, text_file), (
+            "the mode change must reach the synced repository"
         )
 
     assert not repo.path_exists(long_path_first_dir), (

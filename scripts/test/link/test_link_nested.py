@@ -6,7 +6,13 @@ import pytest
 from error_types import LOCAL_MODIFICATIONS, LocalChanges
 from link_helpers import build_nested_link_repos_at, fail_unless_holds, link_pin
 from lore_parsers import parse_status_json
-from test_utils import status_by_path, to_posix, unstaged_entries, working_tree_files
+from test_utils import (
+    read_text,
+    status_by_path,
+    to_posix,
+    unstaged_entries,
+    working_tree_files,
+)
 
 pytestmark = pytest.mark.own_vfs(
     "links a repository, which a virtual clone does not hold"
@@ -234,8 +240,7 @@ def test_nested_link_stage_unstage_reset(new_lore_repo):
     with repo_a.open_file(inner_file, "w+") as f:
         f.writelines(["TEMP deep modification to be reset\n"])
     repo_a.reset(inner_file)
-    with repo_a.open_file(inner_file, "r") as f:
-        content = f.read()
+    content = read_text(repo_a, inner_file)
     assert "TEMP deep modification" not in content, "reset should discard deep change"
     assert "modified content two levels deep" in content, (
         "reset should restore committed deep content"
@@ -338,8 +343,9 @@ def test_nested_link_update_refuses_only_a_local_change_it_would_overwrite(
     else:
         repo_a.link_update(nested_mount, pin=c_v2)
 
-    with repo_a.open_file(inner) as f:
-        assert f.read() == ("locally edited\n" if edited else "C revision two\n")
+    assert read_text(repo_a, inner) == (
+        "locally edited\n" if edited else "C revision two\n"
+    )
     assert link_pin(repo_a, repo_c.get_id()) == (c_v1 if edited else c_v2)
 
 
@@ -596,15 +602,13 @@ def test_nested_link_reset_deep(new_lore_repo):
     )
 
     deep_file = f"{nested_mount}/c-data/inner.txt"
-    with repo_a.open_file(deep_file, "r") as f:
-        original = f.read()
+    original = read_text(repo_a, deep_file)
 
     with repo_a.open_file(deep_file, "w+") as f:
         f.writelines(["temporary deep change to be reset\n"])
 
     repo_a.reset(deep_file)
-    with repo_a.open_file(deep_file, "r") as f:
-        content = f.read()
+    content = read_text(repo_a, deep_file)
     assert "temporary deep change" not in content, "reset should discard deep change"
     assert content == original, "reset should restore committed deep content exactly"
 
@@ -697,8 +701,9 @@ def test_merge_lands_an_edit_inside_a_nested_link(new_lore_repo):
     repo_a.push()
 
     fail_unless_holds(repo_a, outer_path, outer_edit)
-    with repo_a.open_file(nested_path) as f:
-        assert f.read() == nested_edit, "the merge must land the nested edit"
+    assert read_text(repo_a, nested_path) == nested_edit, (
+        "the merge must land the nested edit"
+    )
 
 
 @pytest.mark.smoke
@@ -730,8 +735,7 @@ def test_unstage_below_a_nested_link_leaves_what_a_forced_stage_staged_past_the_
     clone.commit("Past the view below a nested link")
     clone.push()
     repo_c.sync()
-    with repo_c.open_file("Hidden/new.txt") as committed:
-        assert committed.read() == content
+    assert read_text(repo_c, "Hidden/new.txt") == content
 
 
 @pytest.mark.smoke

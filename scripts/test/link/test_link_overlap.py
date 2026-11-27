@@ -7,43 +7,29 @@ from error_types import (
     OverlappingMountError,
 )
 from link_helpers import (
+    OVERLAP_LINK_FILES,
+    add_a_link,
+    assert_switch_realized,
     error_line,
     layer_targets,
+    make_repo,
+    parent_and_link_for_overlap,
     parse_revision_diff,
     remote_branch_names,
 )
-from lore_parsers import parse_jsonl
-from test_utils import status_by_path, unstaged_entries, working_tree_files
+from test_utils import (
+    links_by_path,
+    read_text,
+    source_paths_by_link_path,
+    status_by_path,
+    working_tree_files,
+)
 
 from lore import Lore
 
 pytestmark = pytest.mark.own_vfs(
     "links a repository, which a virtual clone does not hold"
 )
-
-_OVERLAP_LINK_FILES = {
-    "sub/outer.txt": "outer content\n",
-    "sub/test/inner.txt": "inner content\n",
-    "sub/other/sibling.txt": "sibling content\n",
-}
-
-
-def _parent_and_link_for_overlap(new_lore_repo, name: str = ""):
-    parent: Lore = new_lore_repo()
-    parent.write_commit_push("Initial parent", {"parent.txt": "parent content\n"})
-
-    link_repo: Lore = new_lore_repo(name)
-    link_repo.write_commit_push("Initial link", _OVERLAP_LINK_FILES)
-
-    return parent, link_repo
-
-
-def _mounted_source_paths(repo: Lore) -> dict:
-    """Maps every mount path in `repo` to the source path it exposes."""
-    return {
-        entry["linkPath"]: entry["sourcePath"]
-        for entry in parse_jsonl(repo.link_list(json=True), "linkEntry")
-    }
 
 
 @pytest.mark.smoke
@@ -54,7 +40,7 @@ def test_link_add_rejects_source_path_inside_existing_mount(new_lore_repo):
     The argument is spelled in a different case from the stored path, which
     resolves to the same node, so the comparison has to run on the stored path.
     """
-    parent, link_repo = _parent_and_link_for_overlap(new_lore_repo)
+    parent, link_repo = parent_and_link_for_overlap(new_lore_repo)
 
     parent.link_add("vendor/whole", link_repo.get_id(), "sub")
     parent.commit("Add link at vendor/whole")
@@ -67,7 +53,7 @@ def test_link_add_rejects_source_path_inside_existing_mount(new_lore_repo):
     for path in ("vendor/part", "sub/test", "vendor/whole"):
         assert path in error, error
 
-    assert _mounted_source_paths(parent) == {"vendor/whole": "sub"}, (
+    assert source_paths_by_link_path(parent) == {"vendor/whole": "sub"}, (
         "A refused link add must leave the registry holding only the first mount"
     )
 
@@ -77,7 +63,7 @@ def test_link_add_rejects_source_path_containing_existing_mount(new_lore_repo):
     """The check is symmetric: mounting `sub` when `sub/test` is already mounted
     from the same repository is refused too.
     """
-    parent, link_repo = _parent_and_link_for_overlap(new_lore_repo)
+    parent, link_repo = parent_and_link_for_overlap(new_lore_repo)
 
     parent.link_add("vendor/part", link_repo.get_id(), "sub/test")
     parent.commit("Add link at vendor/part")
@@ -86,7 +72,7 @@ def test_link_add_rejects_source_path_containing_existing_mount(new_lore_repo):
     with pytest.raises(OverlappingLinkError):
         parent.link_add("vendor/whole", link_repo.get_id(), "sub")
 
-    assert _mounted_source_paths(parent) == {"vendor/part": "sub/test"}, (
+    assert source_paths_by_link_path(parent) == {"vendor/part": "sub/test"}, (
         "A refused link add must leave the registry holding only the first mount"
     )
 
@@ -96,7 +82,7 @@ def test_link_add_rejects_nesting_under_a_root_mount(new_lore_repo):
     """A root mount exposes every subtree, so any other source path nests under
     it. The root is the empty stored path, which no prefix comparison matches.
     """
-    parent, link_repo = _parent_and_link_for_overlap(new_lore_repo)
+    parent, link_repo = parent_and_link_for_overlap(new_lore_repo)
 
     parent.link_add("vendor/all", link_repo.get_id(), "/")
     parent.commit("Add root mount")
@@ -105,7 +91,7 @@ def test_link_add_rejects_nesting_under_a_root_mount(new_lore_repo):
     with pytest.raises(OverlappingLinkError):
         parent.link_add("vendor/part", link_repo.get_id(), "sub/test")
 
-    assert _mounted_source_paths(parent) == {"vendor/all": "/"}, (
+    assert source_paths_by_link_path(parent) == {"vendor/all": "/"}, (
         "A refused link add must leave the registry holding only the root mount"
     )
 
@@ -117,9 +103,9 @@ def test_link_add_allows_disjoint_source_paths_and_refuses_one_folder_twice(
     """Disjoint subtrees of one repository mount side by side, and a second repository shares no
     pin with the first however its source paths line up. A second mount of the same subtree is
     refused, as the working tree would hold its files twice."""
-    parent, first_link = _parent_and_link_for_overlap(new_lore_repo)
+    parent, first_link = parent_and_link_for_overlap(new_lore_repo)
     second_link: Lore = new_lore_repo()
-    second_link.write_commit_push("Initial second link", _OVERLAP_LINK_FILES)
+    second_link.write_commit_push("Initial second link", OVERLAP_LINK_FILES)
 
     parent.link_add("vendor/test", first_link.get_id(), "sub/test")
     parent.link_add("vendor/other", first_link.get_id(), "sub/other")
@@ -129,25 +115,31 @@ def test_link_add_allows_disjoint_source_paths_and_refuses_one_folder_twice(
     parent.commit("Add non-nesting mounts")
     parent.push()
 
-    assert _mounted_source_paths(parent) == {
+    assert source_paths_by_link_path(parent) == {
         "vendor/test": "sub/test",
         "vendor/other": "sub/other",
         "vendor/second": "sub",
     }
 
-    with parent.open_file("vendor/test/inner.txt") as f:
-        assert f.read() == _OVERLAP_LINK_FILES["sub/test/inner.txt"]
-    with parent.open_file("vendor/other/sibling.txt") as f:
-        assert f.read() == _OVERLAP_LINK_FILES["sub/other/sibling.txt"]
-    with parent.open_file("vendor/second/test/inner.txt") as f:
-        assert f.read() == _OVERLAP_LINK_FILES["sub/test/inner.txt"]
+    assert (
+        read_text(parent, "vendor/test/inner.txt")
+        == OVERLAP_LINK_FILES["sub/test/inner.txt"]
+    )
+    assert (
+        read_text(parent, "vendor/other/sibling.txt")
+        == OVERLAP_LINK_FILES["sub/other/sibling.txt"]
+    )
+    assert (
+        read_text(parent, "vendor/second/test/inner.txt")
+        == OVERLAP_LINK_FILES["sub/test/inner.txt"]
+    )
 
 
 @pytest.mark.smoke
 def test_link_mounts_of_one_repository_must_agree_on_branch_and_flags(new_lore_repo):
     """Every mount of one repository shares its pin, so a mount of another folder has to track
     the same branch with the same flags."""
-    parent, link_repo = _parent_and_link_for_overlap(new_lore_repo)
+    parent, link_repo = parent_and_link_for_overlap(new_lore_repo)
     parent.link_add("vendor/test", link_repo.get_id(), "sub/test")
 
     with pytest.raises(ImproperArgumentsError):
@@ -158,10 +150,14 @@ def test_link_mounts_of_one_repository_must_agree_on_branch_and_flags(new_lore_r
     parent.commit("Add links")
     parent.push()
 
-    with parent.open_file("vendor/test/inner.txt") as f:
-        assert f.read() == _OVERLAP_LINK_FILES["sub/test/inner.txt"]
-    with parent.open_file("vendor/other/sibling.txt") as f:
-        assert f.read() == _OVERLAP_LINK_FILES["sub/other/sibling.txt"]
+    assert (
+        read_text(parent, "vendor/test/inner.txt")
+        == OVERLAP_LINK_FILES["sub/test/inner.txt"]
+    )
+    assert (
+        read_text(parent, "vendor/other/sibling.txt")
+        == OVERLAP_LINK_FILES["sub/other/sibling.txt"]
+    )
 
 
 @pytest.mark.smoke
@@ -170,17 +166,13 @@ def test_link_mount_added_without_flags_takes_the_flags_of_its_repository(
 ):
     """A mount of a repository mounted without following branches, added without
     `--disable-branching`, takes the flags of the other mounts."""
-    parent, link_repo = _parent_and_link_for_overlap(new_lore_repo)
+    parent, link_repo = parent_and_link_for_overlap(new_lore_repo)
     parent.link_add(
         "vendor/test", link_repo.get_id(), "sub/test", disable_branching=True
     )
     parent.link_add("vendor/other", link_repo.get_id(), "sub/other")
 
-    flags = {
-        entry["linkPath"]: entry["flags"]
-        for entry in parse_jsonl(parent.link_list(json=True), "linkEntry")
-    }
-    assert flags == {"vendor/test": 1, "vendor/other": 1}
+    assert links_by_path(parent, "flags") == {"vendor/test": 1, "vendor/other": 1}
 
 
 @pytest.mark.smoke
@@ -193,7 +185,7 @@ def test_link_reset_rejects_restoring_an_overlapping_mount(
     folder, can be added while it is gone. Resetting the removal must not restore the overlap,
     and leaves a link to another repository added in its place as it was.
     """
-    parent, link_repo = _parent_and_link_for_overlap(new_lore_repo)
+    parent, link_repo = parent_and_link_for_overlap(new_lore_repo)
 
     parent.link_add("vendor/whole", link_repo.get_id(), "sub")
     parent.commit("Add link at vendor/whole")
@@ -212,7 +204,7 @@ def test_link_reset_rejects_restoring_an_overlapping_mount(
     with pytest.raises(OverlappingLinkError):
         parent.reset("vendor/whole")
 
-    assert _mounted_source_paths(parent) == expected, (
+    assert source_paths_by_link_path(parent) == expected, (
         "A refused reset must leave the staged registry as it was"
     )
     assert parent.read_files() == files
@@ -223,7 +215,7 @@ def test_link_merge_rejects_incoming_overlapping_mount(new_lore_repo):
     """Both branches fork from a revision holding neither mount, so neither
     `link add` can see the other. The merge that brings them together is refused.
     """
-    parent, link_repo = _parent_and_link_for_overlap(new_lore_repo)
+    parent, link_repo = parent_and_link_for_overlap(new_lore_repo)
 
     parent.branch_create("mount-whole")
     parent.link_add("vendor/whole", link_repo.get_id(), "sub")
@@ -241,7 +233,7 @@ def test_link_merge_rejects_incoming_overlapping_mount(new_lore_repo):
     with pytest.raises(OverlappingLinkError):
         parent.branch_merge_start("mount-part", message="Merge nesting mount")
 
-    assert _mounted_source_paths(parent) == {"vendor/whole": "sub"}, (
+    assert source_paths_by_link_path(parent) == {"vendor/whole": "sub"}, (
         "A refused merge must leave the target's registry as it was"
     )
     assert not parent.path_exists("vendor/part"), (
@@ -263,17 +255,6 @@ _WHOLE_MOUNT_FILES = [
 _PART_MOUNT_FILES = ["vendor/part/inner.txt"]
 
 
-def _assert_switch_realized(repo: Lore, expected_files: list[str], source: dict):
-    unstaged = unstaged_entries(repo)
-    assert unstaged == [], f"A clean switch must leave nothing unstaged, got {unstaged}"
-    assert _mounted_source_paths(repo) == source, (
-        "The switch must restore the registry the branch committed"
-    )
-    assert working_tree_files(repo, "vendor") == expected_files, (
-        "The switch must realize the mount against the source path its own branch names"
-    )
-
-
 @pytest.mark.smoke
 def test_link_branch_switch_realizes_each_mount_against_its_own_source(new_lore_repo):
     """Two branches mount one repository at different, non-nesting source paths.
@@ -283,7 +264,7 @@ def test_link_branch_switch_realizes_each_mount_against_its_own_source(new_lore_
     pair for one mount moving between paths. The configuration is the one
     `test_link_add_allows_non_nesting_source_paths` leaves deliberately legal.
     """
-    parent, link_repo = _parent_and_link_for_overlap(new_lore_repo)
+    parent, link_repo = parent_and_link_for_overlap(new_lore_repo)
 
     parent.branch_create("mount-whole")
     parent.link_add("vendor/whole", link_repo.get_id(), "sub")
@@ -308,7 +289,7 @@ def test_link_branch_switch_realizes_each_mount_against_its_own_source(new_lore_
     part_revision = parent.branch_info().local_latest
 
     parent.branch_switch("mount-whole")
-    _assert_switch_realized(parent, _WHOLE_MOUNT_FILES, {"vendor/whole": "sub"})
+    assert_switch_realized(parent, _WHOLE_MOUNT_FILES, {"vendor/whole": "sub"})
 
     mount_actions = {
         path.rstrip("/"): action
@@ -323,7 +304,7 @@ def test_link_branch_switch_realizes_each_mount_against_its_own_source(new_lore_
     )
 
     parent.branch_switch("mount-part")
-    _assert_switch_realized(parent, _PART_MOUNT_FILES, {"vendor/part": "sub/test"})
+    assert_switch_realized(parent, _PART_MOUNT_FILES, {"vendor/part": "sub/test"})
 
 
 _LIB_FILES = ["vendor/lib/lib.txt"]
@@ -331,25 +312,24 @@ _LIB_FILES = ["vendor/lib/lib.txt"]
 
 @pytest.fixture
 def parent_with_link_and_layer_repo(new_lore_repo):
-    parent: Lore = new_lore_repo()
-    parent.write_commit_push("Initial parent", {"parent.txt": "parent content\n"})
+    parent = make_repo(
+        new_lore_repo, {"parent.txt": "parent content\n"}, "Initial parent"
+    )
 
-    link_repo: Lore = new_lore_repo()
-    link_repo.write_commit_push("Initial link", {"lib.txt": "lib content\n"})
+    link_repo = make_repo(new_lore_repo, {"lib.txt": "lib content\n"}, "Initial link")
 
     layer_repo: Lore = new_lore_repo(parent.name + "_layer")
     layer_repo.write_commit_push("Initial layer", {"layer.txt": "layer content\n"})
 
-    parent.link_add("vendor/lib", link_repo.get_id(), "/")
-    parent.commit("Add link at vendor/lib")
-    parent.push()
+    add_a_link(parent, link_repo, link_path="vendor/lib")
     return parent, link_repo, layer_repo
 
 
 @pytest.fixture
 def parent_with_layer_and_link_repo(new_lore_repo):
-    parent: Lore = new_lore_repo()
-    parent.write_commit_push("Initial parent", {"parent.txt": "parent content\n"})
+    parent = make_repo(
+        new_lore_repo, {"parent.txt": "parent content\n"}, "Initial parent"
+    )
 
     layer_repo: Lore = new_lore_repo(parent.name + "_layer")
     layer_repo.write_commit_push("Initial layer", {"layer.txt": "layer content\n"})
@@ -358,8 +338,7 @@ def parent_with_layer_and_link_repo(new_lore_repo):
     maps_layer_repo: Lore = new_lore_repo(parent.name + "_maps_layer")
     maps_layer_repo.write_commit_push("Initial maps layer", {"layer.txt": "maps\n"})
 
-    link_repo: Lore = new_lore_repo()
-    link_repo.write_commit_push("Initial link", {"lib.txt": "lib content\n"})
+    link_repo = make_repo(new_lore_repo, {"lib.txt": "lib content\n"}, "Initial link")
 
     parent.layer_add("assets", layer_repo, "/")
     parent.layer_add("art/maps", maps_layer_repo, "/")
@@ -430,7 +409,9 @@ def test_link_add_refuses_a_path_overlapping_a_layer(parent_with_layer_and_link_
         with pytest.raises(OverlappingMountError):
             parent.link_add(link_path, link_repo.get_id(), "/", dry_run=dry_run)
 
-    assert _mounted_source_paths(parent) == {}, "A refused link add must add no link"
+    assert source_paths_by_link_path(parent) == {}, (
+        "A refused link add must add no link"
+    )
     assert working_tree_files(parent, "assets") == ["assets/layer.txt"], (
         "A refused link add must leave the layer's files as they were"
     )
@@ -444,7 +425,7 @@ def test_link_add_refuses_a_path_overlapping_a_layer(parent_with_layer_and_link_
 
     parent.link_add("assets2/lib", link_repo.get_id(), "/")
 
-    assert _mounted_source_paths(parent) == {"assets2/lib": "/"}
+    assert source_paths_by_link_path(parent) == {"assets2/lib": "/"}
     assert working_tree_files(parent, "assets2") == ["assets2/lib/lib.txt"]
     assert "feature" in remote_branch_names(link_repo), (
         "A link add beside the layer must create the branch the refusals left out"

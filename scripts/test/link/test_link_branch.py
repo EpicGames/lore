@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import sys
+from functools import partial
 
 import pytest
 from error_types import (
@@ -18,22 +19,39 @@ from link_helpers import (
     DEFAULT_PARENT_FILE,
     assert_holds_folder,
     assert_holds_link,
+    assert_link_follows_feature,
     assert_link_holds,
+    assert_local_work_kept,
+    branch_over_a_link_on_another_branch,
     build_nested_link_repos_at,
     commit_through_mount,
     folder_replaced_by_a_link,
-    link_entry,
     link_field,
+    link_on_feature_with_local_work,
     link_pin_at,
     link_replaced_by_its_folder,
+    link_tracks,
+    make_parent_reaching_shared_twice,
     make_parent_with_link,
+    make_parent_with_two_links,
     make_repo,
     remote_branch_entries,
-    remount,
+    stage_a_divergent_merge,
+    stage_a_link_add,
+    stage_a_link_removal,
+    stage_a_link_update,
+    stage_a_parent_edit,
+    stage_a_remount,
 )
 from lore_parsers import parse_complete_json, parse_jsonl, parse_status_json
 from lore_server import allocate_free_port, generate_server_config, lore_local_server
-from test_utils import view_file, working_tree_files
+from test_utils import (
+    current_revision,
+    link_entries,
+    read_text,
+    view_file,
+    working_tree_files,
+)
 
 from lore import Lore
 
@@ -765,26 +783,6 @@ def test_link_push_tells_a_layer_from_a_link(new_lore_repo):
     )
 
 
-def _current_revision(repo: Lore) -> str:
-    """The revision `status` reports the working copy at."""
-    match = re.search(r"On branch \S+ revision \d+ -> (\w+)", repo.status())
-    assert match, "status must report the current revision"
-    return match.group(1)
-
-
-def _tracks(repo: Lore, link_path: str) -> bool:
-    """Whether the link at `link_path` follows its parent's branch."""
-    return bool(link_entry(repo, link_path)["tracking"])
-
-
-def _assert_link_follows_feature(repo: Lore, source: Lore):
-    assert re.search(
-        rf"Link\s+{source.get_id()}.*?Branch:\s+feature\b[^\n]*\[tracking\]",
-        repo.link_list(),
-        re.DOTALL,
-    ), "the link must follow the parent onto the new branch"
-
-
 @pytest.mark.smoke
 @pytest.mark.parametrize("pin", [None, "main@LATEST"], ids=["latest", "pin"])
 def test_link_update_along_the_parent_branch_keeps_the_link_tracking(
@@ -802,15 +800,15 @@ def test_link_update_along_the_parent_branch_keeps_the_link_tracking(
     parent.link_update(DEFAULT_LINK_MOUNT, pin=pin)
     parent.commit("Move the link")
     parent.push()
-    assert _tracks(parent, DEFAULT_LINK_MOUNT), "the link must follow main"
-    start = _current_revision(parent)
+    assert link_tracks(parent, DEFAULT_LINK_MOUNT), "the link must follow main"
+    start = current_revision(parent)
 
     parent.branch_create("feature")
 
     assert parent.branch_info().local_latest == start, (
         "a branch over a tracking link must start at the parent's revision"
     )
-    assert _current_revision(parent) == start
+    assert current_revision(parent) == start
     parent.write_commit_push("First commit", {"feature.txt": "on feature\n"})
 
     parent.branch_switch("main")
@@ -822,57 +820,10 @@ def test_link_update_along_the_parent_branch_keeps_the_link_tracking(
     parent.branch_merge("main", message="Merge main")
     parent.push()
 
-    _assert_link_follows_feature(parent, source)
-    with parent.open_file(f"{DEFAULT_LINK_MOUNT}/again.txt", "r") as input_file:
-        assert input_file.read() == "again\n", "the merge must carry the update"
-
-
-def _stage_an_edit(parent: Lore, _source: Lore):
-    parent.write_files({"staged.txt": "staged\n"})
-    parent.stage("staged.txt")
-
-
-def _stage_a_link_removal(parent: Lore, _source: Lore):
-    parent.link_remove(DEFAULT_LINK_MOUNT)
-
-
-def _stage_a_remount(parent: Lore, source: Lore):
-    remount(parent, DEFAULT_LINK_MOUNT, source.get_id(), "/sub", message=None)
-
-
-def _stage_a_divergent_merge(parent: Lore, _source: Lore):
-    """Stages the merge of main's latest, which another clone pushed, into a
-    local commit on main."""
-    other = parent.clone()
-    other.write_commit_push("Remote change", {"remote.txt": "remote\n"})
-    parent.write_files({"local.txt": "local\n"})
-    parent.stage("local.txt")
-    parent.commit("Local change")
-    parent.branch_merge_start("main", no_commit=True)
-
-
-def _branch_over_a_link_on_another_branch(new_lore_repo, stage) -> tuple[Lore, Lore]:
-    """Parent on a new `feature` branch, created over a link that `link update`
-    pinned to another branch of the linked repository, with what `stage` stages
-    before the branch was created, and the linked repository."""
-    parent, source = make_parent_with_link(
-        new_lore_repo,
-        link_files={"linked.txt": "linked content\n", "sub/inner.txt": "inner\n"},
+    assert_link_follows_feature(parent, source)
+    assert read_text(parent, f"{DEFAULT_LINK_MOUNT}/again.txt") == "again\n", (
+        "the merge must carry the update"
     )
-    source.branch_create("release")
-    source.write_commit_push("Release", {"release.txt": "release\n"})
-    parent.link_update(DEFAULT_LINK_MOUNT, pin="release@LATEST")
-    parent.commit("Pin the link to release")
-    parent.push()
-    assert not _tracks(parent, DEFAULT_LINK_MOUNT), "the link must name release"
-    stage(parent, source)
-
-    parent.branch_create("feature")
-
-    assert _current_revision(parent) == parent.branch_info().local_latest, (
-        "the working copy must stand on the revision the new branch starts at"
-    )
-    return parent, source
 
 
 @pytest.mark.smoke
@@ -881,8 +832,8 @@ def test_branch_created_over_a_link_on_another_branch_keeps_a_staged_edit_staged
 ):
     """An edit staged before the branch was created stays staged, outside the
     revision the branch starts at, and is committed by the first commit."""
-    parent, _source = _branch_over_a_link_on_another_branch(
-        new_lore_repo, _stage_an_edit
+    parent, _source = branch_over_a_link_on_another_branch(
+        new_lore_repo, lambda parent, _source: stage_a_parent_edit(parent)
     )
 
     staged = parse_status_json(parent.status(json=True))
@@ -893,8 +844,9 @@ def test_branch_created_over_a_link_on_another_branch_keeps_a_staged_edit_staged
     parent.commit("First commit")
     parent.push()
     clone = parent.clone(branch="feature")
-    with clone.open_file("staged.txt", "r") as input_file:
-        assert input_file.read() == "staged\n", "the first commit must carry the edit"
+    assert read_text(clone, "staged.txt") == "staged\n", (
+        "the first commit must carry the edit"
+    )
 
 
 @pytest.mark.smoke
@@ -903,8 +855,8 @@ def test_branch_created_over_a_link_on_another_branch_merges_a_staged_merge_into
 ):
     """A merge of main's latest into a local commit, staged before the branch
     was created, merges main's latest into the new branch, which pushes."""
-    parent, _source = _branch_over_a_link_on_another_branch(
-        new_lore_repo, _stage_a_divergent_merge
+    parent, _source = branch_over_a_link_on_another_branch(
+        new_lore_repo, stage_a_divergent_merge
     )
     remote_main = parent.branch_info("main").remote_latest
 
@@ -921,7 +873,7 @@ def test_branch_created_over_a_link_on_another_branch_merges_a_staged_merge_into
 @pytest.mark.smoke
 @pytest.mark.parametrize(
     "stage_link_change",
-    [_stage_a_link_removal, _stage_a_remount],
+    [stage_a_link_removal, stage_a_remount],
     ids=["remove", "remount"],
 )
 def test_branch_created_over_a_staged_link_change_keeps_the_link_on_it_once_unstaged(
@@ -930,15 +882,15 @@ def test_branch_created_over_a_staged_link_change_keeps_the_link_on_it_once_unst
     """A link on another branch that a staged removal or remount replaces
     follows the new branch once the change is unstaged, and the branch takes a
     commit and pushes."""
-    parent, source = _branch_over_a_link_on_another_branch(
+    parent, source = branch_over_a_link_on_another_branch(
         new_lore_repo, stage_link_change
     )
 
     parent.unstage(".")
 
-    _assert_link_follows_feature(parent, source)
+    assert_link_follows_feature(parent, source)
     parent.write_commit_push("First commit", {"feature.txt": "on feature\n"})
-    assert _current_revision(parent) == parent.branch_info().local_latest
+    assert current_revision(parent) == parent.branch_info().local_latest
 
 
 @pytest.mark.smoke
@@ -956,12 +908,12 @@ def test_branch_created_over_nested_links_takes_a_commit_and_pushes(new_lore_rep
     parent.link_add("other/nested", c.get_id(), "/")
     parent.commit("Link C through other")
     parent.push()
-    assert _tracks(parent, b_mount), "the outer link must follow main"
-    start = _current_revision(parent)
+    assert link_tracks(parent, b_mount), "the outer link must follow main"
+    start = current_revision(parent)
 
     parent.branch_create("feature")
     assert parent.branch_info().local_latest == start
-    assert _current_revision(parent) == start
+    assert current_revision(parent) == start
 
     branch_id = parent.branch_info("feature").id
     for linked in (b, other, c):
@@ -974,7 +926,7 @@ def test_branch_created_over_nested_links_takes_a_commit_and_pushes(new_lore_rep
 
     parent.write_commit_push("First commit", {"feature.txt": "on feature\n"})
 
-    assert _current_revision(parent) == parent.branch_info().local_latest
+    assert current_revision(parent) == parent.branch_info().local_latest
 
 
 @pytest.mark.smoke
@@ -992,13 +944,15 @@ def test_branch_created_over_a_nested_link_on_another_branch_moves_it_onto_the_b
     parent.link_update(nested_mount, pin="release@LATEST")
     parent.commit("Pin the nested link to release")
     parent.push()
-    assert not _tracks(parent, nested_mount), "the nested link must name release"
+    assert not link_tracks(parent, nested_mount), "the nested link must name release"
     outer_pin = link_pin_at(parent, b_mount)
 
     parent.branch_create("feature")
 
-    assert _tracks(parent, nested_mount), "the nested link must follow the new branch"
-    assert _tracks(parent, b_mount), "the outer link must follow the new branch"
+    assert link_tracks(parent, nested_mount), (
+        "the nested link must follow the new branch"
+    )
+    assert link_tracks(parent, b_mount), "the outer link must follow the new branch"
     assert link_pin_at(parent, b_mount) != outer_pin, (
         "the outer link must move onto the revision repinning the nested link"
     )
@@ -1009,27 +963,9 @@ def test_branch_created_over_a_nested_link_on_another_branch_moves_it_onto_the_b
     assert any("Repin links onto branch feature" in m for m in messages), messages
 
 
-def _stage_a_link_add(new_lore_repo) -> tuple[Lore, Lore]:
-    """Parent with a link staged by `link add` and not committed, and the
-    linked repository."""
-    parent = make_repo(new_lore_repo, {DEFAULT_PARENT_FILE: "baseline\n"})
-    source = make_repo(new_lore_repo, {"linked.txt": "linked content\n"})
-    parent.link_add(DEFAULT_LINK_MOUNT, source.get_id(), "/")
-    return parent, source
-
-
-def _stage_a_link_update(new_lore_repo) -> tuple[Lore, Lore]:
-    """Parent with a committed link that a staged `link update` repins, and the
-    linked repository."""
-    parent, source = make_parent_with_link(new_lore_repo)
-    source.write_commit_push("Advance", {"advanced.txt": "advanced\n"})
-    parent.link_update(DEFAULT_LINK_MOUNT)
-    return parent, source
-
-
 @pytest.mark.smoke
 @pytest.mark.parametrize(
-    "stage_link", [_stage_a_link_add, _stage_a_link_update], ids=["add", "update"]
+    "stage_link", [stage_a_link_add, stage_a_link_update], ids=["add", "update"]
 )
 def test_branch_created_over_a_staged_link_branches_the_linked_repository(
     new_lore_repo, stage_link
@@ -1051,7 +987,7 @@ def test_branch_created_over_a_staged_link_branches_the_linked_repository(
     parent.commit("Commit the staged link")
     parent.push()
 
-    _assert_link_follows_feature(parent, source)
+    assert_link_follows_feature(parent, source)
 
 
 @pytest.mark.smoke
@@ -1164,22 +1100,6 @@ def test_push_of_a_diverged_layer_pushes_nothing(new_lore_repo):
         parent.push()
 
     assert parent.branch_info().remote_latest == pushed
-
-
-def make_parent_reaching_shared_twice(new_lore_repo) -> tuple[Lore, Lore]:
-    """Returns (parent, shared): the parent links `first` and `second`, each of
-    which links `shared` at `<name>/shared`, all pushed."""
-    parent = make_repo(new_lore_repo, {DEFAULT_PARENT_FILE: "baseline\n"})
-    shared = make_repo(new_lore_repo, {"shared.txt": "shared content\n"})
-    for name in ("first", "second"):
-        middle = make_repo(new_lore_repo, {f"{name}.txt": f"{name} content\n"})
-        parent.link_add(name, middle.get_id(), "/")
-        parent.commit(f"Link {name}")
-        parent.push()
-        parent.link_add(f"{name}/shared", shared.get_id(), "/")
-        parent.commit(f"Link the shared repository in {name}")
-        parent.push()
-    return parent, shared
 
 
 @pytest.mark.smoke
@@ -1373,26 +1293,6 @@ def test_link_archived_parent_branch_does_not_disturb_link_resolution(new_lore_r
 # ---------------------------------------------------------------------------
 
 
-def _setup_repo_with_two_links(new_lore_repo):
-    """Set up a parent repo with two links (sec, thr) and content in each.
-
-    Returns (parent_repo, second_repo, third_repo).
-    """
-    repo: Lore = new_lore_repo()
-    second_repo: Lore = new_lore_repo(repo.name + "_second")
-    third_repo: Lore = new_lore_repo(repo.name + "_third")
-
-    repo.write_commit_push(None, {"main.txt": b"main content"})
-    second_repo.write_commit_push(None, {"second.txt": b"second content"})
-    third_repo.write_commit_push(None, {"third.txt": b"third content"})
-
-    repo.link_add("sec", second_repo.get_id(), "/")
-    repo.link_add("thr", third_repo.get_id(), "/")
-    repo.commit("add links")
-    repo.push()
-    return repo, second_repo, third_repo
-
-
 @pytest.mark.smoke
 def test_link_branch_archive_include_links(new_lore_repo):
     """`--include-links` archives the branch in the linked repository too, so
@@ -1473,13 +1373,9 @@ def test_link_branch_archive_warns_of_unreachable_link_remote(
     """A link whose remote can't be reached is a warning naming its repository, beside the
     failure of the outer remote archive."""
     remote_url, stop_remote = stoppable_remote_url
-    repo = new_lore_repo(remote_url=remote_url)
-    repo.write_commit_push("Baseline", {DEFAULT_PARENT_FILE: "baseline\n"})
-    link_repo = new_lore_repo(remote_url=remote_url)
-    link_repo.write_commit_push("Initial linked content", {"linked.txt": "linked\n"})
-    repo.link_add(DEFAULT_LINK_MOUNT, link_repo.get_id(), "/")
-    repo.commit("Add link")
-    repo.push()
+    repo, link_repo = make_parent_with_link(
+        partial(new_lore_repo, remote_url=remote_url)
+    )
     repo.branch_create("feature")
     repo.push()
     repo.branch_switch("main")
@@ -1502,7 +1398,7 @@ def test_link_branch_archive_warns_of_unreachable_link_remote(
 @pytest.mark.smoke
 def test_link_branch_archive_multiple_links(new_lore_repo):
     """`--include-links` archives the branch in every configured link."""
-    repo, second_repo, third_repo = _setup_repo_with_two_links(new_lore_repo)
+    repo, second_repo, third_repo = make_parent_with_two_links(new_lore_repo)
 
     repo.branch_create("feature")
     repo.push()
@@ -1523,7 +1419,7 @@ def test_link_branch_archive_multiple_links(new_lore_repo):
 @pytest.mark.smoke
 def test_link_branch_archive_single_link(new_lore_repo):
     """`--link <path>` archives the branch in that link and no other."""
-    repo, second_repo, third_repo = _setup_repo_with_two_links(new_lore_repo)
+    repo, second_repo, third_repo = make_parent_with_two_links(new_lore_repo)
 
     repo.branch_create("feature")
     repo.push()
@@ -1618,7 +1514,7 @@ def test_link_branch_archive_tolerates_already_archived_link(new_lore_repo):
 @pytest.mark.smoke
 def test_link_branch_archive_reports_once(new_lore_repo):
     """Archiving reports a single branch, not one line per link."""
-    repo, _second_repo, _third_repo = _setup_repo_with_two_links(new_lore_repo)
+    repo, _second_repo, _third_repo = make_parent_with_two_links(new_lore_repo)
 
     repo.branch_create("feature")
     repo.push()
@@ -1795,9 +1691,7 @@ def test_syncing_a_dependency_set_off_a_link_realizes_the_folder(new_lore_repo):
     parent.sync(folder_revision, root_files=["shared/a.txt"])
 
     assert_holds_folder(parent)
-    assert parse_jsonl(parent.link_list(json=True), "linkEntry") == [], (
-        "the link must be removed"
-    )
+    assert link_entries(parent) == [], "the link must be removed"
 
 
 @pytest.mark.smoke
@@ -1859,10 +1753,9 @@ def test_switching_off_a_link_over_a_local_edit_the_folder_would_overwrite(
     else:
         with pytest.raises(LocalChanges):
             parent.branch_switch("main")
-        with parent.open_file("shared/a.txt", "r") as input_file:
-            assert input_file.read() == "a edited locally\n", (
-                "the local edit must be kept"
-            )
+        assert read_text(parent, "shared/a.txt") == "a edited locally\n", (
+            "the local edit must be kept"
+        )
 
 
 @pytest.mark.smoke
@@ -1885,43 +1778,6 @@ def test_switching_off_a_link_keeps_a_local_edit_holding_the_folder_content(
 # Leaving a link mount that holds local work.
 # ---------------------------------------------------------------------------
 
-_LOCAL_WORK = {
-    "vendor/linked.txt": "edited locally\n",
-    "vendor/untracked.txt": "never staged\n",
-}
-
-_LINKED = {"linked.txt": "linked\n", "sub/inner.txt": "inner\n"}
-
-
-def _link_on_feature_with_local_work(
-    new_lore_repo, local_work: dict[str, str] = _LOCAL_WORK
-) -> tuple[Lore, str]:
-    """Parent on `feature`, which links a repository holding `_LINKED` at
-    `vendor/`, with `local_work` written in the mount. `main` holds no link, and
-    `folder` holds a plain `vendor/` folder of other files. Returns the parent and
-    the revision `feature` branched from."""
-    parent = make_repo(new_lore_repo, {"root.txt": "root\n"})
-    source = make_repo(new_lore_repo, _LINKED)
-
-    parent.branch_create("folder")
-    parent.write_commit_push("Add a folder", {"vendor/other.txt": "other\n"})
-    parent.branch_switch("main")
-    branched_from = parent.branch_info().local_latest
-
-    parent.branch_create("feature")
-    parent.link_add("vendor", source.get_id(), "/")
-    parent.commit("Add a link")
-    parent.push()
-
-    parent.write_files(local_work)
-    return parent, branched_from
-
-
-def _assert_local_work_kept(parent: Lore) -> None:
-    for path, content in _LOCAL_WORK.items():
-        with parent.open_file(path, "r") as input_file:
-            assert input_file.read() == content, f"{path} must keep its local content"
-
 
 @pytest.mark.smoke
 @pytest.mark.parametrize("target", ["main", "folder"])
@@ -1931,7 +1787,7 @@ def test_switching_off_a_link_refuses_to_delete_a_local_edit_in_the_mount(
     """Switching to a branch without the link is refused while a file the link
     tracks holds a local edit, with and without `--dry-run`, naming the file and
     leaving the mount and the branch untouched."""
-    parent, _branched_from = _link_on_feature_with_local_work(new_lore_repo)
+    parent, _branched_from = link_on_feature_with_local_work(new_lore_repo)
     head_before = parent.branch_info().local_latest
 
     for dry_run in (True, False):
@@ -1940,7 +1796,7 @@ def test_switching_off_a_link_refuses_to_delete_a_local_edit_in_the_mount(
         assert "vendor/linked.txt" in str(refused.value), (
             "the refusal must name the edited file"
         )
-        _assert_local_work_kept(parent)
+        assert_local_work_kept(parent)
 
     assert parent.branch_info().local_latest == head_before, (
         "a refused switch must leave the branch where it was"
@@ -1952,7 +1808,7 @@ def test_switching_off_a_link_with_force_discards_local_work_in_the_mount(
     new_lore_repo,
 ):
     """`--force` takes the switch anyway and removes the mount."""
-    parent, _branched_from = _link_on_feature_with_local_work(new_lore_repo)
+    parent, _branched_from = link_on_feature_with_local_work(new_lore_repo)
 
     parent.branch_switch("main", force=True)
 
@@ -1974,7 +1830,7 @@ def test_leaving_a_link_refuses_what_it_cannot_read(new_lore_repo, kind, path):
     anything, naming the path. The unreadable file holds an edit of the same size,
     so the size alone does not tell."""
     content = "LINKED\n" if kind == "unreadable" else "linked\n"
-    parent, _branched_from = _link_on_feature_with_local_work(
+    parent, _branched_from = link_on_feature_with_local_work(
         new_lore_repo, {"vendor/linked.txt": content} if kind == "unreadable" else {}
     )
     absolute = os.path.join(parent.path, path)
@@ -1991,8 +1847,9 @@ def test_leaving_a_link_refuses_what_it_cannot_read(new_lore_repo, kind, path):
         os.chmod(absolute, 0o755 if kind == "unlistable" else 0o644)
 
     assert parent.path_exists("vendor/sub/inner.txt"), "a refusal must remove nothing"
-    with parent.open_file("vendor/linked.txt", "r") as input_file:
-        assert input_file.read() == content, "the file must be kept as it was"
+    assert read_text(parent, "vendor/linked.txt") == content, (
+        "the file must be kept as it was"
+    )
 
 
 @pytest.mark.smoke
@@ -2003,7 +1860,7 @@ def test_leaving_a_link_refuses_what_it_cannot_read(new_lore_repo, kind, path):
 def test_switching_off_a_link_keeps_a_symbolic_link_in_the_mount(new_lore_repo):
     """A symbolic link in the mount is no file the link tracks: the switch removes
     the link's content around it and keeps the symbolic link itself."""
-    parent, _branched_from = _link_on_feature_with_local_work(new_lore_repo, {})
+    parent, _branched_from = link_on_feature_with_local_work(new_lore_repo, {})
     os.symlink("sub", os.path.join(parent.path, "vendor", "alias"))
 
     output = parent.branch_switch("main")
@@ -2026,7 +1883,7 @@ def test_leaving_a_link_whose_mount_is_a_symbolic_link_follows_it_nowhere(
     is kept as the link, and nothing in that directory is removed. A switch to the
     folder, which would write through the link, is refused, though the directory
     holds the folder's file with its content."""
-    parent, _branched_from = _link_on_feature_with_local_work(new_lore_repo, {})
+    parent, _branched_from = link_on_feature_with_local_work(new_lore_repo, {})
     mount = os.path.join(parent.path, "vendor")
     outside = os.path.join(tmp_path, "vendor")
     shutil.move(mount, outside)
@@ -2061,7 +1918,7 @@ def test_switching_off_a_link_keeps_what_it_does_not_track_in_the_mount(
     folders they leave empty, and keeps an untracked file and what the ignore or
     view rules exclude, as deleting a folder does, and says so."""
     kept = "vendor/private/note.txt"
-    parent, _branched_from = _link_on_feature_with_local_work(
+    parent, _branched_from = link_on_feature_with_local_work(
         new_lore_repo, {kept: "local\n"}
     )
     if rule is not None:
@@ -2074,8 +1931,7 @@ def test_switching_off_a_link_keeps_what_it_does_not_track_in_the_mount(
     assert f"Kept 1 {label} entry in link mount vendor" in output
     assert not parent.path_exists("vendor/linked.txt"), "the link's content must go"
     assert not parent.path_exists("vendor/sub"), "a folder left empty must go"
-    with parent.open_file(kept, "r") as input_file:
-        assert input_file.read() == "local\n", "the file must be kept"
+    assert read_text(parent, kept) == "local\n", "the file must be kept"
 
 
 @pytest.mark.smoke
@@ -2097,7 +1953,7 @@ def test_switching_off_a_link_refuses_an_ignored_file_in_the_way(new_lore_repo, 
     the switch where the target branch writes a file at its path, naming it. A
     write there would follow the link out of the mount."""
     in_the_way = "vendor/other.txt"
-    parent, _branched_from = _link_on_feature_with_local_work(
+    parent, _branched_from = link_on_feature_with_local_work(
         new_lore_repo, {in_the_way: "ignored\n"} if kind == "file" else {}
     )
     if kind == "symlink":
@@ -2111,17 +1967,19 @@ def test_switching_off_a_link_refuses_an_ignored_file_in_the_way(new_lore_repo, 
         parent.branch_switch("folder")
 
     assert in_the_way in str(refused.value), "the refusal must name the file"
-    with parent.open_file(in_the_way, "r") as input_file:
-        assert input_file.read() == ("ignored\n" if kind == "file" else "root\n")
-    with parent.open_file("root.txt", "r") as input_file:
-        assert input_file.read() == "root\n", "nothing may be written through the link"
+    assert read_text(parent, in_the_way) == (
+        "ignored\n" if kind == "file" else "root\n"
+    )
+    assert read_text(parent, "root.txt") == "root\n", (
+        "nothing may be written through the link"
+    )
 
 
 @pytest.mark.smoke
 def test_syncing_a_link_moved_to_another_repository_checks_the_mount(new_lore_repo):
     """A link moved to another repository replaces the content of its mount: a
     local edit in it is refused, and an untracked and an ignored file are kept."""
-    parent, _branched_from = _link_on_feature_with_local_work(new_lore_repo, {})
+    parent, _branched_from = link_on_feature_with_local_work(new_lore_repo, {})
     first = parent.branch_info().local_latest
     other = make_repo(new_lore_repo, {"other.txt": "other\n"})
     parent.link_remove("vendor")
@@ -2156,8 +2014,7 @@ def test_syncing_a_link_moved_to_another_repository_checks_the_mount(new_lore_re
         ("vendor/local.key", "secret\n"),
         ("vendor/untracked.txt", "never staged\n"),
     ):
-        with parent.open_file(path, "r") as input_file:
-            assert input_file.read() == content, f"{path} must be kept"
+        assert read_text(parent, path) == content, f"{path} must be kept"
 
 
 @pytest.mark.smoke
@@ -2167,11 +2024,11 @@ def test_syncing_off_a_link_with_forward_changes_keeps_only_the_local_work(
     """`sync --forward-changes` to a revision without the link keeps the edited
     and the untracked file, and removes the files the link tracks that hold no
     local change."""
-    parent, branched_from = _link_on_feature_with_local_work(new_lore_repo)
+    parent, branched_from = link_on_feature_with_local_work(new_lore_repo)
 
     parent.sync(branched_from, forward_changes=True)
 
-    _assert_local_work_kept(parent)
+    assert_local_work_kept(parent)
     assert not parent.path_exists("vendor/sub"), "the unchanged content must go"
 
 
@@ -2192,8 +2049,9 @@ def test_syncing_off_a_link_holding_a_nested_link_checks_the_nested_mount(
     parent.write_files({f"{nested_mount}/c-data/inner.txt": "edited locally\n"})
     with pytest.raises(LocalChanges):
         parent.sync("@1")
-    with parent.open_file(f"{nested_mount}/c-data/inner.txt", "r") as input_file:
-        assert input_file.read() == "edited locally\n", "the local edit must be kept"
+    assert (
+        read_text(parent, f"{nested_mount}/c-data/inner.txt") == "edited locally\n"
+    ), "the local edit must be kept"
 
 
 @pytest.mark.smoke
@@ -2202,7 +2060,7 @@ def test_merging_the_removal_of_a_link_refuses_a_local_edit_in_the_mount(
 ):
     """A merge of a branch that removes the link is refused while a file the link
     tracks holds a local edit, naming it and keeping it."""
-    parent, _branched_from = _link_on_feature_with_local_work(new_lore_repo, {})
+    parent, _branched_from = link_on_feature_with_local_work(new_lore_repo, {})
     parent.branch_create("unlinked")
     parent.link_remove("vendor")
     parent.commit("Remove the link")
@@ -2214,8 +2072,9 @@ def test_merging_the_removal_of_a_link_refuses_a_local_edit_in_the_mount(
         parent.branch_merge("unlinked")
 
     assert "vendor/linked.txt" in str(refused.value), "the refusal must name the file"
-    with parent.open_file("vendor/linked.txt", "r") as input_file:
-        assert input_file.read() == "edited locally\n", "the local edit must be kept"
+    assert read_text(parent, "vendor/linked.txt") == "edited locally\n", (
+        "the local edit must be kept"
+    )
 
 
 @pytest.mark.smoke
@@ -2233,5 +2092,6 @@ def test_syncing_a_dependency_set_off_a_link_refuses_a_local_edit_in_the_mount(
         parent.sync(folder_revision, root_files=["shared/a.txt"])
 
     assert "shared/c.txt" in str(refused.value), "the refusal must name the file"
-    with parent.open_file("shared/c.txt", "r") as input_file:
-        assert input_file.read() == "c edited locally\n", "the local edit must be kept"
+    assert read_text(parent, "shared/c.txt") == "c edited locally\n", (
+        "the local edit must be kept"
+    )

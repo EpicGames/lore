@@ -37,6 +37,7 @@ from mock_oidc_provider import (
     USER,
     MockOidcProvider,
 )
+from test_utils import link_entries
 
 from lore import Lore
 
@@ -480,7 +481,7 @@ def test_listing_links_from_a_clone_without_access_to_one_lists_the_others(
     denied.sync()
 
     def listed() -> list[tuple[str, str]]:
-        links = parse_jsonl(denied.link_list(json=True), "linkEntry")
+        links = link_entries(denied)
         return sorted((link["linkPath"], link["link"]) for link in links)
 
     assert listed() == [("app", app_id)]
@@ -508,7 +509,7 @@ def test_updating_or_removing_a_link_to_a_repository_no_longer_granted_is_refuse
     commit_a_file(denied, "a.txt", "edit\n")
     denied.push()
     parent.sync()
-    links = parse_jsonl(parent.link_list(json=True), "linkEntry")
+    links = link_entries(parent)
     assert [link["linkPath"] for link in links] == ["lib"]
 
 
@@ -577,7 +578,7 @@ def test_a_clone_without_access_to_a_linked_repository_pushes_what_leaves_the_li
     parent.sync()
     assert parent.read_files()["a.txt"] == "first\n"
     assert parent.read_files()["b.txt"] == "second\n"
-    links = parse_jsonl(parent.link_list(json=True), "linkEntry")
+    links = link_entries(parent)
     assert [(link["linkPath"], link["link"], link["revision"]) for link in links] == [
         ("lib", linked_id, pin)
     ]
@@ -927,7 +928,7 @@ def test_a_branch_create_skips_the_linked_repositories_that_refuse_it_and_keeps_
         "feature", id=branch_id
     ), "the branch made below a refusing repository must have been taken back"
     main = parent.branch_info("main").id
-    links = parse_jsonl(parent.link_list(json=True), "linkEntry")
+    links = link_entries(parent)
     assert {
         link["link"]: (link["revision"], link["branch"])
         for link in links

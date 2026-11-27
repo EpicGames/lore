@@ -3,12 +3,11 @@
 import logging
 import os
 import shutil
-import stat
 import sys
 from pathlib import Path
 
 import pytest
-from test_utils import posix_join, to_posix
+from test_utils import is_executable, posix_join, to_posix
 
 from lore import Lore
 from lore_parsers import parse_status_count_json, parse_status_json
@@ -1109,9 +1108,8 @@ def test_status_scan_reports_a_mode_only_change(new_lore_repo):
     )
 
     clone = repo.clone()
-    cloned_mode = os.stat(os.path.join(clone.path, "script.sh")).st_mode
-    assert cloned_mode & stat.S_IXUSR, (
-        f"the revision must carry the executable bit to a clone: {cloned_mode:o}"
+    assert is_executable(clone, "script.sh"), (
+        "the revision must carry the executable bit to a clone"
     )
 
 
