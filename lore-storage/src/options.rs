@@ -215,8 +215,8 @@ pub struct ReadOptions {
     /// than with `AddressNotFound`, which stays the answer for an address the local store does not
     /// hold.
     pub strict_local: bool,
-    /// Write to file directly, with no temporary file, and on Windows a file of one fragment past the
-    /// file cache unless with `sparse_write` ([`Self::writes_unbuffered`])
+    /// Write to file directly, with no temporary file, and on Windows past the file cache unless
+    /// with `sparse_write` ([`Self::writes_unbuffered`])
     pub direct_write: bool,
     /// Write a file read at its own path, with no temporary file, and without the unbuffered write
     /// `direct_write` adds. A write that fails or stops leaves the file partly written.
@@ -289,9 +289,10 @@ impl Default for ReadOptions {
 }
 
 impl ReadOptions {
-    /// Whether a read into a file writes a file of one fragment unbuffered, past the file cache, as
-    /// [`lore_io::IoDriver::write_file_bytes_unbuffered`] writes it: on Windows, with `direct_write`
-    /// and without `sparse_write`. A fragment list is written through the file cache.
+    /// Whether a read into a file writes it unbuffered, past the file cache: on Windows, with
+    /// `direct_write` and without `sparse_write`. A file of one fragment is written as
+    /// [`lore_io::IoDriver::write_file_bytes_unbuffered`] writes it, and a fragment list as
+    /// [`crate::defragment::open_file_write`] describes.
     pub fn writes_unbuffered(&self) -> bool {
         cfg!(target_family = "windows") && self.direct_write && !self.sparse_write
     }

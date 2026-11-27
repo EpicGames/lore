@@ -174,6 +174,10 @@ impl OpenOptions {
 pub struct IoFile {
     driver: IoDriver,
     file: Arc<File>,
+    /// Whether a test refuses the padded writes of this file, opened unbuffered
+    /// ([`crate::unbuffered::test_util::refuse_unbuffered`]).
+    #[cfg(all(feature = "test-util", target_family = "windows"))]
+    refused_writes: bool,
 }
 
 impl std::fmt::Debug for IoFile {
@@ -300,7 +304,19 @@ fn try_lock_file(file: &File) -> std::io::Result<bool> {
 
 impl IoFile {
     pub(crate) fn new(driver: IoDriver, file: Arc<File>) -> IoFile {
-        IoFile { driver, file }
+        IoFile {
+            driver,
+            file,
+            #[cfg(all(feature = "test-util", target_family = "windows"))]
+            refused_writes: false,
+        }
+    }
+
+    /// The file, its padded writes refused where `refused`.
+    #[cfg(all(feature = "test-util", target_family = "windows"))]
+    pub(crate) fn refusing_writes(mut self, refused: bool) -> IoFile {
+        self.refused_writes = refused;
+        self
     }
 
     /// Wraps `file`, which the caller opened, so that `driver` runs its positional operations and
@@ -422,6 +438,28 @@ impl IoFile {
             done += written;
         }
         Ok(buffers)
+    }
+
+    /// Writes the concatenation of `buffers` at `offset`, padded with zeros to a multiple of
+    /// [`crate::UNBUFFERED_ALIGNMENT`], to a file opened unbuffered ([`OpenOptions::unbuffered`]):
+    /// one write on the syscall pool, for every backend, from the pool thread's aligned buffer, so
+    /// the segments need no alignment of their own. `offset` is a multiple of the alignment. A
+    /// write past the end of the file extends it to the end of the padding. Answers `buffers`, with
+    /// the error where the write failed: one [`crate::unbuffered_refused`] recognizes where the
+    /// volume refuses it.
+    #[cfg(target_family = "windows")]
+    pub async fn write_padded_at<B: StableBufList>(
+        &self,
+        buffers: B,
+        offset: u64,
+    ) -> Result<B, (std::io::Error, B)> {
+        #[cfg(feature = "test-util")]
+        if self.refused_writes {
+            return Err((crate::unbuffered::test_util::refused(), buffers));
+        }
+        crate::psync::PsyncDriver
+            .write_padded_at(Arc::clone(&self.file), buffers, offset)
+            .await
     }
 
     /// Syncs file data (not necessarily metadata) to disk.

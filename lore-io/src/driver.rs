@@ -250,6 +250,8 @@ impl IoDriver {
     ) -> std::io::Result<IoFile> {
         let std_options = options.to_std();
         let path = path.as_ref().to_path_buf();
+        #[cfg(all(feature = "test-util", target_family = "windows"))]
+        let refused_writes = crate::unbuffered::test_util::refused_open(&path, options)?;
         let file = match &*self.inner {
             DriverInner::Psync(driver) => driver.open(std_options, path).await?,
             #[cfg(target_os = "linux")]
@@ -257,7 +259,10 @@ impl IoDriver {
             #[cfg(target_family = "windows")]
             DriverInner::Iocp(driver) => driver.open(std_options, path).await?,
         };
-        Ok(IoFile::new(self.clone(), Arc::new(file)))
+        let file = IoFile::new(self.clone(), Arc::new(file));
+        #[cfg(all(feature = "test-util", target_family = "windows"))]
+        let file = file.refusing_writes(refused_writes);
+        Ok(file)
     }
 
     /// Prepares `file`, which the caller opened, for this driver's operations as an open prepares

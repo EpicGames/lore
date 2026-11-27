@@ -83,16 +83,20 @@ The `[file]` table controls how the client writes files into the working tree. B
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `direct_write` | Boolean | `false` | Write to target files directly instead of writing a temporary file and moving it into place, and on Windows write each file of one fragment past the file cache ([`direct_write` on Windows](#direct_write-on-windows)). Writes may not be atomic, so an error can leave a file in an inconsistent state. `lore clone` writes every file directly whatever this says. |
+| `direct_write` | Boolean | `false` | Write to target files directly instead of writing a temporary file and moving it into place, and on Windows write files past the file cache ([`direct_write` on Windows](#direct_write-on-windows)). Writes may not be atomic, so an error can leave a file in an inconsistent state. `lore clone` writes every file directly whatever this says. |
 | `flush_write` | Boolean | `false` | Flush file data to disk after each write. Parsed from the config but not currently wired to any write path, so setting it has no effect today. |
 
 #### `direct_write` on Windows
 
-On Windows, `direct_write` also writes each file of one fragment, at most 256 KiB, past the file cache: unbuffered, with `FILE_FLAG_NO_BUFFERING`, in one write. The data goes to the device as it is written, and the lazy writer has nothing left to write afterwards. A larger file is written through the file cache. A file that `lore_storage_get_file` writes sparse is written through the file cache. Where the volume refuses unbuffered writes, as a network share or an unusual sector size does, the file is written through the file cache, and the client logs a warning once per command, and again each time commands that run at the same time in one process, such as the Lore service, alternate.
+On Windows, `direct_write` also writes files past the file cache: unbuffered, with `FILE_FLAG_NO_BUFFERING`. A file of one fragment, at most 256 KiB, is written in one write. A larger file is written as its fragments arrive, one write at a time, each write joining the fragments that have arrived and follow each other in the file, with the sectors two fragments share written once both have arrived. The data goes to the device as it is written, and the lazy writer has nothing left to write afterwards. A file that `lore_storage_get_file` writes sparse is written through the file cache. Where the volume refuses unbuffered writes, as a network share or an unusual sector size does, the file is written through the file cache, and the client logs a warning once per command, and again each time commands that run at the same time in one process, such as the Lore service, alternate.
+
+How much of a large file's data a clone written this way fetches ahead of its writes is bounded by the process's fragment budget, which `LORE_FRAGMENT_BUDGET_MIB` sets: a larger budget makes the clone faster and holds more memory ([Environment variables](#environment-variables)).
+
+Measured on a Windows cloud VM writing to a network block-storage volume, a whole clone of a test view of 2.8 million files and 505 GiB, most files small and most bytes in large files, took 1,378 seconds written this way at the default budget, against 1,623 seconds for the same clone writing its large files through the file cache. Through the file cache, the clone used up the machine's free memory within about 210 seconds, and the lazy writer then wrote about 477 GiB. Written this way, at least 79 GiB stayed free, the lazy writer wrote about 4 GiB, and the clone's peak private memory was 5.6 GiB, against 5.0 GiB.
 
 The cost is on the first read: a file written this way isn't in the file cache after the command, so its first read comes from the device. Measured on a Windows cloud VM with NTFS in a VHDX, reading about 22 GB of whole directories with eight readers right after a clone took 8.8 to 11.3 seconds from a clone written this way, against 6.3 to 7.2 seconds from one written through the file cache.
 
-`lore clone --direct-file-write` writes the clone's files of one fragment this way without setting this field. The new instance's `direct_write` stays `false`, and later commands such as `lore sync` follow it.
+`lore clone --direct-file-write` writes the clone's files this way without setting this field. The new instance's `direct_write` stays `false`, and later commands such as `lore sync` follow it.
 
 On Linux and macOS, `direct_write` writes files in place through the file cache.
 ### `[sync]` table
@@ -233,12 +237,13 @@ The Python test suite sets this per run, so running it leaves a service you have
 
 ## Environment variables
 
-`LORE_SERVICE_EXECUTABLE`, `LORE_USE_SERVICE` and `LORE_SERVICE_SOCKET` choose the Lore service that carries out commands; the [`[service]` table](#service-table) and [Giving a run its own service](#giving-a-run-its-own-service) describe them. The variables below decide how a process reaches its remote.
+`LORE_SERVICE_EXECUTABLE`, `LORE_USE_SERVICE` and `LORE_SERVICE_SOCKET` choose the Lore service that carries out commands; the [`[service]` table](#service-table) and [Giving a run its own service](#giving-a-run-its-own-service) describe them. The variables below decide how a process reaches its remote, and how much fragment data it holds in memory.
 
 | Variable | Effect |
 | --- | --- |
 | `LORE_UDS_SOCKET` | Names the socket of a machine server. Every gRPC channel the process opens goes through it, and a `lore-unix` remote requires it. |
 | `LORE_QUIC_CONGESTION_ALGORITHM` | Names the congestion controller a QUIC storage connection runs when the process establishes it, as the CLI or a program using the storage API does: `bbr`, the default, or `cubic`. |
+| `LORE_FRAGMENT_BUDGET_MIB` | Sets, in MiB, the process's fragment budget: how much fragment data it holds in memory at once across its writes, its streamed reads and its reads into a file. 1024 by default. |
 
 `LORE_UDS_SOCKET` holds the absolute path of a socket a machine server listens on, typically one bind-mounted into a container (see [Container sockets](lore-server-config.md#container-sockets)). With it set, every gRPC channel the process opens, the authentication service's included, connects through the socket in plaintext and keeps the host it would have dialed as the request's authority, which the machine server forwards the request by. A `lore-unix` remote also sends its storage requests through the socket, over one storage connection per process. The process sizes its network threads for that one connection. OIDC login requests, which are HTTP, still go to the network.
 
@@ -254,6 +259,13 @@ The Python test suite sets this per run, so running it leaves a service you have
 - A connection already established is reused as it is.
 - Each process reads the variable once, from its own environment, the first time it establishes a storage connection. The relay does not pass it to the Lore service, so set it for the service as well.
 - A Lore server doesn't read it. The connections a `remote` store establishes to its upstream run the controller its `congestion_algorithm` key names (see [Remote store mode](lore-server-config.md#remote-store-mode)).
+
+`LORE_FRAGMENT_BUDGET_MIB` bounds the fragments a process has fetched and not yet written: each fragment of a file a read writes holds its share of the budget from before it is fetched until its write ends. A read that returns content in memory isn't bounded by it.
+
+For a clone that writes past the file cache ([`direct_write` on Windows](#direct_write-on-windows)), the budget is the trade-off between throughput and memory. Such a clone writes a large file's fragments as they arrive, and a fragment waiting for its write holds its share meanwhile. The part of a fragment, under one sector, that waits for the fragment or hole it shares a sector with is copied and holds none, at most two sectors for each fragment fetched and not yet written, so no budget is too small for the clone to finish. A larger budget lets the clone fetch more fragments at once, so it finishes sooner and holds more memory in fragment buffers. A smaller one holds less memory, and the clone is slower. The measurement in [`direct_write` on Windows](#direct_write-on-windows) is at the default budget.
+
+- Unset or blank, the budget is 1024 MiB. A value below 4 is raised to 4, a value above 524287 is lowered to 524287, and a value that isn't a whole number, such as a negative one, leaves the default in place. Each of these three logs a warning.
+- Each process reads the variable once, the first time it needs the budget, and the budget is shared by every command the process runs. A command the Lore service runs uses the service's own budget, set from the environment the service started in.
 
 ## Examples
 

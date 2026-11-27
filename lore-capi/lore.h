@@ -5488,8 +5488,8 @@ typedef struct lore_repository_clone_args_t {
   struct lore_string_t view;
   // Clone without any files
   uint8_t bare;
-  // Use direct file write: on Windows, write each file of one fragment past the file cache. A
-  // clone writes every file at its own path either way
+  // Use direct file write: on Windows, write files past the file cache. A clone writes every
+  // file at its own path either way
   uint8_t direct_file_write;
   // Which VFS to use, if any
   enum lore_vfs_type_t vfs;

@@ -1744,7 +1744,8 @@ pub fn read_into_file(
 /// back, because the handle moves into the pipeline. A hole is left unwritten, and every leaf is
 /// written, one of zeros included. That path writes through `<path><temp_file_extension>` and
 /// renames, unless `options` asks for the target to be written in place
-/// ([`ReadOptions::writes_in_place`]). With `options.resume_write`, for a range of at least
+/// ([`ReadOptions::writes_in_place`]), and past the file cache where `options` asks for that
+/// ([`ReadOptions::writes_unbuffered`]). With `options.resume_write`, for a range of at least
 /// [`RESUME_WRITE_MIN_LEN`](crate::options::RESUME_WRITE_MIN_LEN), the temporary file is kept when
 /// the write fails or stops, and a later write of the same content and range resumes from it, as
 /// [`crate::resume`] describes: the file it resumes is sized, and is emptied and written again as a
@@ -1804,6 +1805,7 @@ fn write_root_to_file(
                 .then(|| TemporaryFile::guard(file_path.clone()));
 
             let mut create_parent = options.create_parent;
+            let mut unbuffered = false;
             let (file, held) = loop {
                 let directory_missing = {
                     // `opened` ends with this block, so that it is not held across the wait below.
@@ -1815,9 +1817,13 @@ fn write_root_to_file(
                                 file_path.as_path(),
                                 range.len(),
                                 options.sparse_write,
+                                options.writes_unbuffered(),
                             )
                             .await
-                            .map(|file| Opened::File(file, false))
+                            .map(|(file, opened_unbuffered)| {
+                                unbuffered = opened_unbuffered;
+                                Opened::File(file, false)
+                            })
                         };
                         match opened {
                             Ok(Opened::File(file, held)) => break (file, held),
@@ -1883,6 +1889,7 @@ fn write_root_to_file(
                     DefragmentSink::File {
                         file: file.clone(),
                         size: range.len(),
+                        unbuffered: unbuffered.then(|| file_path.clone()),
                     },
                     ReadOptions {
                         resume_write: resuming,
@@ -2011,6 +2018,7 @@ fn pipe_resumed<'a>(
                 DefragmentSink::File {
                     file: file.clone(),
                     size,
+                    unbuffered: None,
                 },
                 ReadOptions {
                     resume_write: true,
@@ -2121,7 +2129,7 @@ pub async fn write_all_to_file(
 /// runs without one. Only the last context to warn is remembered, so commands that run at the same
 /// time in one process warn again each time they alternate. [`lore_io::unbuffered_fallbacks`]
 /// counts them all.
-fn log_unbuffered_fallback(path: &Path, reason: &dyn std::fmt::Display) {
+pub(crate) fn log_unbuffered_fallback(path: &Path, reason: &dyn std::fmt::Display) {
     type Context = std::sync::Weak<dyn std::any::Any + Send + Sync>;
     static LOGGED: std::sync::Mutex<Option<Context>> = std::sync::Mutex::new(None);
     static LOGGED_WITHOUT_CONTEXT: std::sync::atomic::AtomicBool =

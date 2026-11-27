@@ -103,18 +103,7 @@ impl PsyncDriver {
     ) -> std::io::Result<B> {
         SyscallPool::global()
             .submit(move || {
-                let mut done = 0;
-                while done < len {
-                    let written =
-                        write_at_impl(&file, &buffer.as_ref()[done..len], offset + done as u64)?;
-                    if written == 0 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::WriteZero,
-                            "file refused further writes",
-                        ));
-                    }
-                    done += written;
-                }
+                write_all_at_impl(&file, &buffer.as_ref()[..len], offset)?;
                 Ok(buffer)
             })
             .await
@@ -305,6 +294,31 @@ impl PsyncDriver {
             .submit(move || {
                 let written = write_vectored_impl(&file, &buffers, skip, offset)?;
                 Ok((buffers, written))
+            })
+            .await
+    }
+
+    /// Writes the concatenation of `buffers` and its padding at `offset` of `file` in one job, as
+    /// [`crate::unbuffered::write_padded_at`] writes it, answering `buffers` either way.
+    #[cfg(target_family = "windows")]
+    pub(crate) async fn write_padded_at<B: StableBufList>(
+        &self,
+        file: Arc<File>,
+        buffers: B,
+        offset: u64,
+    ) -> Result<B, (std::io::Error, B)> {
+        SyscallPool::global()
+            .submit(move || {
+                let len = buffers.byte_segments().map(<[u8]>::len).sum();
+                match crate::unbuffered::write_padded_at(
+                    &file,
+                    len,
+                    buffers.byte_segments(),
+                    offset,
+                ) {
+                    Ok(()) => Ok(buffers),
+                    Err(err) => Err((err, buffers)),
+                }
             })
             .await
     }
@@ -1373,6 +1387,22 @@ fn read_at_impl(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<
 #[cfg(target_family = "windows")]
 fn write_at_impl(file: &File, buffer: &[u8], offset: u64) -> std::io::Result<usize> {
     crate::overlapped::write_at(file, buffer, offset)
+}
+
+/// Writes all of `data` at `offset` of `file`, looping over short writes.
+pub(crate) fn write_all_at_impl(file: &File, data: &[u8], offset: u64) -> std::io::Result<()> {
+    let mut done = 0;
+    while done < data.len() {
+        let written = write_at_impl(file, &data[done..], offset + done as u64)?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "file refused further writes",
+            ));
+        }
+        done += written;
+    }
+    Ok(())
 }
 
 /// Writes `buffers` to `file` from its start and, with `durable`, syncs it. The segments are

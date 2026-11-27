@@ -189,10 +189,12 @@ pub(crate) fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::R
     }
 }
 
+/// Writes `buffer` at `offset` of `file`. No completion reaches a completion port `file` is bound
+/// to, so a pool job writes to a file of either backend.
 pub(crate) fn write_at(file: &File, buffer: &[u8], offset: u64) -> std::io::Result<usize> {
     let len = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
     let pointer: *const u8 = buffer.as_ptr();
-    run(file, offset, false, |handle, transferred, overlapped| {
+    run(file, offset, true, |handle, transferred, overlapped| {
         // SAFETY: Calling OS functions. `pointer` and `len` describe `buffer`, which outlives the
         // operation because `run` does not return while it is in flight.
         unsafe { WriteFile(handle, pointer, len, transferred, overlapped) }

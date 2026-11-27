@@ -121,6 +121,9 @@ pub use psync::stat_blocking;
 pub use psync::sync_dir;
 pub use stat::Stat;
 pub use stat::StatKind;
+#[cfg(target_family = "windows")]
+pub use unbuffered::PADDED_WRITE_RETAINED;
+pub use unbuffered::record_unbuffered_fallback;
 pub use unbuffered::unbuffered_fallbacks;
 pub use unbuffered::unbuffered_refused;
 #[cfg(target_os = "linux")]

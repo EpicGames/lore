@@ -57,6 +57,8 @@ required-features = ["store-stress"]
 [dev-dependencies]
 # The shared test temp-directory helper.
 lore-base = { workspace = true, features = ["test-util"] }
+# Refusals of unbuffered opens and writes, as a volume refuses them.
+lore-io = { workspace = true, features = ["test-util"] }
 lore-storage = { workspace = true, features = ["test-util"] }
 # A session over a stub peer, with no live connection behind it.
 lore-transport = { workspace = true, features = ["test-util"] }

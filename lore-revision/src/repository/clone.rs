@@ -328,8 +328,8 @@ pub struct CloneOptions {
     /// Ignore existing files
     pub ignore_existing: bool,
     /// Write the clone's files with direct file write, whatever the new instance's
-    /// `[file] direct_write` says, which the clone leaves as it is: on Windows, each file of one
-    /// fragment past the file cache. A clone writes every file at its own path either way
+    /// `[file] direct_write` says, which the clone leaves as it is: on Windows, past the file cache.
+    /// A clone writes every file at its own path either way
     pub direct_file_write: bool,
     /// Access recording whose paths a virtual clone warms in the background: one
     /// repository-relative path per line, directories ending with `/`

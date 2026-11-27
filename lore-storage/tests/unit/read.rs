@@ -152,28 +152,36 @@ async fn put_two_leaf_list(
     partition: Partition,
     context: Context,
 ) -> (Address, Vec<u8>) {
+    put_leaf_list(store, partition, context, &[64, 64]).await
+}
+
+/// Store content spanning leaves of the given sizes and the list naming them, reporting the list's
+/// address and the content the leaves reassemble to: byte `i` of it is `i % 251`.
+async fn put_leaf_list(
+    store: &Arc<dyn ImmutableStore>,
+    partition: Partition,
+    context: Context,
+    sizes: &[usize],
+) -> (Address, Vec<u8>) {
     use lore_storage::FragmentReference;
     use zerocopy::IntoBytes;
 
-    let first = Bytes::from((0u8..64).collect::<Vec<u8>>());
-    let second = Bytes::from((64u8..128).collect::<Vec<u8>>());
-    let first_address = put_whole(store, partition, context, &first).await;
-    let second_address = put_whole(store, partition, context, &second).await;
+    let content: Vec<u8> = (0..sizes.iter().sum::<usize>())
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let mut refs = Vec::with_capacity(sizes.len());
+    let mut offset = 0;
+    for &size in sizes {
+        let leaf = Bytes::copy_from_slice(&content[offset..offset + size]);
+        let address = put_whole(store, partition, context, &leaf).await;
+        refs.push(FragmentReference {
+            hash: address.hash,
+            offset_content: offset as u64,
+        });
+        offset += size;
+    }
 
-    let refs_payload = Bytes::copy_from_slice(
-        [
-            FragmentReference {
-                hash: first_address.hash,
-                offset_content: 0,
-            },
-            FragmentReference {
-                hash: second_address.hash,
-                offset_content: first.len() as u64,
-            },
-        ]
-        .as_bytes(),
-    );
-    let content_size = (first.len() + second.len()) as u64;
+    let refs_payload = Bytes::copy_from_slice(refs.as_bytes());
     let root_address = Address {
         hash: hash::hash_slice(refs_payload.as_ref()),
         context,
@@ -186,16 +194,13 @@ async fn put_two_leaf_list(
             Fragment {
                 flags: FragmentFlags::PayloadFragmented.bits(),
                 size_payload: refs_payload.len() as u32,
-                size_content: content_size,
+                size_content: content.len() as u64,
             },
             Some(refs_payload),
             false,
         )
         .await
         .expect("put the fragment list");
-
-    let mut content = first.to_vec();
-    content.extend_from_slice(&second);
     (root_address, content)
 }
 
@@ -1777,6 +1782,59 @@ async fn file_read_shapes(
         ("staged", list_address, list_content.clone(), false),
         ("in-place", list_address, list_content, true),
     ]
+}
+
+/// A file read with direct write writes a fragment list whose leaves end off sector boundaries in
+/// place, with its content and exact length, past the file cache on Windows.
+#[tokio::test]
+async fn a_direct_file_read_of_a_fragment_list_writes_its_content_and_length() {
+    let (_store_dir, store) = make_test_store().await;
+    let target_dir = TempDir::new("lore-storage-read-direct-list-");
+    let partition = Partition::from([0xA4; 16]);
+    let context = Context::from([0xA4; 16]);
+    let (address, content) =
+        put_leaf_list(&store, partition, context, &[40_000, 70_001, 33_333, 9_000]).await;
+    let target = PathBuf::from(target_dir.as_ref()).join("content.bin");
+
+    read_into_file(
+        store.clone(),
+        partition,
+        address,
+        target.as_path(),
+        ".~loretemp",
+        None,
+        ReadOptions {
+            direct_write: true,
+            ..no_remote()
+        },
+        None,
+    )
+    .await
+    .expect("read the fragment list into the file");
+
+    assert_eq!(std::fs::read(&target).expect("read the target"), content);
+}
+
+/// A read writing in place writes past the file cache only with direct write, on Windows, and never
+/// a sparse file.
+#[test]
+fn a_read_writing_in_place_writes_unbuffered_only_with_direct_write() {
+    let in_place = ReadOptions {
+        write_in_place: true,
+        ..ReadOptions::default()
+    };
+    let direct = ReadOptions {
+        direct_write: true,
+        ..ReadOptions::default()
+    };
+    let direct_sparse = ReadOptions {
+        sparse_write: true,
+        ..direct
+    };
+    assert!(in_place.writes_in_place() && direct.writes_in_place());
+    assert!(!in_place.writes_unbuffered());
+    assert_eq!(direct.writes_unbuffered(), cfg!(target_family = "windows"));
+    assert!(!direct_sparse.writes_unbuffered());
 }
 
 /// A read writing in place writes a fragment list at its own path and makes no temporary file: a

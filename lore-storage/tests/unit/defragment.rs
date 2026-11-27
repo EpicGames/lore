@@ -258,9 +258,10 @@ mod write_to_file {
 
     /// A sized target file, opened the way the materialization path opens one.
     async fn target(dir: &TempDir, name: &str) -> IoFile {
-        lore_storage::defragment::open_file_write(dir.path().join(name), SIZE, false)
+        lore_storage::defragment::open_file_write(dir.path().join(name), SIZE, false, false)
             .await
             .expect("create target file")
+            .0
     }
 
     /// Send one message carrying a permit, as the fetch pool does.
@@ -347,7 +348,7 @@ mod write_to_file {
         let dir = TempDir::new("lore-storage-sink-test-");
         let path = dir.path().join("reused");
         std::fs::write(&path, vec![0xEE; SIZE]).expect("write the earlier content");
-        let file = lore_storage::defragment::open_file_write(&path, SIZE, false)
+        let (file, _) = lore_storage::defragment::open_file_write(&path, SIZE, false, false)
             .await
             .expect("open the target");
         let (tx, rx) = channel::<DataMessage>(4);
@@ -450,6 +451,440 @@ mod write_to_file {
             err.to_string().contains("overflow"),
             "unexpected error: {err}"
         );
+    }
+}
+
+/// A file opened for an unbuffered write is unbuffered on Windows only.
+#[tokio::test]
+async fn an_unbuffered_open_is_unbuffered_on_windows_only() {
+    let dir = lore_base::test_util::TempDir::new("lore-storage-unbuffered-open-");
+    let (_file, unbuffered) = open_file_write(dir.path().join("file"), 100, false, true)
+        .await
+        .expect("open the file");
+    assert_eq!(unbuffered, cfg!(target_family = "windows"));
+}
+
+#[cfg(target_family = "windows")]
+mod write_unbuffered {
+    use std::path::Path;
+
+    use lore_base::test_util::TempDir;
+    use lore_io::unbuffered::test_util::Refusal;
+    use lore_io::unbuffered::test_util::refuse_unbuffered;
+
+    use super::*;
+
+    const SECTOR: u64 = lore_io::UNBUFFERED_ALIGNMENT as u64;
+
+    /// A deterministic stream of numbers, so a failing case repeats.
+    struct Numbers(u64);
+
+    impl Numbers {
+        fn below(&mut self, bound: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) % bound
+        }
+    }
+
+    /// `size` bytes of content that differ from byte to byte.
+    fn content(size: u64) -> Vec<u8> {
+        (0..size).map(|i| (i * 31 % 251) as u8).collect()
+    }
+
+    /// `size` bytes cut into pieces at points `numbers` picks, short ones among them, each a hole
+    /// with chance 1 in `hole_in`, in an order `numbers` picks: offset, length, and whether a hole.
+    fn pieces(numbers: &mut Numbers, size: u64, hole_in: u64) -> Vec<(u64, u64, bool)> {
+        let mut pieces = Vec::new();
+        let mut offset = 0;
+        while offset < size {
+            let len = match numbers.below(4) {
+                0 => 1 + numbers.below(3 * SECTOR / 2),
+                _ => 1 + numbers.below(40_000),
+            }
+            .min(size - offset);
+            pieces.push((offset, len, numbers.below(hole_in) == 0));
+            offset += len;
+        }
+        for i in (1..pieces.len()).rev() {
+            pieces.swap(i, numbers.below(i as u64 + 1) as usize);
+        }
+        pieces
+    }
+
+    /// Lands `write` on `disk` as an unbuffered write lands: at its offset, its parts, then zeros to
+    /// the end of the sector. Counts each sector it writes in `writes_of`.
+    fn land(disk: &mut Vec<u8>, writes_of: &mut [u32], size: u64, write: &SectorWrite) {
+        assert!(
+            write.offset.is_multiple_of(SECTOR),
+            "a write starts on a sector"
+        );
+        let len: u64 = write.parts.0.iter().map(|part| part.len() as u64).sum();
+        let end = write.offset + len;
+        assert!(
+            end.is_multiple_of(SECTOR) || end == size,
+            "a write ends on a sector or at the end of the file"
+        );
+        let padded = end.next_multiple_of(SECTOR) as usize;
+        if disk.len() < padded {
+            disk.resize(padded, 0);
+        }
+        let mut at = write.offset as usize;
+        for part in &write.parts.0 {
+            disk[at..at + part.len()].copy_from_slice(part);
+            at += part.len();
+        }
+        disk[at..padded].fill(0);
+        for sector in write.offset / SECTOR..end.div_ceil(SECTOR) {
+            writes_of[sector as usize] += 1;
+        }
+    }
+
+    /// Leaves and holes cut at any byte, short ones among them, taken in any order, are written in
+    /// writes that start on a sector and end on one or at the end of the file: every sector that
+    /// holds content once, no sector twice, and no piece left over.
+    #[test]
+    fn leaves_cut_anywhere_and_taken_in_any_order_write_each_sector_once() {
+        let mut numbers = Numbers(7);
+        for size in [1, 100, SECTOR, SECTOR + 1, 2 * SECTOR - 1, 70_000, 300_001] {
+            let expected = content(size);
+            for _ in 0..200 {
+                let pieces = pieces(&mut numbers, size, 5);
+                let mut sectors = PartialSectors::new(size);
+                let mut disk = Vec::new();
+                let mut writes_of = vec![0u32; size.div_ceil(SECTOR) as usize];
+                let mut writes = Vec::new();
+                for &(offset, len, hole) in &pieces {
+                    let data = (!hole).then(|| {
+                        Bytes::copy_from_slice(&expected[offset as usize..(offset + len) as usize])
+                    });
+                    sectors.take(offset, len, data, None, &mut writes);
+                    for write in writes.drain(..) {
+                        land(&mut disk, &mut writes_of, size, &write);
+                    }
+                }
+                assert!(sectors.is_empty(), "every partial sector is completed");
+                disk.resize(size.next_multiple_of(SECTOR) as usize, 0);
+                assert_eq!(
+                    &disk[..size as usize],
+                    &with_holes(&expected, &pieces)[..],
+                    "size {size}"
+                );
+                for (sector, writes) in writes_of.iter().enumerate() {
+                    let start = sector as u64 * SECTOR;
+                    let holds_data = pieces.iter().any(|&(offset, len, hole)| {
+                        !hole && offset < start + SECTOR && offset + len > start
+                    });
+                    assert!(
+                        *writes <= 1,
+                        "sector {sector} of {size} written {writes} times"
+                    );
+                    if holds_data {
+                        assert_eq!(*writes, 1, "sector {sector} of {size} holds content");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The part of a leaf kept in a sector it shares with a leaf that has not arrived holds none of
+    /// the leaf's budget: all of it goes with the leaf's write, so kept pieces cannot hold the
+    /// budget the leaves they wait for need to be fetched.
+    #[tokio::test]
+    async fn a_kept_sector_piece_holds_no_fragment_budget() {
+        let budget: &'static Semaphore = Box::leak(Box::new(Semaphore::new(1024)));
+        let size = 3 * SECTOR;
+        let first = 5_000;
+        let expected = content(size);
+        let mut sectors = PartialSectors::new(size);
+        let mut writes = Vec::new();
+        let permit = budget
+            .acquire_many(fragment_permit_count(first as usize))
+            .await
+            .expect("permit");
+        sectors.take(
+            0,
+            first,
+            Some(Bytes::copy_from_slice(&expected[..first as usize])),
+            Some(permit),
+            &mut writes,
+        );
+        assert_eq!(writes.len(), 1, "the first sector is written");
+        assert_eq!(
+            budget.available_permits(),
+            1024 - fragment_permit_count(first as usize) as usize,
+            "the leaf's write holds all its budget"
+        );
+        writes.clear();
+        assert!(!sectors.is_empty(), "the leaf's tail is kept");
+        assert_eq!(
+            budget.available_permits(),
+            1024,
+            "the piece kept holds no budget"
+        );
+
+        let permit = budget
+            .acquire_many(fragment_permit_count((size - first) as usize))
+            .await
+            .expect("permit");
+        sectors.take(
+            first,
+            size - first,
+            Some(Bytes::copy_from_slice(&expected[first as usize..])),
+            Some(permit),
+            &mut writes,
+        );
+        assert!(sectors.is_empty(), "the second leaf completes the sector");
+        assert_eq!(writes.len(), 1, "one write of the rest of the file");
+        assert_eq!(
+            budget.available_permits(),
+            1024 - fragment_permit_count((size - first) as usize) as usize,
+            "the second leaf's write holds all its budget"
+        );
+        writes.clear();
+        assert_eq!(budget.available_permits(), 1024, "all budget is released");
+
+        let mut sectors = PartialSectors::new(size);
+        let permit = budget
+            .acquire_many(fragment_permit_count(100))
+            .await
+            .expect("permit");
+        sectors.take(
+            10,
+            100,
+            Some(Bytes::copy_from_slice(&expected[10..110])),
+            Some(permit),
+            &mut writes,
+        );
+        assert!(writes.is_empty(), "a leaf inside one sector makes no write");
+        assert!(!sectors.is_empty(), "the leaf is kept");
+        assert_eq!(
+            budget.available_permits(),
+            1024,
+            "a leaf that makes no write releases its budget at once"
+        );
+    }
+
+    /// A write of `len` bytes at `offset`, of one part and no budget.
+    fn write_at(offset: u64, len: u64) -> SectorWrite {
+        SectorWrite {
+            offset,
+            parts: WriteParts(smallvec::smallvec![Bytes::from(vec![0u8; len as usize])]),
+            permits: smallvec::SmallVec::new(),
+        }
+    }
+
+    /// The next write is the ready write of lowest offset, merged with the writes that continue it
+    /// until a gap, or until one more would take it past the buffer a pool thread keeps.
+    #[test]
+    fn the_next_write_merges_a_contiguous_run_within_the_retained_buffer() {
+        let cap = lore_io::PADDED_WRITE_RETAINED as u64;
+        let mut ready = vec![
+            write_at(3 * SECTOR, SECTOR),
+            write_at(0, SECTOR),
+            write_at(10 * SECTOR, SECTOR),
+            write_at(SECTOR, 2 * SECTOR),
+        ];
+        let merged = next_write(&mut ready).expect("a write");
+        assert_eq!(merged.offset, 0, "the lowest offset goes first");
+        assert_eq!(merged.parts.0.len(), 3, "the run up to the gap is merged");
+        let next = next_write(&mut ready).expect("a write");
+        assert_eq!(next.offset, 10 * SECTOR, "the write past the gap goes next");
+        assert!(next_write(&mut ready).is_none(), "nothing is left");
+
+        let mut ready = vec![
+            write_at(0, cap - SECTOR),
+            write_at(cap - SECTOR, 2 * SECTOR),
+        ];
+        let first = next_write(&mut ready).expect("a write");
+        assert_eq!(
+            first.parts.0.len(),
+            1,
+            "a merge past the buffer is not made"
+        );
+        assert_eq!(ready.len(), 1, "the write that does not fit waits");
+    }
+
+    /// A target opened unbuffered, the way the materialization path opens one.
+    async fn target(path: &Path, size: u64) -> IoFile {
+        let (file, unbuffered) =
+            lore_storage::defragment::open_file_write(path, size as usize, false, true)
+                .await
+                .expect("open the target");
+        assert!(unbuffered, "the volume takes unbuffered writes");
+        file
+    }
+
+    /// Delivers `pieces` of `content` to a sink writing `file` at `path`, as the fetch pool does,
+    /// and answers what the sink returns.
+    async fn deliver(
+        file: IoFile,
+        path: &Path,
+        content: &[u8],
+        pieces: &[(u64, u64, bool)],
+    ) -> Result<(), StorageError> {
+        let (tx, rx) = channel::<DataMessage>(PIPELINE_DATA_CHANNEL_SIZE);
+        let sink = lore_base::lore_spawn!(lore_storage::defragment::write_unbuffered(
+            file,
+            path.to_path_buf(),
+            content.len(),
+            rx,
+        ));
+        for &(offset, len, hole) in pieces {
+            let message = if hole {
+                DataMessage::Hole(offset as usize, len)
+            } else {
+                let payload =
+                    Bytes::copy_from_slice(&content[offset as usize..(offset + len) as usize]);
+                let permit = fragment_limiter()
+                    .acquire_many(fragment_permit_count(payload.len()))
+                    .await
+                    .expect("permit");
+                DataMessage::Payload(offset as usize, payload, permit)
+            };
+            if tx.send(message).await.is_err() {
+                break;
+            }
+        }
+        drop(tx);
+        sink.await.expect("the sink ends")
+    }
+
+    /// The content with the ranges of the holes among `pieces` zeroed.
+    fn with_holes(content: &[u8], pieces: &[(u64, u64, bool)]) -> Vec<u8> {
+        let mut want = content.to_vec();
+        for &(offset, len, hole) in pieces {
+            if hole {
+                want[offset as usize..(offset + len) as usize].fill(0);
+            }
+        }
+        want
+    }
+
+    /// A file written unbuffered holds its content and its exact length, whatever order its
+    /// leaves and holes arrive in.
+    #[tokio::test]
+    async fn an_unbuffered_file_holds_its_content_whatever_order_its_leaves_arrive() {
+        let dir = TempDir::new("lore-storage-unbuffered-");
+        let size = 300_001;
+        let content = content(size);
+        let mut numbers = Numbers(11);
+        for round in 0..4 {
+            let pieces = pieces(&mut numbers, size, 7);
+            let path = dir.path().join(format!("file-{round}"));
+            deliver(target(&path, size).await, &path, &content, &pieces)
+                .await
+                .expect("the sink writes the file");
+            assert_eq!(
+                std::fs::read(&path).expect("read the file"),
+                with_holes(&content, &pieces),
+                "round {round}"
+            );
+        }
+    }
+
+    /// A file whose leaves fall short of its size fails rather than leaving zeros at its end.
+    #[tokio::test]
+    async fn an_unbuffered_file_short_of_its_content_fails() {
+        let dir = TempDir::new("lore-storage-unbuffered-");
+        let path = dir.path().join("short");
+        let size = 3 * SECTOR + 10;
+        let content = content(size);
+        deliver(
+            target(&path, size).await,
+            &path,
+            &content,
+            &[(0, SECTOR + 7, false), (2 * SECTOR + 3, SECTOR, false)],
+        )
+        .await
+        .expect_err("the content does not cover the file");
+    }
+
+    /// A leaf or a hole that reaches past the end of the file fails rather than growing it.
+    #[tokio::test]
+    async fn an_unbuffered_delivery_past_the_end_of_the_file_fails() {
+        let dir = TempDir::new("lore-storage-unbuffered-bounds-");
+        let size = 2 * SECTOR + 10;
+        for (round, hole) in [false, true].into_iter().enumerate() {
+            let path = dir.path().join(format!("file-{round}"));
+            let (tx, rx) = channel::<DataMessage>(4);
+            let sink = lore_base::lore_spawn!(lore_storage::defragment::write_unbuffered(
+                target(&path, size).await,
+                path.clone(),
+                size as usize,
+                rx,
+            ));
+            let past = SECTOR as usize..(size + 1) as usize;
+            let message = if hole {
+                DataMessage::Hole(past.start, past.len() as u64)
+            } else {
+                let permit = fragment_limiter()
+                    .acquire_many(fragment_permit_count(past.len()))
+                    .await
+                    .expect("permit");
+                DataMessage::Payload(
+                    past.start,
+                    Bytes::from(content(size + 1)).slice(past),
+                    permit,
+                )
+            };
+            tx.send(message).await.expect("send the delivery");
+            drop(tx);
+            sink.await
+                .expect("the sink ends")
+                .expect_err("the delivery reaches past the end of the file");
+            assert_eq!(
+                std::fs::metadata(&path).expect("stat the file").len(),
+                size,
+                "the file keeps its size"
+            );
+        }
+    }
+
+    /// A volume that refuses unbuffered writes has the file written through the file cache: the
+    /// refused write, those after it and the partial sectors kept, counted as a fallback.
+    #[tokio::test]
+    async fn a_refused_unbuffered_write_has_the_file_written_through_the_file_cache() {
+        let dir = TempDir::new("lore-storage-unbuffered-refused-write-");
+        refuse_unbuffered(dir.path(), Refusal::Write);
+        let size = 100_003;
+        let content = content(size);
+        let pieces = pieces(&mut Numbers(13), size, 6);
+        let path = dir.path().join("file");
+        let before = lore_io::unbuffered_fallbacks();
+        deliver(target(&path, size).await, &path, &content, &pieces)
+            .await
+            .expect("the file is written through the file cache");
+        assert_eq!(
+            std::fs::read(&path).expect("read the file"),
+            with_holes(&content, &pieces)
+        );
+        assert!(
+            lore_io::unbuffered_fallbacks() > before,
+            "the fallback is counted"
+        );
+    }
+
+    /// A volume that refuses unbuffered opens has the file opened through the file cache, and so
+    /// does a sparse write, whose holes an unbuffered write would not leave.
+    #[tokio::test]
+    async fn a_refused_or_sparse_unbuffered_open_opens_the_file_through_the_file_cache() {
+        let dir = TempDir::new("lore-storage-unbuffered-refused-open-");
+        let refused = dir.path().join("refused");
+        std::fs::create_dir(&refused).expect("create the refused directory");
+        refuse_unbuffered(&refused, Refusal::Open);
+        let (_file, unbuffered) =
+            lore_storage::defragment::open_file_write(refused.join("file"), 100, false, true)
+                .await
+                .expect("open through the file cache");
+        assert!(!unbuffered, "a refused open is not unbuffered");
+        let (_file, unbuffered) =
+            lore_storage::defragment::open_file_write(dir.path().join("sparse"), 100, true, true)
+                .await
+                .expect("open sparse");
+        assert!(!unbuffered, "a sparse file is not unbuffered");
     }
 }
 
@@ -930,9 +1365,10 @@ mod defragment_integration {
         .await
         .expect("load root list");
 
-        let file = lore_storage::defragment::open_file_write(
+        let (file, _) = lore_storage::defragment::open_file_write(
             dir.path().join("truncated.bin"),
             PAYLOAD,
+            false,
             false,
         )
         .await
@@ -948,6 +1384,7 @@ mod defragment_integration {
             DefragmentSink::File {
                 file,
                 size: PAYLOAD,
+                unbuffered: None,
             },
             options,
             None,

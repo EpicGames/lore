@@ -42,6 +42,12 @@ pub fn unbuffered_fallbacks() -> u64 {
     FALLBACKS.load(Ordering::Relaxed)
 }
 
+/// Counts a file whose unbuffered write was refused and goes through the file cache instead, in
+/// [`unbuffered_fallbacks`].
+pub fn record_unbuffered_fallback() {
+    FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// The flags an open of `options` adds for unbuffered I/O.
 #[cfg(target_family = "windows")]
 pub(crate) fn open_flags(options: &crate::OpenOptions) -> u32 {
@@ -55,9 +61,9 @@ pub(crate) fn open_flags(options: &crate::OpenOptions) -> u32 {
 /// Writes `data` as the whole contents of `path`, created or truncated, with `durable` syncs it,
 /// and answers its metadata, as the cached whole-file write does, and whether it wrote it
 /// unbuffered. On Windows the file is opened unbuffered, `data` is copied into this thread's
-/// aligned buffer ([`write_padded`]) and written with its padding in one write, and the end of the
-/// file is then set to the length of `data`. A refused open or write ([`unbuffered_refused`]) is
-/// counted ([`unbuffered_fallbacks`]) and the file written through the file cache, as it is
+/// aligned buffer ([`write_padded_at`]) and written with its padding in one write, and the end of
+/// the file is then set to the length of `data`. A refused open or write ([`unbuffered_refused`])
+/// is counted ([`unbuffered_fallbacks`]) and the file written through the file cache, as it is
 /// elsewhere.
 pub(crate) fn write_file(
     path: &Path,
@@ -66,9 +72,7 @@ pub(crate) fn write_file(
 ) -> std::io::Result<(std::fs::Metadata, bool)> {
     #[cfg(target_family = "windows")]
     match write_file_unbuffered(path, data, durable) {
-        Err(err) if unbuffered_refused(&err) => {
-            FALLBACKS.fetch_add(1, Ordering::Relaxed);
-        }
+        Err(err) if unbuffered_refused(&err) => record_unbuffered_fallback(),
         written => return written.map(|metadata| (metadata, true)),
     }
     write_file_cached(path, data, durable).map(|metadata| (metadata, false))
@@ -115,7 +119,7 @@ fn write_file_unbuffered(
     if !data.is_empty() {
         #[cfg(feature = "test-util")]
         test_util::refuse(path, test_util::Refusal::Write)?;
-        write_padded(&file, data)?;
+        write_padded_at(&file, data.len(), std::iter::once(data), 0)?;
         if !data.len().is_multiple_of(crate::UNBUFFERED_ALIGNMENT) {
             file.set_len(data.len() as u64)?;
         }
@@ -126,39 +130,52 @@ fn write_file_unbuffered(
     file.metadata()
 }
 
-/// The largest content a pool thread keeps an aligned buffer for between unbuffered whole-file
-/// writes: the most an unfragmented fragment holds. A larger write allocates a buffer of its own.
+/// The largest write [`write_padded_at`] makes from the aligned buffer a pool thread keeps between
+/// unbuffered writes; a larger one allocates a buffer of its own. It holds a file of one fragment
+/// many times over, and the writes of a fragmented file are merged up to it.
 #[cfg(target_family = "windows")]
-const RETAINED_SCRATCH: usize = 256 * 1024;
+pub const PADDED_WRITE_RETAINED: usize = 4 * 1024 * 1024;
 
 #[cfg(target_family = "windows")]
 thread_local! {
-    /// The aligned buffer [`write_padded`] copies into, allocated once per pool thread, so an
-    /// unbuffered whole-file write allocates nothing.
+    /// The aligned buffer [`write_padded_at`] copies into, allocated once per pool thread, so an
+    /// unbuffered write allocates nothing.
     static SCRATCH: std::cell::RefCell<Option<crate::AlignedBuf>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Writes `data` and the zeros that pad it to a multiple of the alignment, in one write from the
-/// start of `file`, through this thread's aligned buffer.
+/// Writes `segments`, `len` bytes in all, and the zeros that pad them to a multiple of the
+/// alignment, in one write at `offset` of `file`, through this thread's aligned buffer. No
+/// completion reaches a completion port `file` is bound to.
 #[cfg(target_family = "windows")]
-fn write_padded(file: &File, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-
-    if data.len() > RETAINED_SCRATCH {
-        // SAFETY: the copy writes every byte of the content before the write reads it.
-        let mut buffer = unsafe { crate::AlignedBuf::uninit(data.len()) };
-        buffer.content_mut().copy_from_slice(data);
-        return (&*file).write_all(buffer.as_ref());
+pub(crate) fn write_padded_at<'a>(
+    file: &File,
+    len: usize,
+    segments: impl Iterator<Item = &'a [u8]>,
+    offset: u64,
+) -> std::io::Result<()> {
+    let fill = |content: &mut [u8]| {
+        let mut at = 0;
+        for segment in segments {
+            content[at..at + segment.len()].copy_from_slice(segment);
+            at += segment.len();
+        }
+    };
+    if len > PADDED_WRITE_RETAINED {
+        // SAFETY: `segments` hold `len` bytes, so the copy writes every byte of the content before
+        // the write reads it.
+        let mut buffer = unsafe { crate::AlignedBuf::uninit(len) };
+        fill(buffer.content_mut());
+        return crate::psync::write_all_at_impl(file, buffer.as_ref(), offset);
     }
     SCRATCH.with_borrow_mut(|scratch| {
-        // SAFETY: the copy writes every byte of the content before the write reads it.
-        let scratch =
-            scratch.get_or_insert_with(|| unsafe { crate::AlignedBuf::uninit(RETAINED_SCRATCH) });
         // SAFETY: as above.
-        unsafe { scratch.set_len(data.len()) };
-        scratch.content_mut().copy_from_slice(data);
-        (&*file).write_all(scratch.as_ref())
+        let scratch = scratch
+            .get_or_insert_with(|| unsafe { crate::AlignedBuf::uninit(PADDED_WRITE_RETAINED) });
+        // SAFETY: as above.
+        unsafe { scratch.set_len(len) };
+        fill(scratch.content_mut());
+        crate::psync::write_all_at_impl(file, scratch.as_ref(), offset)
     })
 }
 
@@ -174,7 +191,7 @@ pub mod test_util {
     pub enum Refusal {
         /// The unbuffered open of the file.
         Open,
-        /// The first unbuffered write to the file, its open allowed.
+        /// The unbuffered writes to the file, its open allowed.
         Write,
     }
 
@@ -189,20 +206,43 @@ pub mod test_util {
             .push((path.to_path_buf(), refusal));
     }
 
-    /// Fails as a volume that refuses an unbuffered call fails, with `ERROR_INVALID_PARAMETER`,
-    /// where `refusal` of `path` is refused.
+    /// Whether `refusal` of `path` is refused.
     #[cfg(target_family = "windows")]
-    pub(crate) fn refuse(path: &Path, refusal: Refusal) -> std::io::Result<()> {
-        let refused = REFUSED
+    fn refuses(path: &Path, refusal: Refusal) -> bool {
+        REFUSED
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .any(|(refused, step)| *step == refusal && path.starts_with(refused));
-        if refused {
-            return Err(std::io::Error::from_raw_os_error(
-                windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER as i32,
-            ));
+            .any(|(refused, step)| *step == refusal && path.starts_with(refused))
+    }
+
+    /// The error a volume that refuses an unbuffered call answers: `ERROR_INVALID_PARAMETER`.
+    #[cfg(target_family = "windows")]
+    pub(crate) fn refused() -> std::io::Error {
+        std::io::Error::from_raw_os_error(
+            windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER as i32,
+        )
+    }
+
+    /// Fails as a volume that refuses an unbuffered call fails ([`refused`]) where `refusal` of
+    /// `path` is refused.
+    #[cfg(target_family = "windows")]
+    pub(crate) fn refuse(path: &Path, refusal: Refusal) -> std::io::Result<()> {
+        if refuses(path, refusal) {
+            return Err(refused());
         }
         Ok(())
+    }
+
+    /// Fails an unbuffered open of `path` with `options` as [`refuse`] does where
+    /// [`Refusal::Open`] of it is refused, and answers whether to refuse the padded writes of the
+    /// file it opens ([`crate::IoFile::write_padded_at`]): where [`Refusal::Write`] of it is.
+    #[cfg(target_family = "windows")]
+    pub(crate) fn refused_open(path: &Path, options: &crate::OpenOptions) -> std::io::Result<bool> {
+        if !options.is_unbuffered() {
+            return Ok(false);
+        }
+        refuse(path, Refusal::Open)?;
+        Ok(refuses(path, Refusal::Write))
     }
 }

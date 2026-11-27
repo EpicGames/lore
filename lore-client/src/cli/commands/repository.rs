@@ -194,10 +194,9 @@ pub struct RepositoryCloneArgs {
     #[clap(long, action)]
     bare: bool,
 
-    /// On Windows, write files of one fragment past the file cache. A clone writes every file
-    /// directly, with no temporary file, with or without this option. Applies to this clone only:
-    /// the new instance's `[file] direct_write` setting is left as it is, and later commands follow
-    /// that setting
+    /// On Windows, write files past the file cache. A clone writes every file directly, with no
+    /// temporary file, with or without this option. Applies to this clone only: the new instance's
+    /// `[file] direct_write` setting is left as it is, and later commands follow that setting
     #[clap(long, action)]
     direct_file_write: bool,
 

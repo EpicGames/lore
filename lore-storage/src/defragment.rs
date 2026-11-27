@@ -49,8 +49,14 @@ pub enum DefragmentSink {
     /// `size` is the expected content length, used to reject out-of-range offsets. With
     /// [`ReadOptions::resume_write`], the pipeline's tasks end with it when it is dropped, and
     /// with [`ReadOptions::resume_held`], a whole leaf the file already holds at its offset,
-    /// checked against the leaf's hash, is not fetched again.
-    File { file: IoFile, size: usize },
+    /// checked against the leaf's hash, is not fetched again. `unbuffered` is the path of `file`
+    /// where [`open_file_write`] opened it unbuffered: the file is then written past the file
+    /// cache, and opened again at that path where the volume refuses that.
+    File {
+        file: IoFile,
+        size: usize,
+        unbuffered: Option<std::path::PathBuf>,
+    },
     /// Stream buffers in content order to a caller-provided channel.
     ///
     /// The item is a `Result` so a failure partway through the tree reaches the consumer as the
@@ -754,6 +760,9 @@ async fn walk_intermediate_level(
 }
 
 /// Unordered fetch pool for file targets of a read that does not resume.
+///
+/// Launches its leaves and holes in file order, which bounds the bytes an unbuffered write sink
+/// keeps on Windows (`PartialSectors`).
 ///
 /// Holds `claim` for as long as it fetches, for the reason [`walk_fragment_tree`] gives. Its
 /// fetches end before it does: a pipeline that is dropped detaches it, and it drains them.
@@ -1693,23 +1702,15 @@ async fn write_to_file(
                 (*offset, usize::try_from(*length).unwrap_or(usize::MAX))
             }
         };
-        let Some(end) = offset.checked_add(length) else {
-            result = Err(StorageError::internal(
-                "file write offset + data length overflows usize",
-            ));
-            break;
-        };
-        if end > size {
-            result = Err(StorageError::internal(format!(
-                "file write out of bounds: offset {offset} + {length} > {size}"
-            )));
+        if let Err(err) = check_delivery(offset, length, size) {
+            result = Err(err);
             break;
         }
 
         written += length;
         #[cfg(target_vendor = "apple")]
         if let DataMessage::Hole(..) = message {
-            holes.push(offset as u64..end as u64);
+            holes.push(offset as u64..(offset + length) as u64);
         }
 
         let DataMessage::Payload(offset, payload, permit) = message else {
@@ -1758,6 +1759,457 @@ async fn write_to_file(
     }
 
     result
+}
+
+/// Refuses `length` bytes delivered at `offset` where they reach past `size`, the length of the
+/// file, as a compromised fragment list could ask.
+fn check_delivery(offset: usize, length: usize, size: usize) -> Result<(), StorageError> {
+    let Some(end) = offset.checked_add(length) else {
+        return Err(StorageError::internal(
+            "file write offset + data length overflows usize",
+        ));
+    };
+    if end > size {
+        return Err(StorageError::internal(format!(
+            "file write out of bounds: offset {offset} + {length} > {size}"
+        )));
+    }
+    Ok(())
+}
+
+/// The sector size unbuffered writes are aligned to.
+#[cfg(target_family = "windows")]
+const SECTOR: u64 = lore_io::UNBUFFERED_ALIGNMENT as u64;
+
+#[cfg(target_family = "windows")]
+const _: () = assert!(
+    FRAGMENT_MINIMUM_COST_KIB as u64 * 1024 >= SECTOR,
+    "a leaf in flight holds at least a sector's worth of budget, which bounds the bytes \
+     `PartialSectors` keeps"
+);
+
+/// The parts one unbuffered write concatenates, in file order: the pieces of a boundary sector it
+/// completes, the part of a leaf it writes, and the pieces of the other boundary sector it
+/// completes.
+#[cfg(target_family = "windows")]
+#[lore_macro::test_pub]
+struct WriteParts(smallvec::SmallVec<[Bytes; 3]>);
+
+#[cfg(target_family = "windows")]
+impl lore_io::StableBufList for WriteParts {
+    fn byte_segments(&self) -> impl Iterator<Item = &[u8]> {
+        self.0.iter().map(|part| part.as_ref())
+    }
+}
+
+/// One unbuffered write of a file: its offset, a multiple of the sector size, its parts, and the
+/// budget it releases once written.
+#[cfg(target_family = "windows")]
+#[lore_macro::test_pub]
+struct SectorWrite {
+    offset: u64,
+    parts: WriteParts,
+    permits: smallvec::SmallVec<[SemaphorePermit<'static>; 3]>,
+}
+
+/// A piece of a partial sector: its offset in the file and a copy of its bytes.
+#[cfg(target_family = "windows")]
+struct SectorPiece {
+    offset: u64,
+    bytes: Bytes,
+}
+
+/// The partial sectors of a file of `size` bytes written unbuffered: the pieces of each sector that
+/// a leaf or hole that has arrived shares with one that has not. Leaves are cut at any byte, so
+/// nearly every boundary between two leaves falls inside a sector, which is written once every
+/// byte of it has arrived.
+///
+/// A kept piece holds no fragment budget, so kept pieces can never hold the budget the leaves they
+/// wait for need to be fetched. The bytes they keep are bounded all the same: a sector stays
+/// partial only while it holds a byte of a leaf or hole that has not arrived, and is that item's
+/// first or last sector, so each such item keeps at most two partial sectors, of under a sector of
+/// bytes each. Leaves and holes launch in file order ([`fetch_unordered`]), so an item that has not
+/// arrived and shares a sector with one that has is a leaf in flight, which holds at least a
+/// sector's worth of budget, a hole queued for the write sink, of which the sink's channel holds at
+/// most [`PIPELINE_DATA_CHANNEL_SIZE`], or an item not yet launched, which shares only the sector
+/// beside the last item launched. A file's kept bytes thus stay under twice the budget its leaves
+/// in flight hold, plus two sectors for each hole queued, plus one sector beside the last item
+/// launched. A partial sector may hold several pieces, one of each item that has arrived in it.
+#[cfg(target_family = "windows")]
+#[lore_macro::test_pub]
+struct PartialSectors {
+    size: u64,
+    pieces: std::collections::HashMap<u64, smallvec::SmallVec<[SectorPiece; 2]>>,
+}
+
+#[cfg(target_family = "windows")]
+impl PartialSectors {
+    #[lore_macro::test_pub]
+    fn new(size: u64) -> PartialSectors {
+        PartialSectors {
+            size,
+            pieces: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Whether every partial sector has been completed.
+    #[lore_macro::test_pub]
+    fn is_empty(&self) -> bool {
+        self.pieces.is_empty()
+    }
+
+    /// Takes `len` bytes delivered at `offset`, `data` or a hole where `data` is `None`, with
+    /// `permit`, the budget covering `data`, and appends to `writes` the writes they make ready.
+    /// A leaf makes at most one write: of its bytes from its first sector boundary to its last,
+    /// widened to the boundary sectors it completes, or to the end of the file. A hole makes a
+    /// write of each boundary sector it completes, of zeros where the hole covers it. What a
+    /// boundary sector holds of a leaf it does not complete is copied and kept, holding no budget;
+    /// all of `permit` is released with the leaf's write, or at once where the leaf makes none.
+    #[lore_macro::test_pub]
+    fn take(
+        &mut self,
+        offset: u64,
+        len: u64,
+        data: Option<Bytes>,
+        permit: Option<SemaphorePermit<'static>>,
+        writes: &mut Vec<SectorWrite>,
+    ) {
+        if len == 0 {
+            return;
+        }
+        let end = offset + len;
+        let first = offset / SECTOR;
+        let last = (end - 1) / SECTOR;
+        let head_whole =
+            offset.is_multiple_of(SECTOR) && (end >= (first + 1) * SECTOR || end == self.size);
+        let mut head = None;
+        let mut body_start = offset;
+        if !head_whole {
+            body_start = end.min((first + 1) * SECTOR);
+            head = self.complete(first, offset..body_start, data.as_ref(), offset);
+        }
+        let mut tail = None;
+        let mut body_end = end;
+        if last > first && !end.is_multiple_of(SECTOR) && end != self.size {
+            body_end = last * SECTOR;
+            tail = self.complete(last, body_end..end, data.as_ref(), offset);
+        }
+        let Some(data) = data else {
+            for pieces in [head, tail].into_iter().flatten() {
+                writes.push(SectorWrite::of_pieces(pieces));
+            }
+            return;
+        };
+        let start = if head.is_some() || head_whole {
+            first * SECTOR
+        } else {
+            body_start
+        };
+        let mut parts = smallvec::SmallVec::new();
+        for piece in head.into_iter().flatten() {
+            parts.push(piece.bytes);
+        }
+        if body_end > body_start {
+            parts.push(data.slice((body_start - offset) as usize..(body_end - offset) as usize));
+        }
+        for piece in tail.into_iter().flatten() {
+            parts.push(piece.bytes);
+        }
+        if !parts.is_empty() {
+            writes.push(SectorWrite {
+                offset: start,
+                parts: WriteParts(parts),
+                permits: permit.into_iter().collect(),
+            });
+        }
+    }
+
+    /// Adds the piece in `range` of `sector` to the sector's pieces: of `data`, delivered at
+    /// `offset`, copied, or of zeros where `data` is `None`. Answers the sector's pieces in file
+    /// order once they cover it.
+    fn complete(
+        &mut self,
+        sector: u64,
+        range: Range<u64>,
+        data: Option<&Bytes>,
+        offset: u64,
+    ) -> Option<smallvec::SmallVec<[SectorPiece; 2]>> {
+        let len = (range.end - range.start) as usize;
+        let bytes = match data {
+            Some(data) => {
+                let start = (range.start - offset) as usize;
+                Bytes::copy_from_slice(&data[start..start + len])
+            }
+            None => Bytes::from_static(&ZEROS[..len]),
+        };
+        let piece = SectorPiece {
+            offset: range.start,
+            bytes,
+        };
+        let kept = self.pieces.entry(sector).or_default();
+        let held: u64 = kept.iter().map(|piece| piece.bytes.len() as u64).sum();
+        if held + (len as u64) < SECTOR.min(self.size - sector * SECTOR) {
+            kept.push(piece);
+            return None;
+        }
+        let mut pieces = self.pieces.remove(&sector).unwrap_or_default();
+        pieces.push(piece);
+        pieces.sort_unstable_by_key(|piece| piece.offset);
+        Some(pieces)
+    }
+
+    /// Takes every piece kept, for a file whose volume refused an unbuffered write.
+    fn drain(&mut self) -> impl Iterator<Item = SectorPiece> + '_ {
+        self.pieces.drain().flat_map(|(_, pieces)| pieces)
+    }
+}
+
+#[cfg(target_family = "windows")]
+impl SectorWrite {
+    /// The bytes the write's parts hold.
+    fn len(&self) -> u64 {
+        self.parts.0.iter().map(|part| part.len() as u64).sum()
+    }
+
+    /// The write of `pieces`, contiguous and in file order: a sector they cover, or a piece kept
+    /// for a file written through the file cache.
+    fn of_pieces(pieces: smallvec::SmallVec<[SectorPiece; 2]>) -> SectorWrite {
+        let offset = pieces.first().map_or(0, |piece| piece.offset);
+        SectorWrite {
+            offset,
+            parts: WriteParts(pieces.into_iter().map(|piece| piece.bytes).collect()),
+            permits: smallvec::SmallVec::new(),
+        }
+    }
+}
+
+/// What [`write_unbuffered`] waits for next.
+#[cfg(target_family = "windows")]
+enum UnbufferedEvent {
+    Message(Option<DataMessage>),
+    Written(Result<WriteEnd, JoinError>),
+}
+
+/// How a write of [`write_unbuffered`] ended. A refused write is boxed, being a cold path, so that
+/// every write's task stays small.
+#[cfg(target_family = "windows")]
+enum WriteEnd {
+    Written,
+    Refused(std::io::Error, Box<SectorWrite>),
+    Failed(StorageError),
+}
+
+/// The write sink of `file`, of `size` bytes, which [`open_file_write`] opened unbuffered at
+/// `path`: drains the fetch pool's [`DataMessage`]s into the file's [`PartialSectors`], and writes
+/// what they make ready unbuffered, from the syscall pool thread's aligned buffer
+/// ([`IoFile::write_padded_at`]), one write at a time ([`next_write`]). The writes that become
+/// ready while one is in flight wait with their budget, and the next write merges a contiguous run
+/// of them, so the file takes fewer and larger writes. A write that starts past the file's valid
+/// data length has NTFS fill the range before it with zeros, which the writes of that range then
+/// overwrite. The end of the file is set to `size` once all is written, as the write of the last
+/// sector is padded.
+///
+/// A volume that refuses an unbuffered write ([`lore_io::unbuffered_refused`]) has the file
+/// counted ([`lore_io::unbuffered_fallbacks`]) and logged
+/// ([`crate::read::log_unbuffered_fallback`]), and the refused write, every later one and every
+/// piece kept written through the file cache, through a second handle opened at `path`. The bounds
+/// and the byte count are checked as [`write_to_file`] checks them.
+#[cfg(target_family = "windows")]
+#[lore_macro::test_pub]
+async fn write_unbuffered(
+    file: IoFile,
+    path: std::path::PathBuf,
+    size: usize,
+    mut data_rx: DataReceiver,
+) -> Result<(), StorageError> {
+    let mut sectors = PartialSectors::new(size as u64);
+    let mut ready = Vec::new();
+    let mut tasks: JoinSet<WriteEnd> = JoinSet::new();
+    let mut cached: Option<IoFile> = None;
+    let mut written = 0usize;
+    let mut open = true;
+    let mut result = Ok(());
+    loop {
+        if tasks.is_empty()
+            && result.is_ok()
+            && let Some(write) = next_write(&mut ready)
+        {
+            match &cached {
+                Some(cached) => lore_base::lore_spawn!(tasks, write_cached(cached.clone(), write)),
+                None => lore_base::lore_spawn!(tasks, write_sector(file.clone(), write)),
+            };
+        }
+        if !open && tasks.is_empty() {
+            break;
+        }
+        let event = tokio::select! {
+            message = data_rx.recv(), if open => UnbufferedEvent::Message(message),
+            Some(done) = tasks.join_next() => UnbufferedEvent::Written(done),
+        };
+        let handled = match event {
+            UnbufferedEvent::Message(None) => {
+                open = false;
+                Ok(())
+            }
+            UnbufferedEvent::Message(Some(message)) => take_unbuffered_message(
+                &mut sectors,
+                cached.is_some(),
+                message,
+                size,
+                &mut written,
+                &mut ready,
+            ),
+            UnbufferedEvent::Written(Ok(WriteEnd::Written)) => Ok(()),
+            UnbufferedEvent::Written(Ok(WriteEnd::Refused(err, refused))) => {
+                lore_io::record_unbuffered_fallback();
+                crate::read::log_unbuffered_fallback(&path, &err);
+                ready.push(*refused);
+                ready.extend(
+                    sectors
+                        .drain()
+                        .map(|piece| SectorWrite::of_pieces(smallvec::smallvec![piece])),
+                );
+                open_cached(&path).await.map(|opened| cached = Some(opened))
+            }
+            UnbufferedEvent::Written(Ok(WriteEnd::Failed(err))) => Err(err),
+            UnbufferedEvent::Written(Err(e)) => {
+                Err(StorageError::internal_with_context(e, "write task"))
+            }
+        };
+        if let Err(err) = handled {
+            if result.is_ok() {
+                result = Err(err);
+            }
+            if open {
+                open = false;
+                data_rx.close();
+            }
+            ready.clear();
+        }
+    }
+    if result.is_ok() && (written != size || !sectors.is_empty()) {
+        result = Err(StorageError::internal(format!(
+            "defragmented content covers {written} of {size} bytes"
+        )));
+    }
+    if result.is_ok() && !size.is_multiple_of(lore_io::UNBUFFERED_ALIGNMENT) {
+        result = file
+            .set_len(size as u64, ())
+            .await
+            .map_err(|e| StorageError::internal_with_context(e, "set the end of the file"));
+    }
+    result
+}
+
+/// Takes from `ready` the write of lowest offset, merged with the writes that continue it, while
+/// the merged write stays within [`lore_io::PADDED_WRITE_RETAINED`], so it needs no buffer of its
+/// own. `None` where `ready` is empty.
+#[cfg(target_family = "windows")]
+#[lore_macro::test_pub]
+fn next_write(ready: &mut Vec<SectorWrite>) -> Option<SectorWrite> {
+    ready.sort_unstable_by_key(|write| std::cmp::Reverse(write.offset));
+    let mut write = ready.pop()?;
+    let mut len = write.len();
+    while let Some(next) = ready.last()
+        && next.offset == write.offset + len
+        && len + next.len() <= lore_io::PADDED_WRITE_RETAINED as u64
+    {
+        let Some(next) = ready.pop() else {
+            break;
+        };
+        len += next.len();
+        write.parts.0.extend(next.parts.0);
+        write.permits.extend(next.permits);
+    }
+    Some(write)
+}
+
+/// Takes one message of the fetch pool into `sectors`, appending the writes it makes ready to
+/// `writes`, and counting the bytes it delivers in `written`, bounded by `size`. A file written
+/// `through_cache` takes a leaf as one write of its bytes and a hole as no write.
+#[cfg(target_family = "windows")]
+fn take_unbuffered_message(
+    sectors: &mut PartialSectors,
+    through_cache: bool,
+    message: DataMessage,
+    size: usize,
+    written: &mut usize,
+    writes: &mut Vec<SectorWrite>,
+) -> Result<(), StorageError> {
+    match message {
+        DataMessage::Payload(offset, payload, permit) => {
+            check_delivery(offset, payload.len(), size)?;
+            *written += payload.len();
+            if through_cache {
+                writes.push(SectorWrite {
+                    offset: offset as u64,
+                    parts: WriteParts(smallvec::smallvec![payload]),
+                    permits: smallvec::smallvec![permit],
+                });
+            } else {
+                let len = payload.len() as u64;
+                sectors.take(offset as u64, len, Some(payload), Some(permit), writes);
+            }
+            Ok(())
+        }
+        DataMessage::Hole(offset, length) => {
+            let length = usize::try_from(length).unwrap_or(usize::MAX);
+            check_delivery(offset, length, size)?;
+            *written += length;
+            if !through_cache {
+                sectors.take(offset as u64, length as u64, None, None, writes);
+            }
+            Ok(())
+        }
+        DataMessage::Held(..) => Err(StorageError::internal(
+            "an unbuffered file is never resumed",
+        )),
+    }
+}
+
+/// Writes `write` unbuffered to `file`, releasing its budget once written. A write the volume
+/// refuses answers itself, to be written through the file cache.
+#[cfg(target_family = "windows")]
+async fn write_sector(file: IoFile, write: SectorWrite) -> WriteEnd {
+    let SectorWrite {
+        offset,
+        parts,
+        permits,
+    } = write;
+    match file.write_padded_at(parts, offset).await {
+        Ok(_parts) => WriteEnd::Written,
+        Err((err, parts)) if lore_io::unbuffered_refused(&err) => WriteEnd::Refused(
+            err,
+            Box::new(SectorWrite {
+                offset,
+                parts,
+                permits,
+            }),
+        ),
+        Err((err, _parts)) => {
+            WriteEnd::Failed(StorageError::internal_with_context(err, "write to file"))
+        }
+    }
+}
+
+/// Writes the parts of `write` through `file`, a handle through the file cache, at the offset of
+/// the first, releasing its budget once written.
+#[cfg(target_family = "windows")]
+async fn write_cached(file: IoFile, write: SectorWrite) -> WriteEnd {
+    let _permits = write.permits;
+    match file.write_all_vectored_at(write.parts, write.offset).await {
+        Ok(_parts) => WriteEnd::Written,
+        Err(err) => WriteEnd::Failed(StorageError::internal_with_context(err, "write to file")),
+    }
+}
+
+/// Opens the file at `path` again, for writes through the file cache.
+#[cfg(target_family = "windows")]
+async fn open_cached(path: &Path) -> Result<IoFile, StorageError> {
+    IoDriver::global()
+        .open(path, &OpenOptions::new().write(true))
+        .await
+        .map_err(|e| StorageError::internal_with_context(e, "open the file for cached writes"))
 }
 
 /// Unified streaming defragmentation pipeline.
@@ -1828,13 +2280,18 @@ pub async fn defragment_pipeline(
             let (walk_result, fetch_result) = tokio::join!(walker, fetcher);
             joined(walk_result).and(joined(fetch_result))
         }
-        DefragmentSink::File { file, size } => {
+        DefragmentSink::File {
+            file,
+            size,
+            unbuffered,
+        } => {
             let (fetcher, writer) = spawn_fetch_and_write(
                 store.clone(),
                 partition,
                 leaf_rx,
                 file,
                 size,
+                unbuffered,
                 options,
                 remote_session.clone(),
                 claim,
@@ -1859,9 +2316,11 @@ pub async fn defragment_pipeline(
 type PipelineTask = JoinHandle<Result<(), StorageError>>;
 
 /// Spawns the fetch pool and the write sink of a [`defragment_pipeline`] into `file`, of `size`
-/// bytes: the pool loads each leaf `leaf_rx` yields, and the sink writes it. For a read that
-/// resumes ([`ReadOptions::resume_write`]) the pool is [`fetch_resuming`], which takes a leaf from
-/// `file` where `file` holds it ([`ReadOptions::resume_held`]); for any other, [`fetch_unordered`].
+/// bytes, at `unbuffered` where it is unbuffered ([`DefragmentSink::File`]): the pool loads each
+/// leaf `leaf_rx` yields, and the sink writes it. For a read that resumes
+/// ([`ReadOptions::resume_write`]) the pool is [`fetch_resuming`], which takes a leaf from `file`
+/// where `file` holds it ([`ReadOptions::resume_held`]); for any other, [`fetch_unordered`]. An
+/// unbuffered file is written by [`write_unbuffered`], and any other by [`write_to_file`].
 ///
 /// A function of its own because it clones `file`, and a local the pipeline's future borrows is
 /// held there until its scope ends, across the wait for the tasks.
@@ -1872,6 +2331,7 @@ fn spawn_fetch_and_write(
     leaf_rx: Receiver<LeafReference>,
     file: IoFile,
     size: usize,
+    unbuffered: Option<std::path::PathBuf>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
     claim: Option<Arc<StoreGuard>>,
@@ -1900,6 +2360,13 @@ fn spawn_fetch_and_write(
             claim,
         ))
     };
+    #[cfg(target_family = "windows")]
+    if let Some(path) = unbuffered {
+        let writer = lore_base::lore_spawn!(write_unbuffered(file, path, size, data_rx));
+        return (fetcher, writer);
+    }
+    #[cfg(not(target_family = "windows"))]
+    let _ = unbuffered;
     let writer = lore_base::lore_spawn!(write_to_file(file, size, data_rx));
     (fetcher, writer)
 }
@@ -2261,22 +2728,41 @@ fn refuse_list(leaf: bool, fragment: &Fragment) -> Result<(), StorageError> {
 /// truncated before its data is written out and grown again records the ranges it held past the
 /// cut as allocated, so the holes of the content written there would be allocated zeros. Every
 /// other file is truncated as it is opened, which frees its storage on the other platforms.
+///
+/// On Windows, with `unbuffered` and not `sparse`, the file is opened unbuffered
+/// ([`OpenOptions::unbuffered`]), to be written by [`write_unbuffered`]. A volume that refuses that
+/// has the file opened through the file cache, counted ([`lore_io::unbuffered_fallbacks`]) and
+/// logged ([`crate::read::log_unbuffered_fallback`]). Answers the file and whether it is
+/// unbuffered.
 pub async fn open_file_write(
     path: impl AsRef<Path>,
     size: usize,
     sparse: bool,
-) -> Result<IoFile, std::io::Error> {
+    unbuffered: bool,
+) -> Result<(IoFile, bool), std::io::Error> {
+    let path = path.as_ref();
     let deallocate = sparse && cfg!(target_family = "windows");
-    let file = IoDriver::global()
-        .open(
-            path,
-            &OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(!deallocate),
-        )
-        .await?;
+    let options = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(!deallocate);
+    let unbuffered = cfg!(target_family = "windows") && unbuffered && !sparse;
+    let opened = if unbuffered {
+        IoDriver::global()
+            .open(path, &options.clone().unbuffered(true))
+            .await
+    } else {
+        IoDriver::global().open(path, &options).await
+    };
+    let (file, unbuffered) = match opened {
+        Err(err) if unbuffered && lore_io::unbuffered_refused(&err) => {
+            lore_io::record_unbuffered_fallback();
+            crate::read::log_unbuffered_fallback(path, &err);
+            (IoDriver::global().open(path, &options).await?, false)
+        }
+        opened => (opened?, unbuffered),
+    };
     if deallocate {
         file.empty(size as u64).await?;
     } else if sparse {
@@ -2284,5 +2770,5 @@ pub async fn open_file_write(
     } else {
         file.set_len(size as u64, ()).await?;
     }
-    Ok(file)
+    Ok((file, unbuffered))
 }

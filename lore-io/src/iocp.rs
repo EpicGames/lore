@@ -293,8 +293,8 @@ pub struct IocpStats {
 ///
 /// A file opened unbuffered ([`crate::OpenOptions::unbuffered`]) takes its overlapped writes past
 /// the file cache. The unbuffered whole-file write
-/// ([`crate::IoDriver::write_file_bytes_unbuffered`]) runs on the syscall pool, as for every
-/// backend.
+/// ([`crate::IoDriver::write_file_bytes_unbuffered`]) and the padded write
+/// ([`crate::IoFile::write_padded_at`]) run on the syscall pool, as for every backend.
 #[lore_macro::test_pub]
 pub(crate) struct IocpDriver {
     inner: Arc<IocpInner>,
