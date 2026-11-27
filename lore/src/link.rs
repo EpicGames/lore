@@ -25,7 +25,7 @@ use crate::interface::LoreString;
 )]
 #[handler(add_local)]
 pub struct LoreLinkAddArgs {
-    /// Link repository URL
+    /// Name, ID or URL of a repository on this repository's remote
     pub link: LoreString,
     /// Path within this repository where the link is added
     pub link_path: LoreString,

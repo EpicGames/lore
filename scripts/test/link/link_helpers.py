@@ -154,6 +154,12 @@ def link_entry(repo: Lore, link_path: str) -> dict:
     return next(e for e in entries if e["linkPath"] == link_path)
 
 
+def with_another_scheme(url: str) -> str:
+    """`url` under a scheme other than its own."""
+    scheme, rest = url.split("://", 1)
+    return f"{'lores' if scheme == 'lore' else 'lore'}://{rest}"
+
+
 def link_field(repo: Lore, source_id: str, field: str) -> str:
     """The first word of `field` in the `link list` entry for `source_id`."""
     output = repo.link_list()

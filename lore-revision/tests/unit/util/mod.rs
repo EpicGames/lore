@@ -9,6 +9,7 @@ mod fan_out;
 pub(crate) mod fs;
 mod path;
 mod request_tracker;
+mod url;
 
 /// What `f` returns and the allocations the calling thread made running it.
 ///

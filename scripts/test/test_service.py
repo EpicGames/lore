@@ -16,6 +16,7 @@ from pathlib import Path
 from time import monotonic, sleep
 
 import pytest
+from error_types import INVALID_ARGUMENTS
 
 from lore import Lore, external_root, strip_protocol
 from service_util import (
@@ -1239,8 +1240,6 @@ def test_a_client_reports_a_service_of_an_older_protocol_as_unavailable(
             )
 
 
-# `InvalidArguments`: a refused target of `service set-external-directory`.
-INVALID_ARGUMENTS = 3
 # What `service status` prints of the external root's state while a move hasn't finished.
 EXTERNAL_ROOT_MOVING = "a move hasn't finished"
 

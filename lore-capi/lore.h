@@ -5341,7 +5341,7 @@ typedef struct lore_lock_file_release_args_t {
 
 // Arguments for adding a new link to a linked repository at the given path.
 typedef struct lore_link_add_args_t {
-  // Link repository URL
+  // Name, ID or URL of a repository on this repository's remote
   struct lore_string_t link;
   // Path within this repository where the link is added
   struct lore_string_t link_path;

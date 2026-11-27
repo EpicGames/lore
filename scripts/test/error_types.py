@@ -73,6 +73,12 @@ LOCAL_MODIFICATIONS = 44
 #: The exit status of a command refused by a divergent history.
 DIVERGENT = 42
 
+#: The exit status of a command refused for its arguments.
+INVALID_ARGUMENTS = 3
+
+#: The exit status of a command that needs a remote the repository has none of.
+NO_REMOTE = 111
+
 
 class FileAlreadyExist(LoreException): ...
 

@@ -2164,12 +2164,12 @@ Link commands
 
 Link to the given point in the repository and subpath from the given repository
 
-**Usage:** `lore link add [OPTIONS] <link_path> <link_url> <source_path>`
+**Usage:** `lore link add [OPTIONS] <link_path> <repository> <source_path>`
 
 ###### **Arguments:**
 
 * `<link_path>` — Path in the current repository where the repository should be linked in
-* `<link_url>` — Repository URL
+* `<repository>` — Name, ID or URL of a repository on this repository's remote
 * `<source_path>` — Path in the link repository that should be linked in
 
 ###### **Options:**

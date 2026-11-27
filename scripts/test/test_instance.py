@@ -13,10 +13,9 @@ import time
 
 import pytest
 from lore import Lore
-from error_types import LoreException
+from error_types import INVALID_ARGUMENTS, LoreException
 from service_util import LORE_SERVICE_ENVIRONMENT
 
-INVALID_ARGUMENTS = 3
 NOT_SUPPORTED = 9
 
 logger = logging.getLogger(__name__)

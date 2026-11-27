@@ -24,6 +24,7 @@ use crate::link::LoreLinkChangeEventData;
 use crate::lore::Address;
 use crate::lore::BranchId;
 use crate::lore::Hash;
+use crate::lore::RepositoryId;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::node::Node;
@@ -48,6 +49,7 @@ use crate::state::State;
 use crate::state::StateNodeChildrenIterator;
 use crate::util::path::RelativePath;
 use crate::util::path::RelativePathBuf;
+use crate::util::url::same_server;
 
 pub async fn add(
     repository: Arc<RepositoryContext>,
@@ -78,36 +80,7 @@ pub async fn add(
             .into());
     }
 
-    // The identifier is a full URL or a bare name or ID, and only a scheme tells them apart:
-    // `is_valid_name` permits scoped names like `org/project`, so a slash says nothing about
-    // which form this is. A schemeless identifier names a repository on the same remote as
-    // this one, so resolve it against this repository's own configured remote rather than
-    // reading its first segment as a host. Taking the remote from the config also keeps the
-    // link and the repository pointing at the same server, which the environment variable
-    // this replaces could not guarantee.
-    let (remote_url, name) = if link_identifier.contains("://") {
-        repository::parse_url(&link_identifier, false).forward_with::<LinkError, _>(|| {
-            format!("Invalid repository URL or ID: {link_identifier}")
-        })?
-    } else {
-        let remote_url = repository
-            .require_path()
-            .ok()
-            .and_then(|path| repository::repository_remote(path.to_string_lossy()).ok())
-            .unwrap_or_default();
-        if remote_url.is_empty() {
-            return Err(LinkError::from(crate::errors::NoRemote));
-        }
-        (remote_url, link_identifier.clone())
-    };
-
-    let context = execution_context();
-    let identity = context.globals().identity().unwrap_or_default();
-    let repository_data = repository::resolve_by_name(&remote_url, &name, identity)
-        .await
-        .forward_with::<LinkError, _>(|| format!("Repository not found: {link_identifier}"))?;
-
-    let link = repository_data.id;
+    let link = resolve_identifier(&repository, link_identifier).await?;
 
     if link == repository.id {
         return Err(LinkError::internal(
@@ -490,6 +463,51 @@ pub async fn add(
     .send();
 
     Ok(())
+}
+
+/// The ID of the repository `link_identifier` names: a URL, or a bare name or ID.
+///
+/// Only a scheme tells a URL from a bare name or ID, since `is_valid_name` permits scoped names
+/// like `org/project`. Every link is fetched through this repository's remote, so the identifier
+/// is resolved there, and a URL naming another server is refused. Takes the identifier by value so
+/// that it is not held across the rest of [`add`].
+async fn resolve_identifier(
+    repository: &RepositoryContext,
+    link_identifier: String,
+) -> Result<RepositoryId, LinkError> {
+    let parent_remote = repository::load_repository_config_from_dot_dir(repository.dot_dir_path()?)
+        .forward::<LinkError>("reading the repository remote")?
+        .remote_url
+        .unwrap_or_default();
+    if parent_remote.is_empty() {
+        return Err(LinkError::from(crate::errors::NoRemote));
+    }
+    let url_name;
+    let name = if link_identifier.contains("://") {
+        let (remote_url, name) = repository::parse_url(&link_identifier, false)
+            .forward_with::<LinkError, _>(|| {
+                format!("Invalid repository URL or ID: {link_identifier}")
+            })?;
+        if !same_server(&remote_url, &parent_remote) {
+            return Err(InvalidArguments {
+                reason: format!(
+                    "{link_identifier} is not on this repository's remote ({parent_remote}); a link must be on the same remote"
+                ),
+            }
+            .into());
+        }
+        url_name = name;
+        &url_name
+    } else {
+        &link_identifier
+    };
+
+    let context = execution_context();
+    let identity = context.globals().identity().unwrap_or_default();
+    Ok(repository::resolve_by_name(&parent_remote, name, identity)
+        .await
+        .forward_with::<LinkError, _>(|| format!("Repository not found: {link_identifier}"))?
+        .id)
 }
 
 /// Creates the directory the link mounts at and the one holding it, and stages the intermediate

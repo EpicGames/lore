@@ -432,6 +432,15 @@ async fn close_idle(connection: Arc<Connection>, idle: Duration) {
     }
 }
 
+/// Parses a remote URL, taking [`DEFAULT_PROTOCOL`] as its scheme when it names none.
+pub fn parse_remote_url(remote_url: &str) -> Result<Url, url::ParseError> {
+    if remote_url.contains("://") {
+        Url::parse(remote_url)
+    } else {
+        Url::parse(&format!("{DEFAULT_PROTOCOL}://{remote_url}"))
+    }
+}
+
 pub fn parse(remote_url: &str) -> Result<(Url, Arc<dyn Protocol>), ProtocolError> {
     // A repository created without a remote URL has nothing to reach, which is a
     // configuration state rather than a fault: report it as `NoRemote` so callers can
@@ -440,16 +449,8 @@ pub fn parse(remote_url: &str) -> Result<(Url, Arc<dyn Protocol>), ProtocolError
         return Err(ProtocolError::from(lore_base::error::NoRemote));
     }
 
-    let mut remote_url = remote_url.to_string();
-    if !remote_url.contains("://") {
-        let mut full_url = DEFAULT_PROTOCOL.to_string();
-        full_url.push_str("://");
-        full_url.push_str(remote_url.as_str());
-        remote_url = full_url;
-    }
-
-    let parsed_url = url::Url::parse(remote_url.as_str())
-        .internal_with(|| format!("remote {remote_url} is invalid"))?;
+    let parsed_url =
+        parse_remote_url(remote_url).internal_with(|| format!("remote {remote_url} is invalid"))?;
 
     let protocol = parsed_url.scheme();
     let protocol = find(protocol)

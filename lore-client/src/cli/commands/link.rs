@@ -44,8 +44,8 @@ pub struct LinkAddArgs {
     #[clap(value_name = "link_path")]
     link_path: String,
 
-    /// Repository URL
-    #[clap(value_name = "link_url")]
+    /// Name, ID or URL of a repository on this repository's remote
+    #[clap(value_name = "repository")]
     link: String,
 
     /// Path in the link repository that should be linked in
