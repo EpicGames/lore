@@ -16,7 +16,10 @@ use super::Channel;
 use super::GRPCAuthRef;
 use super::grpc_retry;
 use super::handle_error;
+use super::handle_error_as;
 use crate::error::ProtocolError;
+use crate::error::RepositoryRenameError;
+use crate::error::repository_rename_error;
 use crate::types::MetadataSetResult;
 use crate::types::RepositoryData;
 
@@ -112,6 +115,30 @@ impl<I: Interceptor + Clone + Send + Sync + 'static> RepositoryService<I> {
         };
 
         Ok(())
+    }
+
+    /// Renames the repository `id` to `name`, mapping the remote's answer as
+    /// [`repository_rename_error`] does.
+    pub async fn rename(&self, id: RepositoryId, name: &str) -> Result<(), RepositoryRenameError> {
+        let mut retry = grpc_retry();
+        loop {
+            let request = repository_v1::RepositoryRenameRequest {
+                id: id.into(),
+                name: name.to_string(),
+            };
+
+            let mut client = self.client.clone();
+
+            match client.repository_rename(request).await {
+                Ok(_response) => return Ok(()),
+                Err(status) => {
+                    handle_error_as(&mut retry, status, |status| {
+                        repository_rename_error(status, id)
+                    })
+                    .await?;
+                }
+            }
+        }
     }
 
     pub async fn query(

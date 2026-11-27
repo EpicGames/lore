@@ -26,6 +26,7 @@ use lore::remote::message::write_stop;
 use lore::remote::message::write_stop_result;
 use lore::repository::LoreRepositoryDeleteArgs;
 use lore::repository::LoreRepositoryInstanceCloneArgs;
+use lore::repository::LoreRepositoryRenameArgs;
 use lore::repository::LoreRepositoryStatusArgs;
 use lore::revision_tree::add::LoreRevisionTreeAddArgs;
 use lore::revision_tree::add::LoreRevisionTreeAddEntry;
@@ -674,6 +675,23 @@ async fn repository_delete_survives_the_wire() {
     match relayed(LoreCommand::RepositoryDelete(args.clone())) {
         LoreCommand::RepositoryDelete(read_back) => {
             assert_eq!(read_back, args, "must carry the URL unchanged");
+        }
+        other => panic!("Unexpected command: {other:?}"),
+    }
+}
+
+/// A rename names its repository and its new name by text alone, so the service renames the
+/// repository the caller named to the name it gave only if both cross the wire unchanged.
+#[tokio::test]
+async fn repository_rename_survives_the_wire() {
+    let args = LoreRepositoryRenameArgs {
+        repository_url: LoreString::from_str("lore://127.0.0.1:41337/org/project"),
+        name: LoreString::from_str("org/renamed"),
+    };
+
+    match relayed(LoreCommand::RepositoryRename(args.clone())) {
+        LoreCommand::RepositoryRename(read_back) => {
+            assert_eq!(read_back, args, "must carry the URL and the name unchanged");
         }
         other => panic!("Unexpected command: {other:?}"),
     }

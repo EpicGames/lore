@@ -340,6 +340,19 @@ pub struct LinkPinsDiverge {
     pub mounts: String,
 }
 
+/// A repository rename the remote can have stopped after its checks passed, leaving the new name
+/// in place in part. The same rename of `repository` run again completes it, and a rename back to
+/// the old name abandons it. `repository` names the repository by its ID, as `<remote_url>/<id>`
+/// where the remote is known, since a lookup by the old name can already fail.
+#[derive(Debug, Clone, Error, FfiError)]
+#[error(
+    "The rename of repository {repository} may be incomplete; run the same rename of {repository} again to complete it, or rename it back to its old name"
+)]
+#[ffi_code(54)]
+pub struct RepositoryRenameIncomplete {
+    pub repository: String,
+}
+
 // ---------------------------------------------------------------------------
 // Already exists (56–63)
 //

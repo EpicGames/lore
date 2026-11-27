@@ -51,6 +51,7 @@ pub(crate) use lore_base::error::Oversized;
 pub(crate) use lore_base::error::PayloadNotFound;
 pub(crate) use lore_base::error::RepositoryAlreadyExists;
 pub(crate) use lore_base::error::RepositoryNotFound;
+pub(crate) use lore_base::error::RepositoryRenameIncomplete;
 pub(crate) use lore_base::error::RevisionNotFound;
 pub(crate) use lore_base::error::SharedStoreNotFound;
 pub(crate) use lore_base::error::SlowDown;

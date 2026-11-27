@@ -210,6 +210,11 @@ fn registry() -> Vec<(&'static str, Group, i32)> {
             .ffi_code(),
         ),
         (
+            "RepositoryRenameIncomplete",
+            Group::RepositoryState,
+            RepositoryRenameIncomplete { repository: text() }.ffi_code(),
+        ),
+        (
             "AlreadyLinked",
             Group::AlreadyExists,
             AlreadyLinked.ffi_code(),

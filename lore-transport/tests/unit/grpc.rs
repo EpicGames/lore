@@ -8,6 +8,7 @@ use lore_base::error::AddressNotFound;
 use lore_base::types::Hash;
 use lore_transport::error::ProtocolError;
 use lore_transport::error::branch_push_error;
+use lore_transport::error::repository_rename_error;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Status;
 use tonic::service::Routes;
@@ -351,6 +352,65 @@ fn an_unmarked_refusal_of_a_branch_push_is_internal() {
     let refused = branch_push_error(Status::failed_precondition("refused by a hook"));
 
     assert!(refused.is_internal(), "{refused:?}");
+}
+
+fn rename_error(status: Status) -> lore_transport::error::RepositoryRenameError {
+    repository_rename_error(status, lore_base::types::RepositoryId::default())
+}
+
+/// A remote without the rename RPC, or whose registry has no rename, answers `UNIMPLEMENTED`,
+/// which is `NotSupported`.
+#[test]
+fn an_unimplemented_rename_is_not_supported() {
+    let error = rename_error(Status::unimplemented("no rename"));
+
+    assert!(error.is_not_supported(), "{error:?}");
+}
+
+/// A name the remote refuses is `InvalidArguments`.
+#[test]
+fn a_refused_name_is_invalid_arguments() {
+    let error = rename_error(Status::invalid_argument("the name is reserved"));
+
+    assert!(error.is_invalid_arguments(), "{error:?}");
+}
+
+/// A rename the remote can have stopped after its checks passed, `ABORTED` for a concurrent
+/// change, `INTERNAL` for a failed store write, and `CANCELLED` or `DEADLINE_EXCEEDED` for a
+/// stopped handler, is `RepositoryRenameIncomplete`, naming the repository by its ID.
+#[test]
+fn a_rename_stopped_after_its_checks_is_incomplete() {
+    let id = lore_base::types::RepositoryId::from([7; 16]);
+    for status in [
+        Status::aborted("the name changed"),
+        Status::internal("store write failed"),
+        Status::cancelled("handler timeout"),
+        Status::deadline_exceeded("deadline"),
+    ] {
+        let error = repository_rename_error(status, id);
+
+        assert!(
+            matches!(
+                &error,
+                lore_transport::error::RepositoryRenameError::RepositoryRenameIncomplete(incomplete)
+                    if incomplete.repository == id.to_string()
+            ),
+            "{error:?}"
+        );
+    }
+}
+
+/// A rename refused before any change maps as any call's refusal does.
+#[test]
+fn a_refused_rename_maps_as_any_call() {
+    let missing = rename_error(Status::not_found("no such repository"));
+    let denied = rename_error(Status::permission_denied("not an administrator"));
+    let unavailable = rename_error(Status::unavailable("restarting"));
+
+    assert!(
+        missing.is_not_found() && denied.is_not_authorized() && unavailable.is_disconnected(),
+        "{missing:?}; {denied:?}; {unavailable:?}"
+    );
 }
 
 /// Details of any other length are not guessed at.

@@ -2065,6 +2065,15 @@ class Lore:
             library_path, "repository-delete", self.path, self.remote_path
         )
 
+    def repository_rename_capi(
+        self, library_path: str, name: str, repository_url: str = ""
+    ) -> int:
+        """Rename a repository through the public C API, returning the FFI code.
+        `repository_url` empty renames the repository of this instance."""
+        return self._capi_driver(
+            library_path, "repository-rename", self.path, repository_url, name
+        )
+
     def revision_sync_capi(self, library_path: str, view: str = "") -> int:
         """Sync through the public C API, returning the FFI code.
 

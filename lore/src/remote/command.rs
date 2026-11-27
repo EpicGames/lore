@@ -196,4 +196,5 @@ pub enum LoreCommand {
     BranchMergeConflictsList(crate::branch::LoreBranchMergeConflictsListArgs),
     ServiceSetExternalDirectory(crate::service::LoreServiceSetExternalDirectoryArgs),
     RevisionGraphBranchPush(crate::revision_graph::branch_push::LoreRevisionGraphBranchPushArgs),
+    RepositoryRename(crate::repository::LoreRepositoryRenameArgs),
 }

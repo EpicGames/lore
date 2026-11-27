@@ -3,6 +3,7 @@
 use std::convert::Infallible;
 
 use lore_base::error::*;
+use lore_base::types::RepositoryId;
 use lore_error_set::prelude::*;
 
 use crate::grpc::address_not_found_details;
@@ -45,6 +46,82 @@ impl From<ProtocolError> for BranchPushError {
     fn from(err: ProtocolError) -> Self {
         let Err(err) = Err::<Infallible, _>(err).forward::<Self>("pushing a branch");
         err
+    }
+}
+
+/// The failures of a repository rename at the remote: those of any call, a name the remote
+/// refuses, and a rename the remote can have stopped after its checks passed.
+#[error_set(clone)]
+pub enum RepositoryRenameError {
+    Disconnected,
+    SlowDown,
+    NotAuthorized,
+    NotAuthenticated,
+    Maintenance,
+    NotFound,
+    AddressNotFound,
+    NoRemote,
+    NotSupported,
+    Oversized,
+    InvalidArguments,
+    RepositoryRenameIncomplete,
+}
+
+impl From<ProtocolError> for RepositoryRenameError {
+    #[track_caller]
+    fn from(err: ProtocolError) -> Self {
+        let Err(err) = Err::<Infallible, _>(err).forward::<Self>("renaming a repository");
+        err
+    }
+}
+
+/// The error of the rename of `repository` that the remote answered with `status`.
+///
+/// `UNIMPLEMENTED` is a remote that cannot rename repositories: a server without the RPC, or one
+/// whose registry has no rename. `INVALID_ARGUMENT` is a name the server or its registry refuses.
+///
+/// `ABORTED`, `INTERNAL`, `CANCELLED` and `DEADLINE_EXCEEDED` are `RepositoryRenameIncomplete`,
+/// as *Order of a rename* and *Failure after the registry accepted* in the repository rename LEP
+/// (`docs/proposals/2026-11-19-repository-rename.md`) describe. Once the registry has accepted, a
+/// rename fails when a concurrent operation changed what the checks read, which is `ABORTED`,
+/// when a store fails, which is `INTERNAL`, or when the handler is stopped, which is `CANCELLED`
+/// or `DEADLINE_EXCEEDED`. Each can leave the new name in place in part, and the same rename, run
+/// again, completes it, except an `ABORTED` because another repository took the name: the
+/// registry holds the name, the repeat is refused, and a rename back to the old name abandons
+/// the rename. They are read the same way before the registry, where a repeat is safe too. The
+/// server answers `INTERNAL` when it cannot reach the registry, before any change.
+///
+/// `UNAVAILABLE`, `UNKNOWN` and `RESOURCE_EXHAUSTED` can also follow the registry's acceptance.
+/// After `UNAVAILABLE` or `UNKNOWN` the client reconnects and sends the rename again. They surface
+/// as `Disconnected` when the reconnect fails or the reconnects run out. `RESOURCE_EXHAUSTED` is
+/// retried before it surfaces as `SlowDown`.
+///
+/// Every other status is a refusal before any change, and maps as any call's does.
+#[lore_macro::test_pub]
+pub(crate) fn repository_rename_error(
+    status: tonic::Status,
+    repository: RepositoryId,
+) -> RepositoryRenameError {
+    match status.code() {
+        tonic::Code::Unimplemented => with_remote_reason(
+            RepositoryRenameError::from(NotSupported {
+                operation: "the remote cannot rename repositories".to_string(),
+            }),
+            &status,
+        ),
+        tonic::Code::InvalidArgument => RepositoryRenameError::from(InvalidArguments {
+            reason: status.message().to_string(),
+        }),
+        tonic::Code::Aborted
+        | tonic::Code::Internal
+        | tonic::Code::Cancelled
+        | tonic::Code::DeadlineExceeded => with_remote_reason(
+            RepositoryRenameError::from(RepositoryRenameIncomplete {
+                repository: repository.to_string(),
+            }),
+            &status,
+        ),
+        _ => RepositoryRenameError::from(ProtocolError::from(status)),
     }
 }
 

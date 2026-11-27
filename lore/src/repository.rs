@@ -735,6 +735,58 @@ fn delete_local(
     })
 }
 
+/// Arguments for renaming a remote repository.
+#[repr(C)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
+#[handler(rename_local)]
+pub struct LoreRepositoryRenameArgs {
+    /// URL of the remote repository to rename, or a name or ID resolved against the remote of
+    /// the repository at `repository_path`. Empty renames the repository of the instance at
+    /// `repository_path`.
+    pub repository_url: LoreString,
+    /// The new name of the repository.
+    pub name: LoreString,
+}
+
+/// Renames a remote repository. Its ID does not change.
+///
+/// # Events
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
+pub fn rename(
+    globals: LoreGlobalArgs,
+    args: LoreRepositoryRenameArgs,
+    callback: LoreEventCallback,
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, rename_local)
+}
+
+fn rename_local(
+    globals: LoreGlobalArgs,
+    args: LoreRepositoryRenameArgs,
+    callback: LoreEventCallback,
+) -> impl Future<Output = i32> {
+    no_repository_call(globals, callback, args, rename, |args| async move {
+        repository::rename::rename(
+            (&args.repository_url).into(),
+            args.name.as_str(),
+            execution_context().globals().identity().unwrap_or_default(),
+        )
+        .await
+    })
+}
+
 /// Arguments for releasing cached store references for the repository path.
 #[repr(C)]
 #[derive(

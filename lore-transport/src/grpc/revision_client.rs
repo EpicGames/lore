@@ -21,10 +21,11 @@ use super::GRPCAuthRef;
 use super::REVISION_LIST_STRATEGY_HEADER;
 use super::RequestScopedCounter;
 use super::grpc_retry;
-use super::handle_branch_push_error;
 use super::handle_error;
+use super::handle_error_as;
 use crate::error::BranchPushError;
 use crate::error::ProtocolError;
+use crate::error::branch_push_error;
 use crate::types::BranchListResponse;
 use crate::types::BranchPushResponse;
 use crate::types::BranchQueryResponse;
@@ -258,7 +259,7 @@ impl RevisionService {
                 Ok(response) => {
                     break response.into_inner();
                 }
-                Err(status) => handle_branch_push_error(&mut retry, status).await?,
+                Err(status) => handle_error_as(&mut retry, status, branch_push_error).await?,
             }
         };
 

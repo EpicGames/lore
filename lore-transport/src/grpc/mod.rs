@@ -65,6 +65,7 @@ use crate::connection::SuppliedCredentials;
 use crate::connection::authenticates_server;
 use crate::error::BranchPushError;
 use crate::error::ProtocolError;
+use crate::error::RepositoryRenameError;
 use crate::tls::grpc_client_tls_config;
 use crate::traits::*;
 use crate::types::*;
@@ -846,16 +847,18 @@ async fn handle_error(retry: &mut crate::util::Retry, status: Status) -> Result<
     Ok(())
 }
 
-/// [`handle_error`] for a branch push, whose statuses map as
-/// [`branch_push_error`](crate::error::branch_push_error) maps them.
-pub(crate) async fn handle_branch_push_error(
+/// [`handle_error`] for a call whose other statuses `map` maps, such as
+/// [`branch_push_error`](crate::error::branch_push_error) for a branch push. `RESOURCE_EXHAUSTED`
+/// is retried, and once the retries run out maps as for any call.
+pub(crate) async fn handle_error_as<E: From<ProtocolError>>(
     retry: &mut crate::util::Retry,
     status: Status,
-) -> Result<(), BranchPushError> {
+    map: impl FnOnce(Status) -> E,
+) -> Result<(), E> {
     if status.code() == tonic::Code::ResourceExhausted {
         return Ok(handle_error(retry, status).await?);
     }
-    Err(crate::error::branch_push_error(status))
+    Err(map(status))
 }
 
 #[allow(clippy::unused_async)]
@@ -1242,6 +1245,12 @@ impl Disconnects for ProtocolError {
 }
 
 impl Disconnects for BranchPushError {
+    fn disconnected(&self) -> bool {
+        self.is_disconnected()
+    }
+}
+
+impl Disconnects for RepositoryRenameError {
     fn disconnected(&self) -> bool {
         self.is_disconnected()
     }
@@ -1735,6 +1744,20 @@ impl Repository for GRPCRepository {
                 match self.partition_client(id).await {
                     Some(client) => client.delete(id).await,
                     None => self.client.read().await.delete(id).await,
+                }
+            },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
+    }
+
+    async fn rename(&self, id: RepositoryId, name: &str) -> Result<(), RepositoryRenameError> {
+        with_reconnect(
+            &self.connection,
+            || async {
+                match self.partition_client(id).await {
+                    Some(client) => client.rename(id, name).await,
+                    None => self.client.read().await.rename(id, name).await,
                 }
             },
             |reconnect_id| self.reconnect(reconnect_id),

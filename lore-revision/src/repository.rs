@@ -12,6 +12,8 @@ pub mod dump;
 pub mod info;
 pub mod list;
 pub mod prefetch;
+pub mod reference;
+pub mod rename;
 pub mod status;
 pub mod store;
 pub mod verify;

@@ -15,6 +15,7 @@ Run as a script, this module is the driver a test invokes as a subprocess:
     python lore_ffi.py service-stop <library-path>
     python lore_ffi.py service-status <library-path>
     python lore_ffi.py repository-delete <library-path> <repository-path> <repository-url>
+    python lore_ffi.py repository-rename <library-path> <repository-path> <repository-url> <name>
     python lore_ffi.py revision-sync <library-path> <repository-path> <view-file>
     python lore_ffi.py revision-bisect <library-path> <repository-path> <start> <end> <keep-store-alive-seconds>
     python lore_ffi.py file-audit <library-path> <repository-path> <path>
@@ -189,6 +190,13 @@ class LoreRepositoryDeleteArgs(Structure):
     _fields_ = [("repository_url", LoreString)]
 
 
+class LoreRepositoryRenameArgs(Structure):
+    """`lore_repository_rename_args_t`. `repository_url` empty renames the
+    repository of the instance at the call's repository path."""
+
+    _fields_ = [("repository_url", LoreString), ("name", LoreString)]
+
+
 class LoreRevisionSyncArgs(Structure):
     """`lore_revision_sync_args_t`. `view` names the view filter file the
     working tree is left materialized under, empty to keep the instance's own."""
@@ -341,6 +349,7 @@ MIRRORED_STRUCTS = [
     ("lore_service_stop_args_t", LoreServiceStopArgs),
     ("lore_service_status_args_t", LoreServiceStatusArgs),
     ("lore_repository_delete_args_t", LoreRepositoryDeleteArgs),
+    ("lore_repository_rename_args_t", LoreRepositoryRenameArgs),
     ("lore_revision_sync_args_t", LoreRevisionSyncArgs),
     ("lore_revision_bisect_args_t", LoreRevisionBisectArgs),
     ("lore_trace_location_array_t", LoreTraceLocationArray),
@@ -468,6 +477,12 @@ class LoreLibrary:
             POINTER(LoreRepositoryDeleteArgs),
             LoreEventCallbackConfig,
         ]
+        self._lib.lore_repository_rename.restype = c_int32
+        self._lib.lore_repository_rename.argtypes = [
+            POINTER(LoreGlobalArgs),
+            POINTER(LoreRepositoryRenameArgs),
+            LoreEventCallbackConfig,
+        ]
         self._lib.lore_revision_sync.restype = c_int32
         self._lib.lore_revision_sync.argtypes = [
             POINTER(LoreGlobalArgs),
@@ -581,6 +596,31 @@ class LoreLibrary:
         args = LoreRepositoryDeleteArgs(LoreString(url_bytes, len(url_bytes)))
 
         return self._lib.lore_repository_delete(
+            ctypes.byref(globals_args),
+            ctypes.byref(args),
+            LoreEventCallbackConfig(0, None),
+        )
+
+    def repository_rename(
+        self, repository_path: str, repository_url: str, name: str
+    ) -> int:
+        """Call `lore_repository_rename` for `repository_url`, empty for the
+        repository of the instance at `repository_path`, returning its FFI
+        code."""
+        # Encoded buffers must outlive the call; keep references on the stack.
+        path_bytes = repository_path.encode()
+        url_bytes = repository_url.encode()
+        name_bytes = name.encode()
+
+        globals_args = LoreGlobalArgs()
+        globals_args.repository_path = LoreString(path_bytes, len(path_bytes))
+
+        args = LoreRepositoryRenameArgs(
+            LoreString(url_bytes, len(url_bytes)),
+            LoreString(name_bytes, len(name_bytes)),
+        )
+
+        return self._lib.lore_repository_rename(
             ctypes.byref(globals_args),
             ctypes.byref(args),
             LoreEventCallbackConfig(0, None),
@@ -751,6 +791,7 @@ USAGE = """usage:
   lore_ffi.py service-status <library-path>
   lore_ffi.py revision-sync <library-path> <repository-path> <view-file>
   lore_ffi.py repository-delete <library-path> <repository-path> <repository-url>
+  lore_ffi.py repository-rename <library-path> <repository-path> <repository-url> <name>
   lore_ffi.py revision-sync <library-path> <repository-path> <view-file>
   lore_ffi.py revision-bisect <library-path> <repository-path> <start> <end> <keep-store-alive-seconds>
   lore_ffi.py file-audit <library-path> <repository-path> <path>
@@ -775,6 +816,16 @@ def main(argv: list[str]) -> int:
         case ["repository-delete", library_path, repository_path, repository_url]:
             return LoreLibrary(library_path).repository_delete(
                 repository_path, repository_url
+            )
+        case [
+            "repository-rename",
+            library_path,
+            repository_path,
+            repository_url,
+            name,
+        ]:
+            return LoreLibrary(library_path).repository_rename(
+                repository_path, repository_url, name
             )
         case ["revision-sync", library_path, repository_path, view]:
             return LoreLibrary(library_path).revision_sync(repository_path, view)

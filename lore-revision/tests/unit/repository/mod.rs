@@ -11,6 +11,7 @@ mod name_validation_tests;
 mod path_optional_tests;
 mod prefetch;
 mod remote_state_tests;
+mod rename_tests;
 mod repository_lock_tests;
 mod root_text_tests;
 mod status;

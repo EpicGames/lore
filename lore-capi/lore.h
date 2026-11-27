@@ -5574,6 +5574,16 @@ typedef struct lore_repository_delete_args_t {
   struct lore_string_t repository_url;
 } lore_repository_delete_args_t;
 
+// Arguments for renaming a remote repository.
+typedef struct lore_repository_rename_args_t {
+  // URL of the remote repository to rename, or a name or ID resolved against the remote of
+  // the repository at `repository_path`. Empty renames the repository of the instance at
+  // `repository_path`.
+  struct lore_string_t repository_url;
+  // The new name of the repository.
+  struct lore_string_t name;
+} lore_repository_rename_args_t;
+
 // Arguments for waiting on outstanding asynchronous repository tasks.
 typedef struct lore_repository_flush_args_t {
   int _unused;
@@ -10799,6 +10809,62 @@ int32_t lore_repository_delete(const struct lore_global_args_t *globals,
 // | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
 void lore_repository_delete_async(const struct lore_global_args_t *globals,
                                   const struct lore_repository_delete_args_t *args,
+                                  struct lore_event_callback_config_t callback);
+
+// Rename a Lore repository on the remote server to `name` in `lore_repository_rename_args_t`.
+// The repository keeps its ID.
+//
+// `repository_url` is a URL, or a repository name or ID on the remote of the repository at
+// `repository_path` in `lore_global_args_t`. An ID is sent as is. When `repository_url` is
+// empty, the call renames the repository of the instance at `repository_path`.
+//
+// On failure, `status` is error code 9 (not supported) when the remote cannot rename
+// repositories, and error code 54 (rename incomplete) when the remote can have stopped the
+// rename after its checks passed. Error codes 28 (disconnected) and 31 (slow down) can also
+// follow a rename the remote started. The same rename, made again, completes it, and a rename
+// back to the old name abandons it. A repeat that fails because another repository holds the
+// new name is abandoned in the same way, by a rename back to the old name. Make the repeat by URL and ID, `<remote_url>/<id>`, which
+// the message of error code 54 names: a repeat by the old name can fail, since the remote can
+// already have released that name. A caller that must repeat without reading the message
+// addresses the repository by URL and ID from the start, as `lore_repository_info` reports
+// them.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+int32_t lore_repository_rename(const struct lore_global_args_t *globals,
+                               const struct lore_repository_rename_args_t *args,
+                               struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_repository_rename`.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+void lore_repository_rename_async(const struct lore_global_args_t *globals,
+                                  const struct lore_repository_rename_args_t *args,
                                   struct lore_event_callback_config_t callback);
 
 // Flush pending repository state to persistent storage.

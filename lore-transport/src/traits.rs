@@ -12,6 +12,7 @@ use crate::connection::Connection;
 use crate::connection::SuppliedCredentials;
 use crate::error::BranchPushError;
 use crate::error::ProtocolError;
+use crate::error::RepositoryRenameError;
 use crate::quic::client::CongestionAlgorithm;
 use crate::types::*;
 
@@ -383,6 +384,9 @@ pub trait Repository: Send + Sync {
 
     /// Delete a repository
     async fn delete(&self, id: RepositoryId) -> Result<(), ProtocolError>;
+
+    /// Rename the repository `id` to `name`. Its ID does not change.
+    async fn rename(&self, id: RepositoryId, name: &str) -> Result<(), RepositoryRenameError>;
 
     /// Get repository metadata from id or name
     async fn query(

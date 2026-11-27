@@ -4450,6 +4450,74 @@ pub extern "C" fn lore_repository_delete_async(
     run_asynchronously(globals, args, callback, dispatch_command);
 }
 
+pub type LoreRepositoryRenameArgs = crate::repository::LoreRepositoryRenameArgs;
+
+/// Rename a Lore repository on the remote server to `name` in `lore_repository_rename_args_t`.
+/// The repository keeps its ID.
+///
+/// `repository_url` is a URL, or a repository name or ID on the remote of the repository at
+/// `repository_path` in `lore_global_args_t`. An ID is sent as is. When `repository_url` is
+/// empty, the call renames the repository of the instance at `repository_path`.
+///
+/// On failure, `status` is error code 9 (not supported) when the remote cannot rename
+/// repositories, and error code 54 (rename incomplete) when the remote can have stopped the
+/// rename after its checks passed. Error codes 28 (disconnected) and 31 (slow down) can also
+/// follow a rename the remote started. The same rename, made again, completes it, and a rename
+/// back to the old name abandons it. A repeat that fails because another repository holds the
+/// new name is abandoned in the same way, by a rename back to the old name. Make the repeat by URL and ID, `<remote_url>/<id>`, which
+/// the message of error code 54 names: a repeat by the old name can fail, since the remote can
+/// already have released that name. A caller that must repeat without reading the message
+/// addresses the repository by URL and ID from the start, as `lore_repository_info` reports
+/// them.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_repository_rename(
+    globals: &LoreGlobalArgs,
+    args: &LoreRepositoryRenameArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, run_command)
+}
+
+/// Asynchronous version of `lore_repository_rename`.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_repository_rename_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRepositoryRenameArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, dispatch_command);
+}
+
 pub type LoreRepositoryFlushArgs = crate::repository::LoreRepositoryFlushArgs;
 
 /// Flush pending repository state to persistent storage.
