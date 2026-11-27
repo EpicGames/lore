@@ -5,6 +5,7 @@ use std::fmt;
 use lore_base::types::RepositoryId;
 use lore_proto::lore::error::v1::ErrorReason;
 use lore_proto::lore::user::v1::RepositoryRegisterRequest;
+use lore_proto::lore::user::v1::RepositoryRenameRequest;
 use lore_proto::lore::user::v1::RepositoryUnregisterRequest;
 use lore_proto::rebac::CreateResourceRequest;
 use lore_proto::rebac::DeleteResourceRequest;
@@ -21,15 +22,16 @@ use super::rebac::grpc_get_rebac_client;
 use crate::grpc::ServerResultExt;
 use crate::grpc::warn_error_to_status;
 
-/// Where the server registers the repositories it creates and deletes, so
-/// that the directory answering the repository catalog learns of them.
+/// Where the server registers the repositories it creates, renames and
+/// deletes, so that the directory answering the repository catalog learns of
+/// them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RepositoryRegistry {
     Unregistered,
     /// `RebacApi.CreateResource` / `DeleteResource` at this `auth_url`.
     AuthService(String),
     /// `lore.user.v1.RepositoryRegistryService.RepositoryRegister` /
-    /// `RepositoryUnregister` at this `user_url`.
+    /// `RepositoryUnregister` / `RepositoryRename` at this `user_url`.
     UserService(String),
 }
 
@@ -134,6 +136,40 @@ impl RepositoryRegistry {
                 remove_outcome(
                     client.repository_unregister(request).await.map(drop),
                     "repository registry RepositoryUnregister",
+                )
+            }
+        }
+    }
+
+    /// Records the new name of a repository the server is renaming. Called
+    /// before the server changes the name, so a refusal leaves the name
+    /// unchanged. With `AuthService`, answers `UNIMPLEMENTED` without a call:
+    /// `RebacApi` has no rename operation.
+    pub async fn rename(
+        &self,
+        authorization: Option<String>,
+        repository_id: RepositoryId,
+        name: &str,
+    ) -> Result<(), Status> {
+        match self {
+            Self::Unregistered => Ok(()),
+            Self::AuthService(_) => Err(Status::unimplemented(
+                "The repository registry RebacApi cannot rename repositories",
+            )),
+            Self::UserService(user_url) => {
+                info!(requested_repo_id = %repository_id, requested_name = name, "Repository rename");
+                let mut client = grpc_get_repository_registry_client(user_url).await?;
+                let request = create_request_with_authorization(
+                    RepositoryRenameRequest {
+                        id: repository_id.into(),
+                        name: name.to_string(),
+                    },
+                    authorization,
+                )?;
+                rename_outcome(
+                    client.repository_rename(request).await.map(drop),
+                    repository_id,
+                    name,
                 )
             }
         }
@@ -257,4 +293,60 @@ fn remove_outcome(result: Result<(), Status>, rpc: &str) -> Result<(), Status> {
         }
         _ => Status::internal(format!("Failed to call {rpc}: {err}")),
     })
+}
+
+/// What the registry's answer to `RepositoryRename` means for the rename.
+/// `PERMISSION_DENIED`, `UNAUTHENTICATED`, `NOT_FOUND` and an
+/// `INVALID_ARGUMENT` naming `name` map to the codes they map to for a create.
+#[lore_macro::test_pub]
+fn rename_outcome(
+    result: Result<(), Status>,
+    repository_id: RepositoryId,
+    name: &str,
+) -> Result<(), Status> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) if err.code() == Code::AlreadyExists => {
+            info!(registry_error = ?err, requested_repo_id = %repository_id, requested_name = name, "Repository rename refused - name not allowed");
+            Err(Status::already_exists(format!(
+                "The repository registry does not allow the name {name} for repository {repository_id}"
+            )))
+        }
+        Err(err) if err.code() == Code::PermissionDenied => {
+            info!(registry_error = ?err, "Repository rename failed - permission denied");
+            Err(Status::permission_denied(
+                "Failed to rename repository, permission denied",
+            ))
+        }
+        Err(err) if err.code() == Code::Unauthenticated => {
+            info!(registry_error = ?err, "Repository rename failed - unauthenticated");
+            Err(Status::unauthenticated(
+                "Failed to rename repository, reauthenticate",
+            ))
+        }
+        Err(err) if err.code() == Code::NotFound => {
+            info!(registry_error = ?err, requested_repo_id = %repository_id, "Repository rename failed - unknown to the registry");
+            Err(Status::failed_precondition(format!(
+                "The repository registry does not know repository {repository_id}"
+            )))
+        }
+        Err(err) if err.code() == Code::Unimplemented => {
+            info!(registry_error = ?err, "Repository rename failed - registry has no rename");
+            Err(Status::unimplemented(
+                "The repository registry cannot rename repositories",
+            ))
+        }
+        Err(err) if is_invalid_name(&err, "name") => {
+            info!(registry_error = ?err, requested_name = name, "Repository rename failed - invalid name");
+            Err(Status::invalid_argument(format!(
+                "Invalid repository name: {}",
+                err.message()
+            )))
+        }
+        Err(err) => Err(warn_error_to_status(&err, |err| {
+            Status::internal(format!(
+                "Failed to call repository registry RepositoryRename: {err}"
+            ))
+        })),
+    }
 }

@@ -97,7 +97,7 @@ The request addresses the repository by ID, as `RepositoryDelete` does, because 
 | `ABORTED` | A concurrent operation changed the repository's name or took the new name after the checks passed. |
 | `FAILED_PRECONDITION` | The registry does not know the repository. |
 | `UNIMPLEMENTED` | The registry has no rename operation. |
-| `UNAVAILABLE` | The server cannot reach the registry. |
+| `INTERNAL` | The server cannot reach the registry, as for create and delete. |
 
 A new RPC is added to `RepositoryRegistryService`, next to `RepositoryRegister` and `RepositoryUnregister`:
 

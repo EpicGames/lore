@@ -206,6 +206,33 @@ fn remove_outcome_maps_the_unregistration_status() {
     }
 }
 
+#[test]
+fn rename_outcome_maps_the_registry_status() {
+    let outcome = |status: Status| rename_outcome(Err(status), repository(), "org/renamed");
+    rename_outcome(Ok(()), repository(), "org/renamed").expect("OK continues the rename");
+    let cases = [
+        (Status::permission_denied(""), Code::PermissionDenied),
+        (Status::unauthenticated(""), Code::Unauthenticated),
+        (Status::already_exists(""), Code::AlreadyExists),
+        (Status::not_found(""), Code::FailedPrecondition),
+        (Status::unimplemented(""), Code::Unimplemented),
+        (invalid_name("name", "bad name"), Code::InvalidArgument),
+        (Status::invalid_argument("bad name"), Code::Internal),
+        (invalid_name("id", "bad id"), Code::Internal),
+        (Status::aborted(""), Code::Internal),
+    ];
+    for (status, expected) in cases {
+        let answer = status.code();
+        assert_eq!(outcome(status).unwrap_err().code(), expected, "{answer:?}");
+    }
+
+    let err = outcome(invalid_name("name", "must be <org>/<repo>")).unwrap_err();
+    assert_eq!(
+        err.message(),
+        "Invalid repository name: must be <org>/<repo>"
+    );
+}
+
 #[tokio::test]
 async fn unregistered_sends_nothing() {
     RepositoryRegistry::Unregistered
@@ -216,16 +243,21 @@ async fn unregistered_sends_nothing() {
         .remove(None, repository())
         .await
         .expect("nothing to unregister from");
+    RepositoryRegistry::Unregistered
+        .rename(None, repository(), "org/renamed")
+        .await
+        .expect("nothing to rename in");
 }
 
-/// Records `RepositoryRegister` and `RepositoryUnregister` requests with
-/// their `authorization` header, answering each with `status`, `OK` when
-/// `None`.
+/// Records `RepositoryRegister`, `RepositoryUnregister` and
+/// `RepositoryRename` requests with their `authorization` header, answering
+/// each with `status`, `OK` when `None`.
 #[derive(Default)]
 struct Registry {
     status: Option<Status>,
     registers: Mutex<Vec<(RepositoryRegisterRequest, Option<String>)>>,
     unregisters: Mutex<Vec<(RepositoryUnregisterRequest, Option<String>)>>,
+    renames: Mutex<Vec<(RepositoryRenameRequest, Option<String>)>>,
 }
 
 fn authorization<T>(request: &tonic::Request<T>) -> Option<String> {
@@ -281,9 +313,14 @@ impl RepositoryRegistryService for Registry {
 
     async fn repository_rename(
         &self,
-        _request: tonic::Request<RepositoryRenameRequest>,
+        request: tonic::Request<RepositoryRenameRequest>,
     ) -> Result<tonic::Response<RepositoryRenameResponse>, Status> {
-        Err(Status::unimplemented("not under test"))
+        let authorization = authorization(&request);
+        self.renames
+            .lock()
+            .unwrap()
+            .push((request.into_inner(), authorization));
+        self.answer()
     }
 }
 
@@ -522,4 +559,74 @@ mod repository_create_auth_resource_tests {
         );
         assert!(error.message().contains("You used my api wrong!"),);
     }
+}
+
+/// The registry is sent the repository id bytes and the new name, under the
+/// caller's token.
+#[tokio::test]
+async fn user_service_renames_the_repository() {
+    let (registry, stub) = serve(None).await;
+    let bearer = Some("Bearer caller".to_string());
+
+    registry
+        .rename(bearer.clone(), repository(), "org/renamed")
+        .await
+        .expect("the registry renames the repository");
+
+    let expected_id: bytes::Bytes = repository().into();
+    let renames = stub.renames.lock().unwrap();
+    let [(rename, rename_authorization)] = renames.as_slice() else {
+        panic!("one RepositoryRename, got {}", renames.len());
+    };
+    assert_eq!(rename.id, expected_id);
+    assert_eq!(rename.name, "org/renamed");
+    assert_eq!(rename_authorization, &bearer);
+}
+
+/// The registry's refusal reaches `rename_outcome`, its `ErrorInfo` included.
+/// `UNIMPLEMENTED` shows the answer goes through `rename_outcome`, not
+/// `add_outcome`.
+#[tokio::test]
+async fn user_service_rename_refusals_map_to_lore_statuses() {
+    for (answer, expected) in [
+        (Status::unimplemented(""), Code::Unimplemented),
+        (
+            invalid_name("name", "must be <org>/<repo>"),
+            Code::InvalidArgument,
+        ),
+    ] {
+        let code = answer.code();
+        let (registry, _stub) = serve(Some(answer)).await;
+        let err = registry
+            .rename(None, repository(), "org/renamed")
+            .await
+            .expect_err("the registry refuses the rename");
+        assert_eq!(err.code(), expected, "rename answered {code:?}");
+    }
+}
+
+/// `RebacApi` has no rename: the server refuses without connecting to it.
+#[tokio::test]
+async fn auth_service_rename_is_unimplemented_without_a_call() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let registry = RepositoryRegistry::AuthService(format!("http://{address}"));
+
+    let rename = registry.rename(
+        Some("Bearer caller".to_string()),
+        repository(),
+        "org/renamed",
+    );
+    let err = tokio::time::timeout(std::time::Duration::from_secs(10), rename)
+        .await
+        .expect("rename answers without waiting on RebacApi")
+        .expect_err("RebacApi cannot rename");
+    assert_eq!(err.code(), Code::Unimplemented);
+    let accepted = listener.accept().map(drop).unwrap_err();
+    assert_eq!(
+        accepted.kind(),
+        std::io::ErrorKind::WouldBlock,
+        "rename connected to RebacApi"
+    );
 }
