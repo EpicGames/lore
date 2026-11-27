@@ -128,6 +128,7 @@ pub async fn handler(
                 creator,
                 created,
                 stack,
+                None,
                 BranchWriteFollowUp {
                     notification_sender,
                     hook_dispatcher: hook_dispatcher.clone(),

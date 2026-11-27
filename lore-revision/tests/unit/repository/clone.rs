@@ -1289,6 +1289,7 @@ async fn a_clone_leaves_a_name_another_branch_holds() {
                 "creator",
                 1,
                 Vec::new(),
+                None,
                 Hash::from([4; 32]),
                 branch::BranchLatestStatus::Divergent,
                 BranchId::default(),

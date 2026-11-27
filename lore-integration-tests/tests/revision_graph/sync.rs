@@ -786,6 +786,7 @@ async fn a_local_walk_that_runs_out_of_revisions_fails_revision_not_found_withou
         CREATOR,
         lore_revision::util::time::timestamp(),
         Vec::new(),
+        None,
         previous,
         BranchLatestStatus::Divergent,
         Context::default(),

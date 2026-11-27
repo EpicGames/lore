@@ -49,15 +49,18 @@ pub const READ_ONLY_KEYS: &[&str] = &[
     branch::STACK,
     branch::PARENT_DEPRECATED,
     branch::BRANCH_POINT_DEPRECATED,
+    branch::SCOPE,
 ];
 
-/// The read-only keys archives and restores write, which no metadata write may add either: they
-/// decide what a later archive or restore of the branch does.
-pub const ARCHIVE_KEYS: &[&str] = &[
+/// The read-only keys no metadata write may add either: those archives and restores write, which
+/// decide what a later archive or restore of the branch does, and the branch's scope, which only
+/// its creation writes.
+pub const NEVER_ADDED_KEYS: &[&str] = &[
     branch::RESTORED,
     branch::ARCHIVED,
     branch::RESTORING,
     branch::RELEASED,
+    branch::SCOPE,
 ];
 
 /// All built-in keys. These cannot be removed via clear, but `protect` can be overwritten
@@ -76,6 +79,7 @@ pub const BUILT_IN_KEYS: &[&str] = &[
     branch::STACK,
     branch::PARENT_DEPRECATED,
     branch::BRANCH_POINT_DEPRECATED,
+    branch::SCOPE,
 ];
 
 #[error_set]

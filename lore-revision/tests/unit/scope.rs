@@ -59,6 +59,13 @@ async fn by_id(repository: &Arc<RepositoryContext>, byte: u8) -> Option<Scope> {
         .expect("reading a scope by id")
 }
 
+/// Whether scope `byte` of `repository` is live.
+async fn is_live(repository: &Arc<RepositoryContext>, byte: u8) -> bool {
+    scope::is_live(repository.clone(), scope_id(byte))
+        .await
+        .expect("reading whether a scope is live")
+}
+
 /// The live scope `byte` named `name`, as a create by `creator` at 7 makes it.
 fn live(byte: u8, name: &str) -> Scope {
     Scope {
@@ -236,6 +243,11 @@ async fn the_default_scope_is_answered_without_a_store_read() {
             scope::get(repository.clone(), default.id).await.unwrap(),
             Some(default.clone())
         );
+        assert!(
+            scope::is_live(repository.clone(), default.id)
+                .await
+                .unwrap()
+        );
         for name in ["default", "DEFAULT"] {
             assert_eq!(
                 scope::get_by_name(repository.clone(), name).await.unwrap(),
@@ -382,6 +394,23 @@ async fn an_archive_removes_the_name_and_keeps_the_record() {
             create(&repository, 2, "release").await.unwrap(),
             live(2, "release")
         );
+    })
+    .await;
+}
+
+/// A scope is live from its create until its archive, and a scope without metadata isn't.
+#[tokio::test]
+async fn a_scope_is_live_until_it_is_archived() {
+    scoped(async {
+        let repository = null_repository().await;
+        assert!(!is_live(&repository, 1).await, "a scope without metadata");
+        create(&repository, 1, "release").await.unwrap();
+        assert!(is_live(&repository, 1).await, "a created scope");
+        scope::archive(repository.clone(), scope_id(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!is_live(&repository, 1).await, "an archived scope");
     })
     .await;
 }

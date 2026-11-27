@@ -89,7 +89,7 @@ pub(super) fn scope_context(
 }
 
 /// The scope id `bytes` hold, refusing an id that isn't 16 non-zero bytes.
-pub(super) fn requested_scope_id(bytes: &[u8]) -> Result<ScopeId, Status> {
+pub(crate) fn requested_scope_id(bytes: &[u8]) -> Result<ScopeId, Status> {
     let id = Context::from(bytes);
     if bytes.len() != size_of::<Context>() || id.is_zero() {
         return Err(Status::invalid_argument(

@@ -48,6 +48,7 @@ fn make_forwarded_request(
         creator: Some("alice".into()),
         category: "default".into(),
         stack: vec![],
+        scope: None,
     })
     .expect("CallerContext::to_forwarded_request failed in test")
 }
@@ -68,6 +69,7 @@ async fn missing_user_id_returns_internal_error() {
             creator: Some("alice".into()),
             category: "default".into(),
             stack: vec![],
+            scope: None,
         });
         request.metadata_mut().insert_bin(
             REPOSITORY_ID_KEY,

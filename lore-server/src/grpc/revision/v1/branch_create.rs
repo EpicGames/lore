@@ -31,6 +31,7 @@ use crate::grpc::create_branch_detached;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::hook_error_to_status;
+use crate::grpc::repository::v1::scope::requested_scope_id;
 use crate::grpc::require_action;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
@@ -139,6 +140,7 @@ pub async fn branch_create_implementation(
     let category = req.category;
     let creator = req.creator.unwrap_or_else(|| context.user_id.clone());
     let stack: Vec<BranchPoint> = req.stack.into_iter().map(BranchPoint::from).collect();
+    let scope = req.scope.as_deref().map(requested_scope_id).transpose()?;
 
     let branch = BranchId::from(req.id);
 
@@ -189,6 +191,7 @@ pub async fn branch_create_implementation(
                 creator,
                 created,
                 stack,
+                scope,
                 BranchWriteFollowUp {
                     notification_sender,
                     hook_dispatcher: hook_dispatcher.clone(),

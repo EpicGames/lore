@@ -237,6 +237,11 @@ pub struct Branch {
     /// parent the branch was forked from; stack\[N-1\] is the ultimate root.
     #[prost(message, repeated, tag = "9")]
     pub stack: ::prost::alloc::vec::Vec<BranchPoint>,
+    /// Id of the scope the branch belongs to, as its metadata records it under
+    /// `scope`. Unset where the branch is in the default scope, which the
+    /// metadata doesn't record, and from a server that predates this field.
+    #[prost(bytes = "bytes", optional, tag = "10")]
+    pub scope: ::core::option::Option<::prost::bytes::Bytes>,
 }
 impl ::prost::Name for Branch {
     const NAME: &'static str = "Branch";

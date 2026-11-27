@@ -149,6 +149,10 @@ message Branch {
   // Ancestry chain — parent-first, root-last. stack[0] is the immediate
   // parent the branch was forked from; stack[N-1] is the ultimate root.
   repeated BranchPoint stack = 9;
+  // Id of the scope the branch belongs to, as its metadata records it under
+  // `scope`. Unset where the branch is in the default scope, which the
+  // metadata doesn't record, and from a server that predates this field.
+  optional bytes scope = 10;
 }
 
 // A scope of a repository: a unit of lock causality with its own id, name

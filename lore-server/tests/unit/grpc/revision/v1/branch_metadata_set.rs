@@ -9,7 +9,7 @@ use lore_revision::branch;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::Metadata;
-use lore_revision::metadata::branch::ARCHIVE_KEYS;
+use lore_revision::metadata::branch::NEVER_ADDED_KEYS;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::allow_all_repositories;
 use lore_server::grpc::get_write_token;
@@ -271,11 +271,11 @@ async fn rejects_removal_of_read_only_creator() {
     .await;
 }
 
-/// A swap that adds any of the keys archives and restores write, to a branch without it, is
-/// refused: such a value would change what the next archive or restore of the branch does.
+/// A swap that adds any of the keys no metadata write may add, to a branch without it, is refused,
+/// the scope of a default-scope branch included.
 #[tokio::test]
-async fn rejects_addition_of_an_archive_key() {
-    for &key in ARCHIVE_KEYS {
+async fn rejects_addition_of_a_never_added_key() {
+    for &key in NEVER_ADDED_KEYS {
         let repository_id = random::<RepositoryId>();
         let branch_id = BranchId::from(uuid::Uuid::now_v7());
         let (immutable_store, mutable_store, execution) =
@@ -293,7 +293,7 @@ async fn rejects_addition_of_an_archive_key() {
             let mut proposed = Metadata::deserialize(repository.clone(), current)
                 .await
                 .expect("deserialize");
-            set_archive_key(&mut proposed, key, 1);
+            set_never_added_key(&mut proposed, key, 1);
             let updated = serialize(repository.clone(), &proposed).await;
 
             let err = handler(
@@ -303,7 +303,7 @@ async fn rejects_addition_of_an_archive_key() {
                 mutable_store.clone(),
             )
             .await
-            .expect_err("adding an archive key must fail");
+            .expect_err("adding a never-added key must fail");
             assert_eq!(err.code(), tonic::Code::InvalidArgument, "{key}");
             assert_eq!(
                 branch::metadata_hash(repository, branch_id).await.ok(),
@@ -315,11 +315,11 @@ async fn rejects_addition_of_an_archive_key() {
     }
 }
 
-/// A swap that changes the value of any of the keys archives and restores write, or removes one,
-/// is refused, and the metadata stays as it was.
+/// A swap that changes the value of any of the keys no metadata write may add, or removes one, is
+/// refused, and the metadata stays as it was.
 #[tokio::test]
-async fn rejects_change_or_removal_of_an_archive_key() {
-    for &key in ARCHIVE_KEYS {
+async fn rejects_change_or_removal_of_a_never_added_key() {
+    for &key in NEVER_ADDED_KEYS {
         for removed in [false, true] {
             let repository_id = random::<RepositoryId>();
             let branch_id = BranchId::from(uuid::Uuid::now_v7());
@@ -337,7 +337,7 @@ async fn rejects_change_or_removal_of_an_archive_key() {
                 let mut stamped = Metadata::deserialize(repository.clone(), created)
                     .await
                     .expect("deserialize");
-                set_archive_key(&mut stamped, key, 1);
+                set_never_added_key(&mut stamped, key, 1);
                 let current = serialize(repository.clone(), &stamped).await;
                 branch::mutable_store_metadata(repository.clone(), branch_id, current)
                     .await
@@ -347,7 +347,7 @@ async fn rejects_change_or_removal_of_an_archive_key() {
                 if removed {
                     proposed.remove_key(key);
                 } else {
-                    set_archive_key(&mut proposed, key, 2);
+                    set_never_added_key(&mut proposed, key, 2);
                 }
                 let updated = serialize(repository.clone(), &proposed).await;
 
@@ -358,7 +358,7 @@ async fn rejects_change_or_removal_of_an_archive_key() {
                     mutable_store.clone(),
                 )
                 .await
-                .expect_err("changing an archive key must fail");
+                .expect_err("changing a never-added key must fail");
                 assert_eq!(err.code(), tonic::Code::InvalidArgument, "{key} {removed}");
                 assert_eq!(
                     branch::metadata_hash(repository, branch_id).await.ok(),
@@ -371,9 +371,13 @@ async fn rejects_change_or_removal_of_an_archive_key() {
     }
 }
 
-/// Sets archive key `key` in `metadata` to a value of its type that `seed` picks.
-fn set_archive_key(metadata: &mut Metadata, key: &str, seed: u64) {
-    if key == branch::RESTORING || key == branch::RELEASED {
+/// Sets never-added key `key` in `metadata` to a value of its type that `seed` picks.
+fn set_never_added_key(metadata: &mut Metadata, key: &str, seed: u64) {
+    if key == branch::SCOPE {
+        let mut scope = [0u8; 16];
+        scope[..8].copy_from_slice(&seed.to_le_bytes());
+        metadata.set_binary(key, &scope).expect("set the key");
+    } else if key == branch::RESTORING || key == branch::RELEASED {
         metadata
             .set_string(key, &format!("name-{seed}"))
             .expect("set the key");

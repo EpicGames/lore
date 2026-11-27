@@ -92,6 +92,7 @@ async fn two_concurrent_local_creates_leave_one_winner_on_a_shared_store() {
         CREATOR,
         lore_revision::util::time::timestamp(),
         Vec::new(),
+        None,
         Hash::from([7; 32]),
         BranchLatestStatus::Divergent,
         Context::default(),

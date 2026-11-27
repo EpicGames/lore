@@ -208,10 +208,11 @@ fn walk_tags_hands_over_unknown_tags_that_walk_passes_over() {
     );
 }
 
-/// A key that is not stored and a key stored under a kind this build does
-/// not know both fail the read, and a caller has to be able to tell them
-/// apart: the first means the key is simply not there, the second that the
-/// metadata was written by something this build disagrees with.
+/// A caller has to be able to tell a key that is not stored from a key stored
+/// under a kind this build does not know: the first means the key is simply
+/// not there, the second that the metadata was written by something this build
+/// disagrees with. `get_typed` fails the first with `FileNotFound` and
+/// `find_typed` answers `None`, and both fail the second otherwise.
 #[test]
 fn an_unknown_tag_fails_differently_from_a_missing_key() {
     let entries = [("key", "value")];
@@ -224,6 +225,14 @@ fn an_unknown_tag_fails_differently_from_a_missing_key() {
         ),
         "a key that was never stored is not found"
     );
+    assert!(
+        matches!(metadata.find_typed("absent"), Ok(None)),
+        "a key that was never stored has no value"
+    );
+    assert!(
+        matches!(Metadata::new().find_typed("absent"), Ok(None)),
+        "empty metadata has no value"
+    );
 
     plant_unknown_tag(&mut metadata, &entries, 0);
 
@@ -233,6 +242,10 @@ fn an_unknown_tag_fails_differently_from_a_missing_key() {
     assert!(
         !matches!(error, MetadataError::FileNotFound(_)),
         "an unreadable kind must not be reported as a key that is not there"
+    );
+    assert!(
+        metadata.find_typed("key").is_err(),
+        "a tag this build does not know must not decode"
     );
 }
 

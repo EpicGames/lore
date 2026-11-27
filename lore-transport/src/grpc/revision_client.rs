@@ -75,6 +75,7 @@ impl RevisionService {
                 creator: Some(creator.to_string()),
                 category: category.to_string(),
                 stack: stack.iter().map(model_v1::BranchPoint::from).collect(),
+                scope: None,
             };
 
             let mut client = self.client.clone();

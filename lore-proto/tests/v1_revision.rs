@@ -54,6 +54,7 @@ fn v1_revision_field_shapes() {
         creator: _,
         category: _,
         stack: _,
+        scope: _,
     } = BranchCreateRequest::default();
     let BranchCreateResponse { branch: _ } = BranchCreateResponse::default();
 

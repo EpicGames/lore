@@ -1066,6 +1066,18 @@ A scope has the same two identifiers and the same lifecycle: archiving it remove
 mapping and keeps its metadata, and restoring it puts a mapping back. A scope can also be
 renamed, which claims the new name's mapping and then releases the old one.
 
+Every branch belongs to one scope, which the server assigns when it creates the branch and which
+never changes. A create of a new branch that names a scope must name a live scope of the
+repository. One that names none takes the scope of the first branch of its stack, parent first,
+whose metadata the server holds, live or archived: a stacked branch's stack is its parent's with
+the parent in front, so a branch pushed before its parent takes the scope of its nearest ancestor
+the server holds. The server reads at most the first 64 branches of the stack, so a create costs a
+bounded number of reads. A branch with an empty stack, or with none of those branches on the
+server, is in the default scope. A create of a branch that exists already, such as one that
+restores an archived branch, keeps the branch's scope, and refuses to name another. The branch's
+metadata records the scope's ID under `scope` only where it isn't the default scope, so a branch
+without the key is in the default scope.
+
 #### 9.4 Atomicity via compare-and-swap
 
 The mutable store's API is narrow: `load`, `store`, `cas`, `list`. The `cas` operation
@@ -1286,11 +1298,13 @@ cheap to load, and fully resident in memory while in use.
 For each entity type, Lore reserves a set of *built-in* keys that the system itself reads or
 writes. Examples include `message`, `timestamp`, `created-by`, `committed-by`,
 `change-request`, and `cherry-picked-from` on a revision; `category`, `creator`, `created`,
-`protect`, and the `archived`, `restored`, `restoring` and `released` keys that archives and
-restores write on a branch; `name`, `description`, `default-branch`, `creator`, and `created` on a
-repository. Some built-in keys are read-only: the system assigns them, at creation or, for the
+`protect`, `scope`, and the `archived`, `restored`, `restoring` and `released` keys that archives
+and restores write on a branch; `name`, `description`, `default-branch`, `creator`, and `created`
+on a repository. Some built-in keys are read-only: the system assigns them, at creation or, for the
 keys archives and restores write, when it archives or restores the branch, and no metadata set
-or clear changes them. Others can be set or updated by users, but the key itself is reserved.
+or clear changes them. A branch can lack some of them, and no metadata set adds those: the keys
+archives and restores write, and `scope`. Others can be set or updated by users, but the key
+itself is reserved.
 
 The remaining key space is free for application use. Tools and integrations attach their own
 keys for purposes the system itself does not know about - code review IDs, build provenance,

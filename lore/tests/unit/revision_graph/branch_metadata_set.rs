@@ -89,7 +89,7 @@ use crate::revision_graph::support::with_mutable_store;
 use crate::revision_graph::support::with_stores;
 
 /// The keys a set refuses in `entries` and in `remove`, as the amendment lists them.
-const READ_ONLY: [&str; 12] = [
+const READ_ONLY: [&str; 13] = [
     "id",
     "name",
     "category",
@@ -102,6 +102,7 @@ const READ_ONLY: [&str; 12] = [
     "restored",
     "restoring",
     "released",
+    "scope",
 ];
 
 fn entry(key: &str, value: LoreMetadata) -> LoreRevisionGraphBranchMetadataEntry {

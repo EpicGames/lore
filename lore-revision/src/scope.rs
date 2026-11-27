@@ -266,6 +266,17 @@ pub async fn get(
         .map(|(_, metadata)| scope_of(id, &metadata)))
 }
 
+/// Whether scope `id` of `repository` is live: the default scope, or a scope with metadata that
+/// isn't archived. The default scope's id answers with no read.
+pub async fn is_live(repository: Arc<RepositoryContext>, id: ScopeId) -> Result<bool, ScopeError> {
+    if id == default_scope_id(repository.id) {
+        return Ok(true);
+    }
+    Ok(stored(repository, id)
+        .await?
+        .is_some_and(|(_, metadata)| !is_archived(&metadata)))
+}
+
 /// The live scope of `repository` that `name` maps to, compared regardless of case, `None` where
 /// there is none: a mapping to a scope whose metadata is archived, or names it otherwise, is
 /// stale. The name [`DEFAULT_NAME`] answers the default scope with no read.

@@ -12,8 +12,10 @@ use lore_revision::metadata::Metadata;
 /// the helper fits both pre-load paths (e.g. delete preserves metadata for the
 /// deleted response) and post-mutation paths. Reading `latest` is left to the
 /// caller because how an unreadable latest should be handled depends on whether
-/// the caller has already committed a mutation. Missing metadata fields
-/// (legacy / partial blobs) fall back to defaults rather than erroring.
+/// the caller has already committed a mutation. Missing or unreadable metadata
+/// fields (legacy / partial blobs) fall back to defaults rather than erroring:
+/// `scope` is unset where the metadata records no scope id
+/// ([`branch::recorded_scope`]).
 pub(super) fn build_branch(
     branch_id: BranchId,
     metadata: &Metadata,
@@ -39,5 +41,9 @@ pub(super) fn build_branch(
         deleted,
         metadata: metadata_hash.into(),
         stack,
+        scope: branch::recorded_scope(metadata)
+            .ok()
+            .flatten()
+            .map(Into::into),
     }
 }

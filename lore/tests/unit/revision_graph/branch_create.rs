@@ -171,6 +171,7 @@ async fn create_in_category(
         "alice",
         CREATED,
         stack,
+        None,
         latest,
         BranchLatestStatus::Divergent,
         Context::default(),

@@ -106,6 +106,7 @@ pub(crate) fn full_branch() -> (model::Branch, BranchRecord) {
         deleted: record.deleted,
         metadata: record.metadata.into(),
         stack: record.stack.iter().map(model::BranchPoint::from).collect(),
+        scope: None,
     };
     (branch, record)
 }

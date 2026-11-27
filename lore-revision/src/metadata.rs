@@ -692,7 +692,45 @@ impl Metadata {
 
     /// Returns the raw value bytes and the [`MetadataType`] for the given key.
     pub fn get_typed(&self, key: &str) -> Result<(&[u8], MetadataType), MetadataError> {
-        self.get_with_type(key.as_bytes())
+        self.find_typed(key)?.ok_or_else(|| {
+            FileNotFound {
+                resource: "metadata key".into(),
+            }
+            .into()
+        })
+    }
+
+    /// The raw value bytes and the [`MetadataType`] for the given key, `None` where the metadata
+    /// doesn't hold the key.
+    pub fn find_typed(&self, key: &str) -> Result<Option<(&[u8], MetadataType)>, MetadataError> {
+        let key = key.as_bytes();
+        let header_size = std::mem::size_of::<u32>() * 2;
+        let item_size = std::mem::size_of::<u32>() * 3;
+
+        let mut offset = header_size;
+        let buffer = self.buffer.as_ref();
+        while offset < self.buffer.len() {
+            let raw_pointer = unsafe { buffer.as_ptr().add(offset).cast::<MetadataItem>() };
+            let item: MetadataItem = unsafe { raw_pointer.read_unaligned() };
+
+            let key_length = item.key_length as usize;
+            let value_length = item.value_length as usize;
+            let value_type = item.value_type;
+            offset += item_size;
+
+            let key_data = unsafe { buffer.as_ptr().add(offset) };
+            let key_slice = unsafe { std::slice::from_raw_parts(key_data, key_length) };
+            offset += key_length;
+
+            if key_slice == key {
+                let value_data = unsafe { buffer.as_ptr().add(offset) };
+                let value_slice = unsafe { std::slice::from_raw_parts(value_data, value_length) };
+                return Ok(Some((value_slice, MetadataType::try_from(value_type)?)));
+            }
+
+            offset += value_length;
+        }
+        Ok(None)
     }
 
     pub fn to_string(value: &[u8]) -> Result<&str, MetadataError> {
@@ -824,46 +862,6 @@ impl Metadata {
             if key_slice == key {
                 let value_data = unsafe { buffer.as_ptr().add(offset) };
                 return Ok(unsafe { std::slice::from_raw_parts(value_data, value_length) });
-            }
-
-            offset += value_length;
-        }
-        Err(FileNotFound {
-            resource: "metadata key".into(),
-        }
-        .into())
-    }
-
-    fn get_with_type<'a>(&'a self, key: &[u8]) -> Result<(&'a [u8], MetadataType), MetadataError> {
-        if self.is_empty() {
-            return Err(FileNotFound {
-                resource: "metadata key".into(),
-            }
-            .into());
-        }
-
-        let header_size = std::mem::size_of::<u32>() * 2;
-        let item_size = std::mem::size_of::<u32>() * 3;
-
-        let mut offset = header_size;
-        let buffer = self.buffer.as_ref();
-        while offset < self.buffer.len() {
-            let raw_pointer = unsafe { buffer.as_ptr().add(offset).cast::<MetadataItem>() };
-            let item: MetadataItem = unsafe { raw_pointer.read_unaligned() };
-
-            let key_length = item.key_length as usize;
-            let value_length = item.value_length as usize;
-            let value_type = item.value_type;
-            offset += item_size;
-
-            let key_data = unsafe { buffer.as_ptr().add(offset) };
-            let key_slice = unsafe { std::slice::from_raw_parts(key_data, key_length) };
-            offset += key_length;
-
-            if key_slice == key {
-                let value_data = unsafe { buffer.as_ptr().add(offset) };
-                let value_slice = unsafe { std::slice::from_raw_parts(value_data, value_length) };
-                return Ok((value_slice, MetadataType::try_from(value_type)?));
             }
 
             offset += value_length;

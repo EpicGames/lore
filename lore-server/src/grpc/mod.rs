@@ -33,6 +33,7 @@ mod replication_service;
 pub mod tower;
 
 pub use admin_service::LoreAdminService;
+use futures::FutureExt;
 use futures::Stream;
 pub use grpc_internal_server::GrpcInternalServerBuilder;
 use lore_base::error::Cancelled;
@@ -325,11 +326,14 @@ pub(crate) struct BranchWriteFollowUp<P> {
     pub(crate) instrument_provider: P,
 }
 
-/// Creates `branch` in `repository`, as `lore_revision::branch::create` does without a dry run or
-/// linked repositories, in a task that runs to its end ([`run_detached`]). Once the create
-/// succeeds, the task sends its notification, spawns its post hooks and counts it, with what
-/// `follow_up` holds. A request dropped part way stops neither the create between its writes nor
-/// what follows it.
+/// Creates `branch` in `repository`, as `lore_revision::branch::create_at` does without a dry run
+/// or linked repositories, in the scope [`new_branch_scope`] resolves from `scope`, the scope the
+/// request names, in a task that runs to its end ([`run_detached`]). The scope is resolved after
+/// the create's argument checks ([`lore_revision::branch::check_create_arguments`]) and before it
+/// writes anything: where the scope is refused, the task answers that refusal and writes nothing.
+/// Once the create succeeds, the task sends its notification, spawns its post hooks and counts it,
+/// with what `follow_up` holds. A request dropped part way stops neither the create between its
+/// writes nor what follows it.
 ///
 /// Not an `async fn`, which would hold its arguments until its first poll, and spawn only then.
 #[allow(clippy::too_many_arguments)]
@@ -341,11 +345,16 @@ pub(crate) fn create_branch_detached(
     creator: String,
     created: u64,
     stack: Vec<lore_base::types::BranchPoint>,
+    scope: Option<lore_revision::scope::ScopeId>,
     follow_up: BranchWriteFollowUp<impl InstrumentProvider + Send + 'static>,
 ) -> impl Future<Output = Result<Result<Context, BranchError>, Status>> {
-    run_detached("branch create", async move {
+    let task = run_detached("branch create", async move {
+        if let Err(err) = lore_revision::branch::check_create_arguments(branch, &name) {
+            return Ok(Err(err));
+        }
+        let scope = new_branch_scope(&repository, branch, scope, &stack).await?;
         let repository_id = repository.id;
-        let branch = lore_revision::branch::create(
+        let created = lore_revision::branch::create_at(
             repository,
             &get_write_token(),
             branch,
@@ -354,10 +363,15 @@ pub(crate) fn create_branch_detached(
             creator.as_str(),
             created,
             stack,
+            Some(scope),
             false,
             false,
         )
-        .await?;
+        .await;
+        let branch = match created {
+            Ok(created) => created.branch,
+            Err(err) => return Ok(Err(err)),
+        };
         follow_up
             .notification_sender
             .branch_created(repository_id, branch)
@@ -369,8 +383,58 @@ pub(crate) fn create_branch_detached(
             .instrument_provider
             .counter("num_branches_created")
             .add(1, &[]);
-        Ok::<_, BranchError>(branch)
-    })
+        Ok(Ok(branch))
+    });
+    task.map(Result::flatten)
+}
+
+/// The scope a create of `branch` with `stack` in `repository` gives it: `named`, where the request
+/// names one, and otherwise the scope it inherits from `stack`
+/// ([`lore_revision::branch::inherited_scope`]). Where `branch` has metadata already, a named scope
+/// must be the one it holds, live or archived: a branch's scope never changes, and a create that
+/// restores the branch keeps it. Otherwise a named scope must be a live scope of the repository,
+/// as the default scope is. The branch's scope and the named scope are read together.
+///
+/// Answers `FailedPrecondition` where `named` is another scope than the existing branch's, or an
+/// unknown or archived scope for a new branch, `ResourceExhausted` where a read is throttled, and
+/// `Internal` where a read fails. Writes nothing.
+async fn new_branch_scope(
+    repository: &Arc<lore_revision::repository::RepositoryContext>,
+    branch: lore_revision::lore::BranchId,
+    named: Option<lore_revision::scope::ScopeId>,
+    stack: &[lore_base::types::BranchPoint],
+) -> Result<lore_revision::scope::ScopeId, Status> {
+    let Some(named) = named else {
+        return lore_revision::branch::inherited_scope(repository.clone(), stack)
+            .await
+            .filter_slow_down()?
+            .warn_map_err(|err| Status::internal(err.to_string()));
+    };
+    let (held, live) = tokio::join!(
+        lore_revision::branch::scope_of(repository.clone(), branch),
+        lore_revision::scope::is_live(repository.clone(), named),
+    );
+    let held = held
+        .filter_slow_down()?
+        .warn_map_err(|err| Status::internal(err.to_string()))?;
+    match held {
+        Some(held) if held != named => Err(Status::failed_precondition(format!(
+            "Branch {branch} is in scope {held}, and a branch's scope never changes"
+        ))),
+        Some(_) => Ok(named),
+        None => {
+            let live = live
+                .filter_slow_down()?
+                .warn_map_err(|err| Status::internal(err.to_string()))?;
+            if live {
+                Ok(named)
+            } else {
+                Err(Status::failed_precondition(format!(
+                    "The scope {named} is not a live scope of the repository"
+                )))
+            }
+        }
+    }
 }
 
 /// Archives `branch` in `repository`, as `lore_revision::branch::delete` does, in a task that runs

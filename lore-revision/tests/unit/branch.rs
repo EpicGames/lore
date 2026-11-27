@@ -3128,6 +3128,7 @@ async fn write_record(
         "creator",
         1,
         Vec::new(),
+        None,
         revision(1),
         status,
         name_expected,
@@ -3706,14 +3707,13 @@ async fn restored_at(repository: &Arc<RepositoryContext>, id: BranchId) -> u64 {
         .expect("the metadata holds a restore time")
 }
 
-/// A metadata set of any key an archive or a restore writes, or a clear of one by name, fails with
-/// `InvalidArguments` before it reads anything: the keys decide what a later archive or restore of
-/// the branch does.
+/// A metadata set of any key no metadata write may add, or a clear of one by name, fails with
+/// `InvalidArguments` before it reads anything.
 #[tokio::test]
-async fn a_metadata_write_refuses_the_archive_keys() {
+async fn a_metadata_write_refuses_the_never_added_keys() {
     Box::pin(with_execution(async {
         let repository = null_repository().await;
-        for &key in lore_revision::metadata::branch::ARCHIVE_KEYS {
+        for &key in lore_revision::metadata::branch::NEVER_ADDED_KEYS {
             let set = lore_revision::metadata::branch::set_boxed(
                 repository.clone(),
                 branch_id(1),
@@ -6512,6 +6512,7 @@ async fn bring_in_record_sets_its_metadata_back_after_a_lost_claim() {
             "creator",
             1,
             Vec::new(),
+            None,
             revision(1),
             BranchLatestStatus::Divergent,
             BranchId::default(),
@@ -6595,4 +6596,49 @@ async fn bring_in_record_keeps_metadata_another_writer_stored_after_its_read() {
         assert_eq!(mapped(&stores.writer, CLAIMED_NAME).await, None);
     }))
     .await;
+}
+
+/// A branch's metadata names its scope by a 16-byte binary id under `scope`, and the default scope
+/// of its repository by holding none, which `recorded_scope` reads as no scope. Any other value
+/// fails as internal rather than answering a scope.
+#[test]
+fn the_scope_reads_from_the_metadata_or_is_the_default() {
+    use lore_revision::branch::recorded_scope;
+
+    let repository = RepositoryId::from([3u8; 16]);
+    let mut metadata = lore_revision::metadata::Metadata::new();
+    assert_eq!(
+        scope(&metadata, repository).ok(),
+        Some(lore_revision::scope::default_scope_id(repository))
+    );
+    assert_eq!(recorded_scope(&metadata).ok(), Some(None));
+    metadata.set_binary(SCOPE, &[5u8; 16]).expect("set scope");
+    assert_eq!(
+        scope(&metadata, repository).ok(),
+        Some(lore_revision::scope::ScopeId::from([5u8; 16]))
+    );
+    assert_eq!(
+        recorded_scope(&metadata).ok(),
+        Some(Some(lore_revision::scope::ScopeId::from([5u8; 16])))
+    );
+    metadata.set_binary(SCOPE, &[5u8; 15]).expect("set scope");
+    assert!(matches!(
+        scope(&metadata, repository),
+        Err(BranchError::Internal(_))
+    ));
+    assert!(matches!(
+        recorded_scope(&metadata),
+        Err(BranchError::Internal(_))
+    ));
+    metadata
+        .set_string(SCOPE, "sixteen-byte-str")
+        .expect("set scope");
+    assert!(matches!(
+        scope(&metadata, repository),
+        Err(BranchError::Internal(_))
+    ));
+    assert!(matches!(
+        recorded_scope(&metadata),
+        Err(BranchError::Internal(_))
+    ));
 }

@@ -465,6 +465,9 @@ pub const RESTORING: &str = "restoring";
 pub const RELEASED: &str = "released";
 pub const STACK: &str = "stack";
 pub const ID: &str = "id";
+/// The id of the branch's scope, a 16-byte binary value that only the branch's creation writes. A
+/// branch in the default scope of its repository holds none.
+pub const SCOPE: &str = "scope";
 
 pub const CATEGORY_DEFAULT: &str = "";
 pub const CATEGORY_PERSONAL: &str = "personal";
@@ -2127,6 +2130,96 @@ pub fn protected(metadata: &Metadata) -> bool {
     metadata.get_bool(PROTECT).unwrap_or_default()
 }
 
+/// The scope of the branch of `repository` that `metadata` describes: the id it holds under
+/// [`SCOPE`], and the default scope's ([`scope::default_scope_id`]) where it holds none.
+///
+/// # Errors
+///
+/// `Internal` where the value isn't a 16-byte binary id.
+pub fn scope(metadata: &Metadata, repository: RepositoryId) -> Result<scope::ScopeId, BranchError> {
+    Ok(recorded_scope(metadata)?.unwrap_or_else(|| scope::default_scope_id(repository)))
+}
+
+/// The scope `metadata` records under [`SCOPE`], `None` where it records none.
+///
+/// # Errors
+///
+/// `Internal` where the value isn't a 16-byte binary id.
+pub fn recorded_scope(metadata: &Metadata) -> Result<Option<scope::ScopeId>, BranchError> {
+    match metadata
+        .find_typed(SCOPE)
+        .forward_any::<BranchError>("reading the branch scope")?
+    {
+        Some((value, MetadataType::Binary)) => Metadata::to_context(value)
+            .map(Some)
+            .forward::<BranchError>("reading the branch scope"),
+        Some(_) => Err(BranchError::internal(
+            "the branch scope is not a binary value",
+        )),
+        None => Ok(None),
+    }
+}
+
+/// The scope of `branch` in `repository`, as [`scope`] reads it from the branch's metadata, whose
+/// key is read from the mutable store of `repository`. `None` where the branch has no metadata.
+/// Every call reads the metadata.
+///
+/// # Errors
+///
+/// A failed or corrupt read, a metadata blob the immutable store doesn't hold, and a value
+/// [`scope`] refuses.
+pub async fn scope_of(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+) -> Result<Option<scope::ScopeId>, BranchError> {
+    let repository_id = repository.id;
+    let Some(hash) = mutable_value(repository.clone(), METADATA, branch).await? else {
+        return Ok(None);
+    };
+    let metadata = load_metadata(repository, hash).await?;
+    scope(&metadata, repository_id).map(Some)
+}
+
+/// The number of branches of a stack, parent first, that [`inherited_scope`] reads.
+pub const INHERITED_SCOPE_PROBES: usize = 64;
+
+/// The scope a new branch of `repository` with `stack` inherits: that of the first branch of the
+/// stack, parent first, that has metadata, live or archived ([`scope_of`]), among the first
+/// [`INHERITED_SCOPE_PROBES`], and the default scope where none of those has. A stacked branch's
+/// stack is its parent's stack with the parent in front, so a branch that reaches the server
+/// before its parent takes the scope of its nearest ancestor the server holds. Each branch without
+/// metadata costs one read, so the bound caps the reads a client's stack can make.
+///
+/// # Errors
+///
+/// A read that fails, and a scope value [`scope`] refuses.
+pub async fn inherited_scope(
+    repository: Arc<RepositoryContext>,
+    stack: &[BranchPoint],
+) -> Result<scope::ScopeId, BranchError> {
+    for point in stack.iter().take(INHERITED_SCOPE_PROBES) {
+        if let Some(scope) = scope_of(repository.clone(), point.branch).await? {
+            return Ok(scope);
+        }
+    }
+    Ok(scope::default_scope_id(repository.id))
+}
+
+/// Records `scope` in `metadata`, that of a new branch of `repository`, under [`SCOPE`]. `None` and
+/// the default scope record nothing: a branch without [`SCOPE`] is in the default scope.
+fn record_scope(
+    metadata: &mut Metadata,
+    repository: RepositoryId,
+    scope: Option<scope::ScopeId>,
+) -> Result<(), BranchError> {
+    match scope {
+        Some(scope) if scope != scope::default_scope_id(repository) => metadata
+            .set_binary(SCOPE, scope.data())
+            .forward::<BranchError>("Failed to populate branch scope metadata"),
+        _ => Ok(()),
+    }
+}
+
 pub async fn branch_metadata(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
@@ -2184,7 +2277,7 @@ pub fn is_valid_name(name: &str) -> bool {
     true
 }
 
-/// [`create_at`], returning the branch it made.
+/// [`create_at`] with no scope recorded, returning the branch it made.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments beside the future of
 /// [`create_at`]. An `async` block awaiting that future would hold it twice.
@@ -2211,6 +2304,7 @@ pub fn create(
             creator,
             created,
             stack,
+            None,
             dry_run,
             create_linked,
         ),
@@ -2241,6 +2335,9 @@ pub struct CreatedBranch {
 ///    run write the record (`create_record`), claiming the name from that value. A record that
 ///    fails to write deletes the linked branches.
 ///
+/// The record holds `scope` as the new branch's scope, as `create_record` records it. A restore
+/// keeps the scope the branch holds.
+///
 /// A name that isn't valid, or a zero `branch`, fails with [`InvalidArguments`] before anything is
 /// written. In step 3, a parent that is zero, the branch itself, or a personal branch, or a zero
 /// parent revision on a branch other than the default branch, fails with [`InvalidArguments`] too.
@@ -2254,16 +2351,11 @@ pub async fn create_at(
     creator: &str,
     created: u64,
     stack: Vec<BranchPoint>,
+    scope: Option<scope::ScopeId>,
     dry_run: bool,
     create_linked: bool,
 ) -> Result<CreatedBranch, BranchError> {
-    // Check if name is valid
-    if !is_valid_name(name) {
-        return Err(BranchError::from(InvalidArguments {
-            reason: format!("the branch name {name:?} is not valid"),
-        }));
-    }
-    check_new_branch_id(branch, name)?;
+    check_create_arguments(branch, name)?;
 
     if restore_existing_branch(
         repository.clone(),
@@ -2434,6 +2526,7 @@ pub async fn create_at(
             creator,
             created,
             stack,
+            scope,
             head,
             BranchLatestStatus::Divergent,
             name_expected,
@@ -2465,6 +2558,18 @@ pub async fn create_at(
         staged,
         restored: false,
     })
+}
+
+/// Fails with [`InvalidArguments`] where `name` isn't a valid branch name ([`is_valid_name`]) or
+/// `branch`, the id of the new branch, is zero: the checks [`create_at`] makes before it reads
+/// anything.
+pub fn check_create_arguments(branch: BranchId, name: &str) -> Result<(), BranchError> {
+    if !is_valid_name(name) {
+        return Err(BranchError::from(InvalidArguments {
+            reason: format!("the branch name {name:?} is not valid"),
+        }));
+    }
+    check_new_branch_id(branch, name)
 }
 
 /// Fails with [`InvalidArguments`] where `branch`, the id of the new branch `name`, is zero.
@@ -3144,9 +3249,10 @@ async fn local_metadata_expected(
     }
 }
 
-/// Writes the record of a new branch: its metadata, swapped into the metadata key of `branch` from
-/// zero, then the mapping of `name` to `branch`, claimed from `name_expected`, then `latest` as its
-/// latest revision with `status`. Sends no event. The latest revision comes last, once the name
+/// Writes the record of a new branch: its metadata, which holds `scope` where it is set and isn't
+/// the default scope ([`record_scope`]), swapped into the metadata key of `branch` from zero, then
+/// the mapping of `name` to `branch`, claimed from `name_expected`, then `latest` as its latest
+/// revision with `status`. Sends no event. The latest revision comes last, once the name
 /// is claimed: a restore that renames a branch refuses one without a latest revision, so it can't
 /// rename a branch whose create is between its metadata and its claim (`check_restore`).
 ///
@@ -3171,6 +3277,7 @@ pub fn create_record(
     creator: &str,
     created: u64,
     stack: Vec<BranchPoint>,
+    scope: Option<scope::ScopeId>,
     latest: Hash,
     status: BranchLatestStatus,
     name_expected: Context,
@@ -3188,6 +3295,7 @@ pub fn create_record(
                 created,
                 stack,
             )?;
+            record_scope(&mut metadata, repository.id, scope)?;
             metadata
                 .serialize(repository.clone())
                 .await

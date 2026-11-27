@@ -346,3 +346,76 @@ async fn rejects_modification_of_read_only_category() {
     }))
     .await;
 }
+
+/// A swap that adds `scope` to a branch in the default scope, or changes or removes the `scope` of
+/// a branch in another scope, is refused, and the metadata stays as it was.
+#[tokio::test]
+async fn rejects_adding_changing_or_removing_the_scope() {
+    let scope = |byte: u8| Some([byte; 16]);
+    for (held, proposed) in [(None, scope(1)), (scope(1), scope(2)), (scope(1), None)] {
+        let repository_id = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository_id,
+                allow_all_repositories(),
+            ));
+            branch::create_record(
+                repository.clone(),
+                branch_id,
+                "test-branch",
+                branch::default_category(),
+                "creator",
+                1,
+                vec![],
+                held.map(lore_revision::scope::ScopeId::from),
+                Hash::default(),
+                branch::BranchLatestStatus::Divergent,
+                BranchId::default(),
+            )
+            .await
+            .expect("Failed to create branch");
+            let current_hash = branch::metadata_hash(repository.clone(), branch_id)
+                .await
+                .expect("Failed to load metadata hash");
+
+            let mut metadata = Metadata::deserialize(repository.clone(), current_hash)
+                .await
+                .expect("deserialize");
+            match proposed {
+                Some(scope) => metadata
+                    .set_binary(branch::SCOPE, &scope)
+                    .expect("set scope"),
+                None => {
+                    metadata.remove_key(branch::SCOPE);
+                }
+            }
+            let new_hash = serialize_metadata(repository.clone(), &metadata).await;
+
+            let status = handler(
+                make_request(repository_id, branch_id, current_hash, new_hash),
+                &crate::util::test_support::allow_all_authorizer(),
+                immutable_store,
+                mutable_store,
+            )
+            .await
+            .expect_err("the swap is refused");
+            assert_eq!(
+                status.code(),
+                tonic::Code::InvalidArgument,
+                "{held:?} {proposed:?}"
+            );
+            assert_eq!(
+                branch::metadata_hash(repository, branch_id).await.ok(),
+                Some(current_hash),
+                "{held:?} {proposed:?}: the metadata stays as it was"
+            );
+        }))
+        .await;
+    }
+}

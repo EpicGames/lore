@@ -14659,7 +14659,7 @@ void lore_revision_graph_branch_metadata_get_async(const struct lore_global_args
 // The call consults the locations `lore_revision_graph_revision_resolve` describes, the remote
 // first, and checks its arguments before it reads either. Neither list may name a read-only key:
 // `id`, `name`, `category`, `creator`, `created`, `stack`, `parent`, `branch-point`, `archived`,
-// `restored`, `restoring` or `released`. `protect` can be set, with a
+// `restored`, `restoring`, `released` or `scope`. `protect` can be set, with a
 // `LORE_METADATA_TYPE_BOOLEAN` value, but not removed. Each value's `tag` must be a
 // `LORE_METADATA_TYPE_*` value; any other is undefined behavior, which no error code reports. The
 // call ignores `globals.force` and `globals.dry_run`, and `lore_storage_close` waits for it.

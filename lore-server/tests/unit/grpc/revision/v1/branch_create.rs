@@ -113,6 +113,7 @@ mod direct_handling {
                 creator: Some("alice".into()),
                 category: "default".into(),
                 stack: vec![],
+                scope: None,
             });
             request.metadata_mut().insert_bin(
                 REPOSITORY_ID_KEY,
@@ -169,6 +170,7 @@ mod direct_handling {
                 creator: Some("alice".into()),
                 category: "default".into(),
                 stack: vec![],
+                scope: None,
             });
             request.metadata_mut().insert_bin(
                 REPOSITORY_ID_KEY,
@@ -221,6 +223,7 @@ mod direct_handling {
                 creator: Some("alice".into()),
                 category: "default".into(),
                 stack: vec![],
+                scope: None,
             });
             request.metadata_mut().insert_bin(
                 REPOSITORY_ID_KEY,
@@ -266,6 +269,7 @@ mod direct_handling {
                 creator: None,
                 category: "default".into(),
                 stack: vec![],
+                scope: None,
             });
             request.metadata_mut().insert_bin(
                 REPOSITORY_ID_KEY,
@@ -321,6 +325,7 @@ mod direct_handling {
                     creator: Some("alice".into()),
                     category: "default".into(),
                     stack: vec![],
+                    scope: None,
                 });
                 request.metadata_mut().insert_bin(
                     REPOSITORY_ID_KEY,
@@ -408,6 +413,7 @@ mod direct_handling {
                 creator: Some("alice".into()),
                 category: "default".into(),
                 stack: vec![],
+                scope: None,
             });
             request.metadata_mut().insert_bin(
                 REPOSITORY_ID_KEY,
@@ -484,6 +490,7 @@ mod direct_handling {
                 creator: Some("alice".into()),
                 category: "default".into(),
                 stack: vec![],
+                scope: None,
             });
             request.metadata_mut().insert_bin(
                 REPOSITORY_ID_KEY,
@@ -516,6 +523,7 @@ mod direct_handling {
             creator: Some("alice".into()),
             category: "default".into(),
             stack: vec![],
+            scope: None,
         });
         request.metadata_mut().insert_bin(
             REPOSITORY_ID_KEY,
@@ -806,6 +814,7 @@ mod forwarded_request {
             creator: Some("alice".into()),
             category: "default".into(),
             stack: vec![],
+            scope: None,
         });
         request.metadata_mut().insert_bin(
             REPOSITORY_ID_KEY,

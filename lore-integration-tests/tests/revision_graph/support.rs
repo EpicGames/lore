@@ -1091,6 +1091,7 @@ pub(crate) async fn create_local_branch_as(
             creator,
             lore_revision::util::time::timestamp(),
             stack,
+            None,
             branch_point,
             BranchLatestStatus::Divergent,
             Context::default(),

@@ -30,6 +30,17 @@ pub struct BranchCreateRequest {
     /// branch_id.
     #[prost(message, repeated, tag = "5")]
     pub stack: ::prost::alloc::vec::Vec<crate::lore::model::v1::BranchPoint>,
+    /// Id of the scope the branch joins. For a new branch it must be a live
+    /// scope of the repository: unknown or archived yields FAILED_PRECONDITION.
+    /// A value that isn't 16 non-zero bytes yields INVALID_ARGUMENT. If unset,
+    /// the branch joins the scope of the first branch, among the first 64
+    /// entries of `stack`, the server holds, or the default scope. A branch's
+    /// scope never changes: where `id` names a branch that exists, live or
+    /// archived, naming another scope than its own yields FAILED_PRECONDITION,
+    /// and a create that restores the branch keeps its scope. A server that
+    /// predates this field ignores it, and the branch is in the default scope.
+    #[prost(bytes = "bytes", optional, tag = "6")]
+    pub scope: ::core::option::Option<::prost::bytes::Bytes>,
 }
 impl ::prost::Name for BranchCreateRequest {
     const NAME: &'static str = "BranchCreateRequest";

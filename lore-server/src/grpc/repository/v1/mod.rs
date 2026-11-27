@@ -13,4 +13,4 @@ pub mod scope_rename;
 pub mod service;
 
 mod record;
-mod scope;
+pub(crate) mod scope;

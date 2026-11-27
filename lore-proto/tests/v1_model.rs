@@ -39,6 +39,7 @@ fn v1_model_field_shapes() {
         deleted: _,
         metadata: _,
         stack: _,
+        scope: _,
     } = Branch::default();
 
     let BranchPoint {
