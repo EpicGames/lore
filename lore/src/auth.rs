@@ -211,10 +211,10 @@ fn configured_remote_url(repository_path: &str) -> Option<String> {
 
 fn send_user_info(user_info: UserInfo) {
     let id = user_info.id;
-    let name = if !user_info.preferred_username.is_empty() {
-        user_info.preferred_username
-    } else if !user_info.name.is_empty() {
+    let name = if !user_info.name.is_empty() {
         user_info.name
+    } else if !user_info.preferred_username.is_empty() {
+        user_info.preferred_username
     } else {
         id.clone()
     };

@@ -8,6 +8,8 @@ use lore_transport::auth::token_only::*;
 const FULL: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UgRXhhbXBsZSIsInByZWZlcnJlZF91c2VybmFtZSI6ImFsaWNlLmUiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
 /// `{"iss":"lore","sub":"alice","name":"Alice Example","exp":2000000000,"aud":["example.com"]}`
 const NAME_ONLY: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UgRXhhbXBsZSIsImV4cCI6MjAwMDAwMDAwMCwiYXVkIjpbImV4YW1wbGUuY29tIl19.signature";
+/// `{"iss":"lore","sub":"alice","preferred_username":"alice.e","exp":2000000000,"aud":["example.com"]}`
+const PREFERRED_ONLY: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJwcmVmZXJyZWRfdXNlcm5hbWUiOiJhbGljZS5lIiwiZXhwIjoyMDAwMDAwMDAwLCJhdWQiOlsiZXhhbXBsZS5jb20iXX0.signature";
 /// `{"iss":"lore","sub":"alice","exp":2000000000,"aud":["example.com"]}`
 const NAMELESS: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
 
@@ -40,7 +42,7 @@ async fn bearer_is_named_from_the_token_and_others_are_echoed() {
         info(FULL, &["bob", "alice", "carol"]).await,
         vec![
             pair("bob", "bob"),
-            pair("alice", "alice.e"),
+            pair("alice", "Alice Example"),
             pair("carol", "carol"),
         ],
         "one answer per requested id, in request order"
@@ -48,11 +50,19 @@ async fn bearer_is_named_from_the_token_and_others_are_echoed() {
 }
 
 #[tokio::test]
-async fn bearer_name_falls_back_from_preferred_username_to_name_to_id() {
-    assert_eq!(info(FULL, &["alice"]).await, vec![pair("alice", "alice.e")]);
+async fn bearer_name_prefers_full_name_then_preferred_username_then_id() {
+    assert_eq!(
+        info(FULL, &["alice"]).await,
+        vec![pair("alice", "Alice Example")],
+        "the full name, not the login handle, is the display name"
+    );
     assert_eq!(
         info(NAME_ONLY, &["alice"]).await,
         vec![pair("alice", "Alice Example")]
+    );
+    assert_eq!(
+        info(PREFERRED_ONLY, &["alice"]).await,
+        vec![pair("alice", "alice.e")]
     );
     assert_eq!(
         info(NAMELESS, &["alice"]).await,

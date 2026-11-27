@@ -24,7 +24,7 @@ fn bearer(authz_token: &str) -> Option<JWTUserInfo> {
 }
 
 fn bearer_display_name(bearer: &JWTUserInfo) -> String {
-    [&bearer.preferred_username, &bearer.name]
+    [&bearer.name, &bearer.preferred_username]
         .into_iter()
         .flatten()
         .find(|name| !name.is_empty())
