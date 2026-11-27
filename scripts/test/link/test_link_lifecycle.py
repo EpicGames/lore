@@ -12,11 +12,13 @@ from error_types import (
     INVALID_ARGUMENTS,
     LOCAL_MODIFICATIONS,
     NO_REMOTE,
+    FileNotFound,
     ImproperArgumentsError,
     LocalChanges,
     LoreException,
     PathExistChildrenLinkError,
     PathExistLinkError,
+    RevisionNotFound,
 )
 from link_helpers import (
     DEFAULT_LINK_MOUNT,
@@ -24,6 +26,7 @@ from link_helpers import (
     SAME_SIZE_LINK_FILES,
     assert_mount_exposes,
     assert_scan_matches_linked_files_by_time,
+    error_line,
     link_entry,
     link_field,
     link_pin,
@@ -31,6 +34,8 @@ from link_helpers import (
     make_parent_with_remount,
     make_repo,
     make_repo_renumbering_folder,
+    remote_branch_entries,
+    remote_branches_by_name,
     with_another_scheme,
 )
 from lore_parsers import parse_jsonl, parse_status_json
@@ -1872,6 +1877,100 @@ def test_link_update_keeps_a_local_change_it_leaves_alone(
     assert link_pin(parent_repo, link_repo.get_id()) == pin_two
     with parent_repo.open_file(local_path) as f:
         assert f.read() == "locally edited\n", "the update should keep the local change"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("disable_branching", [False, True])
+def test_link_add_refuses_a_repository_with_no_revision(
+    new_lore_repo, disable_branching
+):
+    """A repository nothing was pushed to has nothing to mount, so `link add` refuses it before
+    it creates a branch there or writes anything."""
+    parent_repo = make_repo(new_lore_repo, {DEFAULT_PARENT_FILE: "baseline\n"})
+    empty_repo: Lore = new_lore_repo()
+    branches = remote_branch_entries(empty_repo)
+
+    with pytest.raises(ImproperArgumentsError) as failure:
+        parent_repo.link_add(
+            DEFAULT_LINK_MOUNT,
+            empty_repo.get_id(),
+            "/",
+            disable_branching=disable_branching,
+        )
+
+    assert failure.value.returncode == 3
+    assert empty_repo.get_id() in error_line(failure)
+    assert status_by_path(parent_repo) == {}
+    assert not os.path.exists(os.path.join(parent_repo.path, DEFAULT_LINK_MOUNT))
+    assert remote_branch_entries(empty_repo) == branches
+
+
+_REFUSED_LINK_FILES = {
+    "sub/test/inner.txt": "inner\n",
+    "other/other.txt": "other\n",
+    "file.txt": "file\n",
+}
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "link_path, source_path, pin, refusal, returncode",
+    [
+        ("vendor/x", "not/pushed", None, FileNotFound, 82),
+        ("vendor/x", "not/pushed", "first", FileNotFound, 82),
+        ("vendor/x", "sub", "no-such-pin", RevisionNotFound, 88),
+        ("vendor/x", "file.txt", None, ImproperArgumentsError, 3),
+        ("occupied", "sub", None, PathExistChildrenLinkError, 3),
+        ("untracked", "sub", None, PathExistChildrenLinkError, 3),
+        ("untracked/loose.txt/sub", "sub", None, ImproperArgumentsError, 3),
+    ],
+    ids=[
+        "a missing source path",
+        "a missing source path at a pin",
+        "an unresolvable pin",
+        "a source path that is a file",
+        "an occupied mount path",
+        "a mount path holding untracked files",
+        "a mount path below a file",
+    ],
+)
+def test_link_add_refusal_leaves_the_linked_repository_branches_alone(
+    new_lore_repo, link_path, source_path, pin, refusal, returncode
+):
+    """A refused `link add` on a branch the linked repository lacks creates no branch there, and
+    a valid one afterwards creates it from the default branch's latest revision while the link
+    pins the revision given. A source path the linked repository holds only on disk is looked up
+    in the revision on the server, and the refusal says where it looked."""
+    parent_repo = make_repo(
+        new_lore_repo,
+        {DEFAULT_PARENT_FILE: "baseline\n", "occupied/file.txt": "occupied\n"},
+    )
+    link_repo = make_repo(new_lore_repo, _REFUSED_LINK_FILES)
+    first_pin = link_repo.branch_info().local_latest
+    link_repo.write_commit_push("Move on", {"file.txt": "moved on\n"})
+    default_latest = link_repo.branch_info().remote_latest
+    link_repo.write_files({"not/pushed/local.txt": "local only\n"})
+    parent_repo.branch_create("link-c")
+    parent_repo.write_files({"untracked/loose.txt": "untracked\n"})
+
+    with pytest.raises(refusal) as failure:
+        parent_repo.link_add(
+            link_path,
+            link_repo.get_id(),
+            source_path,
+            pin=first_pin if pin == "first" else pin,
+        )
+    assert failure.value.returncode == returncode
+    if refusal is FileNotFound:
+        error = error_line(failure)
+        revision = first_pin if pin == "first" else default_latest
+        for expected in (source_path, link_repo.get_id(), revision):
+            assert expected in error, error
+    assert "link-c" not in remote_branches_by_name(link_repo)
+
+    parent_repo.link_add("vendor/valid", link_repo.get_id(), "other", pin=first_pin)
+    assert link_pin(parent_repo, link_repo.get_id()) == first_pin
+    assert remote_branches_by_name(link_repo)["link-c"]["latest"] == default_latest
 
 
 @pytest.mark.smoke

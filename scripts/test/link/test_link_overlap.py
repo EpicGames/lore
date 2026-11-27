@@ -6,7 +6,12 @@ from error_types import (
     OverlappingLinkError,
     OverlappingMountError,
 )
-from link_helpers import layer_targets, parse_revision_diff, remote_branch_names
+from link_helpers import (
+    error_line,
+    layer_targets,
+    parse_revision_diff,
+    remote_branch_names,
+)
 from lore_parsers import parse_jsonl
 from test_utils import status_by_path, unstaged_entries, working_tree_files
 
@@ -55,8 +60,12 @@ def test_link_add_rejects_source_path_inside_existing_mount(new_lore_repo):
     parent.commit("Add link at vendor/whole")
     parent.push()
 
-    with pytest.raises(OverlappingLinkError):
+    with pytest.raises(OverlappingLinkError) as failure:
         parent.link_add("vendor/part", link_repo.get_id(), "SUB/test")
+
+    error = error_line(failure)
+    for path in ("vendor/part", "sub/test", "vendor/whole"):
+        assert path in error, error
 
     assert _mounted_source_paths(parent) == {"vendor/whole": "sub"}, (
         "A refused link add must leave the registry holding only the first mount"

@@ -3204,6 +3204,8 @@ pub async fn check_incoming_mount_overlaps(
             repository.clone(),
             link_context,
             source_path.clone(),
+            change.path(),
+            Some(&RelativePath::new()),
             change.from.mapping.node,
             SameFolder::Allow,
         )
@@ -3253,13 +3255,18 @@ impl SameFolder {
 ///
 /// `source_path` must be the path as stored in the linked repository, so that it
 /// compares directly against what the existing mounts resolve to.
-/// `exclude_node` is the mount being written, which must not be compared against
-/// itself.
+/// `mount_path` is where the mount being written stands in the working tree, and `exclude_node` is
+/// its node, which must not be compared against itself. `mount_root` is where `state`'s repository
+/// stands in the working tree, derived from `mount_path` and `exclude_node` where `None`, so the
+/// refusal names both mounts as the working tree shows them.
+#[allow(clippy::too_many_arguments)]
 pub async fn check_source_path_overlap(
     state: &State,
     repository: Arc<RepositoryContext>,
     link_context: Arc<RepositoryContext>,
     source_path: RelativePath,
+    mount_path: &RelativePath,
+    mount_root: Option<&RelativePath>,
     exclude_node: NodeID,
     same_folder: SameFolder,
 ) -> Result<(), StateError> {
@@ -3292,11 +3299,31 @@ pub async fn check_source_path_overlap(
             .node_path(repository.clone(), link_reference.local_node)
             .await
             .forward::<StateError>("Failed resolving link node")?;
+        let mount_root = if let Some(root) = mount_root {
+            root.as_str().to_owned()
+        } else {
+            let below_root = state
+                .node_path(repository.clone(), exclude_node)
+                .await
+                .forward::<StateError>("Failed resolving link node")?;
+            mount_path
+                .as_str()
+                .strip_suffix(below_root.as_str())
+                .unwrap_or_default()
+                .trim_end_matches('/')
+                .to_owned()
+        };
+        let link_path = if mount_root.is_empty() {
+            link_path
+        } else {
+            format!("{mount_root}/{link_path}")
+        };
 
         return Err(InvalidArguments {
             reason: format!(
-                "source path {} overlaps the link already mounted at {} from source path {}",
+                "mounting {} at {} overlaps the link already mounted at {} from source path {}",
                 display_path(source_path.as_str()),
+                display_path(mount_path.as_str()),
                 display_path(&link_path),
                 display_path(mounted_source.as_str()),
             ),

@@ -201,6 +201,8 @@ async fn restorable_link(
         at.repository.clone(),
         linked_repository.clone(),
         source_path,
+        &at.path,
+        None,
         at.node,
         link::SameFolder::Refuse,
     )

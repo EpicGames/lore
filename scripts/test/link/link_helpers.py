@@ -134,9 +134,24 @@ def remote_branch_entries(repo: Lore) -> list[dict]:
     return parse_jsonl(repo.branch_list(remote=True, json=True), "branchListEntry")
 
 
+def error_line(failure: pytest.ExceptionInfo) -> str:
+    """The first error line a failed command printed."""
+    output = str(failure.value)
+    line = next(
+        (line for line in output.splitlines() if line.startswith("[Error]")), None
+    )
+    assert line is not None, f"No [Error] line in: {output}"
+    return line
+
+
 def remote_branch_names(repo: Lore) -> list[str]:
     """The sorted names of a repository's remote branches."""
     return sorted(entry["name"] for entry in remote_branch_entries(repo))
+
+
+def remote_branches_by_name(repo: Lore) -> dict[str, dict]:
+    """A repository's remote branch list entries, by branch name."""
+    return {entry["name"]: entry for entry in remote_branch_entries(repo)}
 
 
 def layer_targets(repo: Lore) -> set[str]:

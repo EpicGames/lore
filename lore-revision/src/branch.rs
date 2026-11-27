@@ -1116,6 +1116,20 @@ pub async fn load_remote(
     })
 }
 
+/// The latest revision of `branch` on the remote, `None` where the remote lacks it. Unlike
+/// [`load_remote_latest`], a failed query is returned rather than read as a missing branch.
+pub async fn remote_latest_if_present(
+    remote: Arc<Connection>,
+    repository: RepositoryId,
+    branch: BranchId,
+) -> Result<Option<Hash>, BranchError> {
+    match load_remote(remote, repository, branch).await {
+        Ok(status) => Ok(Some(status.latest)),
+        Err(err) if err.is_branch_not_found() => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 /// What the remote answered for a branch's latest revision.
 #[lore_macro::test_pub]
 #[derive(Debug, Default, PartialEq, Eq)]

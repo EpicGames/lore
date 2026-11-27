@@ -4,11 +4,13 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
+use lore_transport::Connection;
+use lore_transport::RepositoryData;
 
 use super::LinkError;
 use crate::branch;
+use crate::errors::FileNotFound;
 use crate::errors::InvalidArguments;
-use crate::errors::InvalidPath;
 use crate::errors::is_refusal;
 use crate::event;
 use crate::filter::FilterMode;
@@ -24,7 +26,6 @@ use crate::link::LoreLinkChangeEventData;
 use crate::lore::Address;
 use crate::lore::BranchId;
 use crate::lore::Hash;
-use crate::lore::RepositoryId;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::node::Node;
@@ -80,7 +81,8 @@ pub async fn add(
             .into());
     }
 
-    let link = resolve_identifier(&repository, link_identifier).await?;
+    let repository_data = resolve_identifier(&repository, link_identifier).await?;
+    let link = repository_data.id;
 
     if link == repository.id {
         return Err(LinkError::internal(
@@ -101,6 +103,8 @@ pub async fn add(
         .remote()
         .await
         .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
+
+    let link_label = || format!("{} ({})", repository_data.name, link.id);
 
     // Resolve through any parent links so the link lands in the innermost
     // containing repository (empty chain for a plain top-level link).
@@ -123,118 +127,73 @@ pub async fn add(
         .into_iter()
         .find(|row| row.repository() == link.id);
 
-    // Determine the link branch and revision based on --pin and --disable-branching
-    let (link_revision, link_branch) = if let Some(row) = mounted {
-        mounted_pin(
+    let resolve_pin = async |pin: Option<String>| match pin {
+        Some(pin) => link::resolve_pin(link.clone(), pin)
+            .await
+            .map(Some)
+            .forward_with::<LinkError, _>(|| link::unreachable(link.id)),
+        None => Ok(None),
+    };
+    let (link_revision, base_branch, branching) = if let Some(row) = mounted {
+        let (revision, branch) = mounted_pin(
             &link,
             row,
             pin,
             disable_branching,
             chain.owner_branch(current_branch),
         )
-        .await?
+        .await?;
+        (revision, branch, LinkBranch::Off)
     } else if disable_branching {
-        if let Some(pin) = pin {
-            link::resolve_pin(link.clone(), pin)
-                .await
-                .forward_with::<LinkError, _>(|| link::unreachable(link.id))?
-        } else {
-            // Use the linked repo's default branch latest
-            let default_branch_id = default_branch(&link).await?;
-
-            let link_latest =
-                branch::load_remote_latest(link_remote.clone(), link.id, default_branch_id)
-                    .await
-                    .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
-
-            lore_debug!("Using default branch {default_branch_id} at LATEST ({link_latest})");
-
-            (link_latest, default_branch_id)
-        }
+        let (revision, branch) = match resolve_pin(pin).await? {
+            Some(pinned) => pinned,
+            None => default_branch_latest(&link, &link_remote).await?,
+        };
+        (revision, branch, LinkBranch::Off)
     } else {
-        // Branching enabled: ensure a matching branch exists in the linked repo
-        let current_branch_id = current_branch;
-
-        let branch_latest = if let Ok(link_latest) =
-            branch::load_remote_latest(link_remote.clone(), link.id, current_branch_id).await
-        {
-            lore_debug!("Using existing link branch at LATEST ({link_latest})");
-            link::report_branch_outcome(
-                link_path.as_str(),
-                link.id,
-                current_branch_id,
-                link_latest,
-                true, /* reused */
-            );
-            link_latest
-        } else {
-            let default_branch_id = default_branch(&link).await?;
-
-            let branch_metadata = branch::metadata(repository.clone(), current_branch_id)
-                .await
-                .forward::<LinkError>("Failed getting branch metadata")?;
-            let branch_name = branch::name(&branch_metadata)
-                .forward::<LinkError>("Failed getting branch metadata")?;
-            let branch_category = branch::category(&branch_metadata).unwrap_or_default();
-
-            let parent_latest =
-                branch::load_remote_latest(link_remote.clone(), link.id, default_branch_id)
+        let (existing, pinned) = tokio::try_join!(
+            async {
+                branch::remote_latest_if_present(link_remote.clone(), link.id, current_branch)
                     .await
-                    .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
-
-            let outcome = link::create_branch(
-                link.clone(),
-                link_remote.clone(),
-                current_branch_id,
-                branch_name,
-                branch_category,
-                default_branch_id,
-                parent_latest,
+                    .forward_with::<LinkError, _>(|| link::unreachable(link.id))
+            },
+            resolve_pin(pin),
+        )?;
+        if let Some(latest) = existing {
+            let (revision, branch) = pinned.unwrap_or((latest, current_branch));
+            (revision, branch, LinkBranch::Reuse(latest))
+        } else {
+            let (parent_latest, parent) = default_branch_latest(&link, &link_remote).await?;
+            let follows_parent = pinned.is_none();
+            let (revision, branch) = pinned.unwrap_or((parent_latest, parent));
+            (
+                revision,
+                branch,
+                LinkBranch::Create {
+                    parent,
+                    parent_latest,
+                    follows_parent,
+                },
             )
-            .await?;
-
-            link::report_branch_outcome(
-                link_path.as_str(),
-                link.id,
-                current_branch_id,
-                outcome.revision,
-                outcome.reused,
-            );
-
-            lore_debug!(
-                "Created branch {} at LATEST ({}) in linked repo",
-                current_branch_id,
-                outcome.revision
-            );
-
-            outcome.revision
-        };
-
-        let link_revision = if let Some(pin) = pin {
-            let (pin_revision, _pin_branch) =
-                link::resolve_pin(link.clone(), pin)
-                    .await
-                    .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
-            lore_debug!("Using pinned revision {pin_revision} on branch {current_branch_id}");
-            pin_revision
-        } else {
-            branch_latest
-        };
-
-        (link_revision, current_branch_id)
+        }
+    };
+    lore_debug!("Validating link revision {link_revision} on branch {base_branch}");
+    let link_branch = if matches!(branching, LinkBranch::Off) {
+        base_branch
+    } else {
+        current_branch
     };
 
-    // A dry run does not create a missing link branch, which takes the name of the branch it
-    // is created for in this repository.
-    let branch_metadata = match branch::metadata(link.clone(), link_branch).await {
-        Err(err) if err.is_branch_not_found() && execution_context().globals().dry_run() => {
-            branch::metadata(repository.clone(), link_branch).await
+    if link_revision.is_zero() {
+        return Err(InvalidArguments {
+            reason: format!(
+                "linked repository {} has no revision on branch {}; commit and push to it first",
+                link_label(),
+                branch::display_name(link.clone(), base_branch).await
+            ),
         }
-        metadata => metadata,
+        .into());
     }
-    .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
-    let branch_name =
-        branch::name(&branch_metadata).forward::<LinkError>("Failed getting branch metadata")?;
 
     lore_debug!("Load link revision state");
     let link_state = State::deserialize(link.clone(), link_revision)
@@ -242,23 +201,38 @@ pub async fn add(
         .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
 
     lore_debug!("Find link target node for {source_path}");
-    let link_found = link_state
+    let found = link_state
         .locate_node(link.clone(), source_path.as_str())
-        .await
-        .forward_with::<LinkError, _>(|| {
-            format!(
-                "Failed to find {source_path} in linked repository {}",
-                link.id
-            )
-        })?;
+        .await;
+    let not_found = || {
+        source_path_not_found(
+            &link,
+            link_label(),
+            &source_path,
+            link_revision,
+            base_branch,
+        )
+    };
+    let link_found = match found {
+        Ok(found) if found.is_valid_or_root() => found,
+        Ok(_) => return Err(not_found().await.into()),
+        Err(err) if err.is_node_not_found() => {
+            return Err(LinkError::FileNotFound(not_found().await.chain_err_from(
+                err,
+                "finding the source path in the linked repository",
+            )));
+        }
+        Err(err) => {
+            return Err(err).forward_with::<LinkError, _>(|| {
+                format!(
+                    "Failed to find {source_path} in linked repository {}",
+                    link.id
+                )
+            });
+        }
+    };
 
     lore_debug!("Link target node is {:?}", link_found.identity());
-    if !link_found.is_valid_or_root() {
-        return Err(InvalidPath {
-            path: source_path.to_string(),
-        }
-        .into());
-    }
 
     // Target node must be in the given link repository, not a link itself
     let Some(link_target) = link_found.own_node() else {
@@ -274,9 +248,14 @@ pub async fn add(
         .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
 
     if !link_node.is_directory() {
-        return Err(LinkError::internal(
-            "Link path must be a directory in the target repository",
-        ));
+        return Err(InvalidArguments {
+            reason: format!(
+                "source path {} is not a directory in linked repository {}",
+                link::display_path(source_path.as_str()),
+                link_label(),
+            ),
+        }
+        .into());
     }
 
     let clone_path = link_path.clone();
@@ -300,6 +279,8 @@ pub async fn add(
         inner_repository.clone(),
         link.clone(),
         resolved_source_path,
+        &clone_path,
+        Some(&chain.innermost.path),
         crate::node::INVALID_NODE,
         link::SameFolder::Refuse,
     )
@@ -320,9 +301,7 @@ pub async fn add(
     {
         // Prevent linking into file or other link
         if !node.is_directory() {
-            return Err(LinkError::internal(format!(
-                "Link path is already a link {clone_path}"
-            )));
+            return Err(mount_refused("is already a link", &clone_path));
         }
 
         let mut children =
@@ -334,9 +313,7 @@ pub async fn add(
         if let Ok(child) = children.next().await
             && child.is_some()
         {
-            return Err(LinkError::internal(format!(
-                "Link path already has children {clone_path}"
-            )));
+            return Err(mount_refused("already has children", &clone_path));
         }
     };
 
@@ -349,11 +326,72 @@ pub async fn add(
     // link has to be stored by then, or its files are written onto the mount as local changes
     // (ADR-00042).
     with_operation::<_, LinkError, _>(repository.file_system(), async |operation| {
+        let mount = check_link_mount(&operation, &clone_path).await?;
+
+        let outcome = match branching {
+            LinkBranch::Off => None,
+            LinkBranch::Reuse(latest) => Some(link::LinkBranchOutcome {
+                revision: latest,
+                reused: true,
+            }),
+            LinkBranch::Create {
+                parent,
+                parent_latest,
+                follows_parent,
+            } => {
+                let outcome = create_link_branch(
+                    &repository,
+                    &link,
+                    link_remote.clone(),
+                    current_branch,
+                    parent,
+                    parent_latest,
+                )
+                .await?;
+                // The add validated `parent_latest`, which a branch another client created
+                // meanwhile need not hold.
+                if follows_parent && outcome.revision != parent_latest {
+                    return Err(InvalidArguments {
+                        reason: format!(
+                            "branch {} was created in linked repository {} while the link was \
+                             added; run the command again",
+                            branch::display_name(repository.clone(), current_branch).await,
+                            link_label(),
+                        ),
+                    }
+                    .into());
+                }
+                Some(outcome)
+            }
+        };
+        if let Some(outcome) = outcome {
+            link::report_branch_outcome(
+                link_path.as_str(),
+                link.id,
+                current_branch,
+                outcome.revision,
+                outcome.reused,
+            );
+        }
+
+        // A dry run does not create a missing link branch, which takes the name of the branch it
+        // is created for in this repository.
+        let branch_metadata = match branch::metadata(link.clone(), link_branch).await {
+            Err(err) if err.is_branch_not_found() && execution_context().globals().dry_run() => {
+                branch::metadata(repository.clone(), link_branch).await
+            }
+            metadata => metadata,
+        }
+        .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
+        let branch_name = branch::name(&branch_metadata)
+            .forward::<LinkError>("Failed getting branch metadata")?;
+
         create_link_mount(
             &operation,
             chain.innermost.clone(),
             remainder_parent,
             &clone_path,
+            mount,
         )
         .await?;
 
@@ -465,7 +503,7 @@ pub async fn add(
     Ok(())
 }
 
-/// The ID of the repository `link_identifier` names: a URL, or a bare name or ID.
+/// The repository `link_identifier` names: a URL, or a bare name or ID.
 ///
 /// Only a scheme tells a URL from a bare name or ID, since `is_valid_name` permits scoped names
 /// like `org/project`. Every link is fetched through this repository's remote, so the identifier
@@ -474,7 +512,7 @@ pub async fn add(
 async fn resolve_identifier(
     repository: &RepositoryContext,
     link_identifier: String,
-) -> Result<RepositoryId, LinkError> {
+) -> Result<RepositoryData, LinkError> {
     let parent_remote = repository::load_repository_config_from_dot_dir(repository.dot_dir_path()?)
         .forward::<LinkError>("reading the repository remote")?
         .remote_url
@@ -504,17 +542,94 @@ async fn resolve_identifier(
 
     let context = execution_context();
     let identity = context.globals().identity().unwrap_or_default();
-    Ok(repository::resolve_by_name(&parent_remote, name, identity)
+    repository::resolve_by_name(&parent_remote, name, identity)
         .await
-        .forward_with::<LinkError, _>(|| format!("Repository not found: {link_identifier}"))?
-        .id)
+        .forward_with::<LinkError, _>(|| format!("Repository not found: {link_identifier}"))
 }
 
-/// Creates the directory the link mounts at and the one holding it, and stages the intermediate
-/// path against the innermost repository.
-///
-/// A mount point the filesystem already holds is taken only as an empty directory: a file, or a
-/// directory with children, is something the link would displace.
+/// What the filesystem holds at and above the mount point `clone_path`.
+#[derive(Clone, Copy)]
+struct LinkMount {
+    mount_exists: bool,
+    parent_exists: bool,
+}
+
+/// Refuses a mount point holding a file or a directory with children, which the link would
+/// displace, and one below a file, which leaves no directory to create.
+async fn check_link_mount(
+    operation: &Arc<InstanceOperationImpl>,
+    clone_path: &RelativePath,
+) -> Result<LinkMount, LinkError> {
+    let check_failed = || format!("Failed to check link path {clone_path}");
+    match operation
+        .file_info(clone_path)
+        .await
+        .forward_with::<LinkError, _>(check_failed)?
+    {
+        FileInfo::NotExist => {
+            let parent = clone_path.parent_path();
+            let mut ancestor = parent.clone();
+            while !ancestor.is_empty() {
+                match operation
+                    .file_info(&ancestor)
+                    .await
+                    .forward_with::<LinkError, _>(check_failed)?
+                {
+                    FileInfo::NotExist => ancestor = ancestor.parent_path(),
+                    FileInfo::Directory => break,
+                    FileInfo::File { .. } => {
+                        return Err(InvalidArguments {
+                            reason: format!(
+                                "mount path {} is below the file {}",
+                                link::display_path(clone_path.as_str()),
+                                link::display_path(ancestor.as_str()),
+                            ),
+                        }
+                        .into());
+                    }
+                }
+            }
+            Ok(LinkMount {
+                mount_exists: false,
+                parent_exists: ancestor == parent,
+            })
+        }
+        FileInfo::Directory => {
+            let mut entries = operation
+                .read_directory(clone_path)
+                .await
+                .forward_with::<LinkError, _>(check_failed)?;
+            if entries
+                .next()
+                .await
+                .transpose()
+                .forward_with::<LinkError, _>(check_failed)?
+                .is_some()
+            {
+                return Err(mount_refused("already has children", clone_path));
+            }
+            Ok(LinkMount {
+                mount_exists: true,
+                parent_exists: true,
+            })
+        }
+        FileInfo::File { .. } => Err(mount_refused("is a file", clone_path)),
+    }
+}
+
+/// The refusal of the mount point `clone_path`, which `reason` says is taken.
+fn mount_refused(reason: &str, clone_path: &RelativePath) -> LinkError {
+    InvalidArguments {
+        reason: format!(
+            "Link path {reason} {}",
+            link::display_path(clone_path.as_str())
+        ),
+    }
+    .into()
+}
+
+/// Creates the directory the link mounts at and the one holding it, as [`check_link_mount`] found
+/// them missing, and stages the intermediate path against the innermost repository.
 ///
 /// One operation covers all of it: the mount point, the directory the link is placed in, the path
 /// staged against the innermost repository, and the mount directory itself are in the same
@@ -524,52 +639,16 @@ async fn create_link_mount(
     innermost: NodeMapping,
     remainder_parent: RelativePathBuf,
     clone_path: &RelativePath,
+    mount: LinkMount,
 ) -> Result<(), LinkError> {
-    let mount_info = operation
-        .file_info(clone_path)
-        .await
-        .forward_with::<LinkError, _>(|| format!("Failed to check link path {clone_path}"))?;
-    match mount_info {
-        FileInfo::NotExist => {}
-        FileInfo::Directory => {
-            let mut entries = operation
-                .read_directory(clone_path)
-                .await
-                .forward_with::<LinkError, _>(|| {
-                    format!("Failed to check link path {clone_path}")
-                })?;
-            if entries
-                .next()
-                .await
-                .transpose()
-                .forward_with::<LinkError, _>(|| format!("Failed to check link path {clone_path}"))?
-                .is_some()
-            {
-                return Err(LinkError::internal(format!(
-                    "Link path already has children {clone_path}"
-                )));
-            }
-        }
-        FileInfo::File { .. } => {
-            return Err(LinkError::internal(format!(
-                "Link path is a file {clone_path}"
-            )));
-        }
-    }
-
     let parent_path = clone_path.parent_path();
-    if !operation
-        .file_info(&parent_path)
-        .await
-        .is_ok_and(|info| info.exists())
-    {
+    if !mount.parent_exists {
         lore_debug!("Creating directory {parent_path}");
         operation
             .create_dir_all(&parent_path)
             .await
             .forward_with::<LinkError, _>(|| format!("Failed to create directory {parent_path}"))?;
     }
-
     if !remainder_parent.is_empty() {
         lore_debug!("Staging link parent path in innermost repository");
         Box::pin(stage::stage_filesystem_path(
@@ -591,7 +670,7 @@ async fn create_link_mount(
         .forward::<LinkError>("Failed staging the link node")?;
     }
 
-    if mount_info == FileInfo::NotExist {
+    if !mount.mount_exists {
         lore_debug!("Creating directory {clone_path}");
         operation
             .create_dir_all(clone_path)
@@ -672,4 +751,84 @@ async fn default_branch(link: &Arc<RepositoryContext>) -> Result<BranchId, LinkE
         .await
         .forward_with::<LinkError, _>(metadata_failed)?;
     Ok(metadata.default_branch)
+}
+
+/// How `link add` treats the branch of this repository in the linked repository.
+#[derive(Clone, Copy)]
+enum LinkBranch {
+    /// The link pins a revision without following branches.
+    Off,
+    /// The linked repository holds the branch, at the given latest revision.
+    Reuse(Hash),
+    /// The linked repository lacks the branch, created at `parent_latest` of `parent`.
+    /// `follows_parent` where the link pins `parent_latest` rather than a pin given.
+    Create {
+        parent: BranchId,
+        parent_latest: Hash,
+        follows_parent: bool,
+    },
+}
+
+/// The linked repository's default branch and its latest revision on the remote.
+async fn default_branch_latest(
+    link: &Arc<RepositoryContext>,
+    link_remote: &Arc<Connection>,
+) -> Result<(Hash, BranchId), LinkError> {
+    let default_branch_id = default_branch(link).await?;
+    let latest = branch::load_remote_latest(link_remote.clone(), link.id, default_branch_id)
+        .await
+        .forward_with::<LinkError, _>(|| link::unreachable(link.id))?;
+    Ok((latest, default_branch_id))
+}
+
+/// Creates the branch `branch_id` of this repository in the linked repository `link` at
+/// `parent_latest` of `parent`, or reuses the one it holds.
+async fn create_link_branch(
+    repository: &Arc<RepositoryContext>,
+    link: &Arc<RepositoryContext>,
+    link_remote: Arc<Connection>,
+    branch_id: BranchId,
+    parent: BranchId,
+    parent_latest: Hash,
+) -> Result<link::LinkBranchOutcome, LinkError> {
+    let branch_metadata = branch::metadata(repository.clone(), branch_id)
+        .await
+        .forward::<LinkError>("Failed getting branch metadata")?;
+    let branch_name =
+        branch::name(&branch_metadata).forward::<LinkError>("Failed getting branch metadata")?;
+    let branch_category = branch::category(&branch_metadata).unwrap_or_default();
+
+    let outcome = link::create_branch(
+        link.clone(),
+        link_remote,
+        branch_id,
+        branch_name,
+        branch_category,
+        parent,
+        parent_latest,
+    )
+    .await?;
+    lore_debug!(
+        "Created branch {branch_id} at LATEST ({}) in linked repo",
+        outcome.revision
+    );
+    Ok(outcome)
+}
+
+/// The refusal of a `source_path` that `revision` of the linked repository does not hold.
+async fn source_path_not_found(
+    link: &Arc<RepositoryContext>,
+    link_label: String,
+    source_path: &RelativePath,
+    revision: Hash,
+    branch: BranchId,
+) -> FileNotFound {
+    FileNotFound {
+        resource: format!(
+            "{} in linked repository {link_label} at revision {revision} on branch {}; it may not \
+             be committed and pushed there yet",
+            link::display_path(source_path.as_str()),
+            branch::display_name(link.clone(), branch).await,
+        ),
+    }
 }

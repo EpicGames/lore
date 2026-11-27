@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use lore_base::error::Disconnected;
 use lore_base::error::NotAuthenticated;
 use lore_base::error::NotAuthorized;
 use lore_base::error::NotFound;
@@ -120,6 +121,8 @@ enum BranchQueryAnswer {
     NotFound,
     /// A refusal of the caller's login.
     Unauthenticated,
+    /// A lost connection.
+    Disconnected,
 }
 
 /// A remote revision service that refuses the caller on every request but a branch query, which it
@@ -160,6 +163,7 @@ impl Revision for RefusingRevision {
             BranchQueryAnswer::Unauthenticated => {
                 return Err(ProtocolError::from(NotAuthenticated));
             }
+            BranchQueryAnswer::Disconnected => return Err(ProtocolError::from(Disconnected)),
         };
         Ok(BranchQueryResponse {
             id: branch.unwrap_or_default(),
@@ -552,6 +556,40 @@ async fn create_feature_branch(
 
 async fn with_execution<F: Future>(body: F) -> F::Output {
     LORE_CONTEXT.scope(setup_test_execution(), body).await
+}
+
+/// A remote latest query that may find no branch reads only the remote's not-found as a missing
+/// branch, and returns a failed query, which a lookup that creates a missing branch must not take
+/// for one.
+#[tokio::test]
+async fn a_remote_latest_query_tells_a_missing_branch_from_a_failed_query() {
+    Box::pin(with_execution(async {
+        let repository = RepositoryId::from(uuid::Uuid::now_v7());
+        let latest = Hash::from([7; 32]);
+        let query = async |answer| {
+            let remote = Connection::detached_revision(
+                Vec::new(),
+                Ok(()),
+                repository,
+                Arc::new(RefusingRevision {
+                    answer,
+                    ..RefusingRevision::default()
+                }),
+            );
+            branch::remote_latest_if_present(remote, repository, BranchId::default()).await
+        };
+
+        assert_eq!(
+            query(BranchQueryAnswer::Latest(latest)).await.unwrap(),
+            Some(latest)
+        );
+        assert_eq!(query(BranchQueryAnswer::NotFound).await.unwrap(), None);
+        let failed = query(BranchQueryAnswer::Disconnected)
+            .await
+            .expect_err("a failed query is no missing branch");
+        assert!(failed.is_disconnected(), "{failed}");
+    }))
+    .await;
 }
 
 /// The remote latest query reports a refusal of the caller's login, at the connect or at the query,

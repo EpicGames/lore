@@ -598,13 +598,9 @@ async fn resolve_merge_source(
             .remote()
             .await
             .forward::<MergeError>("acquiring remote")?;
-        match branch::load_remote_latest(remote, repository.id, source_branch).await {
-            Ok(remote_latest) => Some(remote_latest),
-            Err(err) if err.is_branch_not_found() => None,
-            Err(err) => {
-                return Err(err).forward::<MergeError>("loading remote branch latest");
-            }
-        }
+        branch::remote_latest_if_present(remote, repository.id, source_branch)
+            .await
+            .forward::<MergeError>("loading remote branch latest")?
     } else {
         None
     };
